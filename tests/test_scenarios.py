@@ -104,6 +104,11 @@ class UnexpectedTableGenerator:
         raise AssertionError("A fully planned scenario must not call the generator")
 
 
+class MissingTableGenerator:
+    def generate_for_schemas(self, *args, **kwargs):
+        return {}
+
+
 def _claim_schemas():
     return {
         "Patient": {
@@ -764,6 +769,339 @@ def test_rejects_non_increasing_workflow_timestamps():
         )
 
 
+@pytest.mark.parametrize(
+    ("definition_kwargs", "message"),
+    [
+        pytest.param(
+            {"schemas": {"A": {"id": "integer"}}, "steps": []},
+            "at least one workflow step",
+            id="no-steps",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}, "B": {"id": "integer"}},
+                "steps": [
+                    ScenarioStep(name="duplicate", table="A"),
+                    ScenarioStep(name="duplicate", table="B"),
+                ],
+            },
+            "step names must be unique",
+            id="duplicate-step-name",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [
+                    ScenarioStep(name="first", table="A"),
+                    ScenarioStep(name="second", table="A"),
+                ],
+            },
+            "distinct table",
+            id="duplicate-table",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [ScenarioStep(name="a", table="A")],
+                "instanceIdField": "scenario",
+                "pathField": "scenario",
+            },
+            "must be distinct",
+            id="same-metadata-fields",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"scenario_instance_id": "text"}},
+                "steps": [ScenarioStep(name="a", table="A")],
+            },
+            "reserved scenario fields",
+            id="reserved-schema-field",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [ScenarioStep(name="missing", table="Missing")],
+            },
+            "unknown table",
+            id="unknown-step-table",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [
+                    ScenarioStep(name="a", table="A", timestampField="created_at")
+                ],
+            },
+            "Timestamp field",
+            id="unknown-timestamp-field",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [ScenarioStep(name="a", table="A", values={"missing": "x"})],
+            },
+            "sets unknown fields",
+            id="unknown-fixed-value",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Parent": {"id": "integer"},
+                    "Child": {"__foreign_keys__": {"missing": "Parent.id"}},
+                },
+                "steps": [
+                    ScenarioStep(name="parent", table="Parent"),
+                    ScenarioStep(name="child", table="Child"),
+                ],
+            },
+            "Foreign key field",
+            id="missing-foreign-key-field",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Parent": {"id": "integer"},
+                    "Child": {
+                        "parent_id": "foreign_key",
+                        "__foreign_keys__": {"parent_id": "Parent.missing"},
+                    },
+                },
+                "steps": [
+                    ScenarioStep(name="parent", table="Parent"),
+                    ScenarioStep(name="child", table="Child"),
+                ],
+            },
+            "Foreign key target",
+            id="missing-foreign-key-target",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [ScenarioStep(name="a", table="A")],
+                "paths": [
+                    ScenarioPath(name="duplicate", steps=["a"]),
+                    ScenarioPath(name="duplicate", steps=["a"]),
+                ],
+            },
+            "path names must be unique",
+            id="duplicate-path-name",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [ScenarioStep(name="a", table="A")],
+                "paths": [ScenarioPath(name="bad", steps=["missing"])],
+            },
+            "references unknown steps",
+            id="unknown-path-step",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}, "B": {"id": "integer"}},
+                "steps": [
+                    ScenarioStep(name="a", table="A"),
+                    ScenarioStep(name="b", table="B"),
+                ],
+                "paths": [ScenarioPath(name="reverse", steps=["b", "a"])],
+            },
+            "does not follow workflow order",
+            id="reversed-path",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Parent": {"id": "integer"},
+                    "Child": {
+                        "parent_id": "foreign_key",
+                        "__foreign_keys__": {"parent_id": "Parent.id"},
+                    },
+                },
+                "steps": [
+                    ScenarioStep(name="child", table="Child"),
+                    ScenarioStep(name="parent", table="Parent"),
+                ],
+                "paths": [ScenarioPath(name="bad", steps=["child", "parent"])],
+            },
+            "depends on later step",
+            id="later-parent-step",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}, "B": {"id": "integer"}},
+                "steps": [
+                    ScenarioStep(name="a", table="A"),
+                    ScenarioStep(name="b", table="B"),
+                ],
+                "paths": [
+                    ScenarioPath(
+                        name="bad",
+                        steps=["a"],
+                        overrides={"b": {"id": 1}},
+                    )
+                ],
+            },
+            "overrides excluded step",
+            id="override-excluded-step",
+        ),
+        pytest.param(
+            {
+                "schemas": {"A": {"id": "integer"}},
+                "steps": [ScenarioStep(name="a", table="A")],
+                "paths": [
+                    ScenarioPath(
+                        name="bad",
+                        steps=["a"],
+                        overrides={"a": {"missing": 1}},
+                    )
+                ],
+            },
+            "overrides unknown fields",
+            id="override-unknown-field",
+        ),
+        pytest.param(
+            {
+                "schemas": {"Source": {"value": "text"}},
+                "steps": [ScenarioStep(name="source", table="Source")],
+                "bindings": [
+                    ScenarioBinding(
+                        name="copy", source="value", targets=["Source.value"]
+                    )
+                ],
+            },
+            "must use 'Table.field'",
+            id="malformed-binding-reference",
+        ),
+        pytest.param(
+            {
+                "schemas": {"Source": {"value": "text"}},
+                "steps": [ScenarioStep(name="source", table="Source")],
+                "bindings": [
+                    ScenarioBinding(
+                        name="copy",
+                        source="Source.missing",
+                        targets=["Source.value"],
+                    )
+                ],
+            },
+            "Unknown scenario field reference",
+            id="unknown-binding-field",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Source": {"value": "text"},
+                    "Target": {"copied": "text"},
+                },
+                "steps": [
+                    ScenarioStep(name="source", table="Source"),
+                    ScenarioStep(name="target", table="Target"),
+                ],
+                "bindings": [
+                    ScenarioBinding(
+                        name="duplicate",
+                        source="Source.value",
+                        targets=["Target.copied"],
+                    ),
+                    ScenarioBinding(
+                        name="duplicate",
+                        source="Source.value",
+                        targets=["Target.copied"],
+                    ),
+                ],
+            },
+            "binding names must be unique",
+            id="duplicate-binding-name",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Source": {"value": "text"},
+                    "Target": {"copied": "text"},
+                },
+                "steps": [ScenarioStep(name="target", table="Target")],
+                "bindings": [
+                    ScenarioBinding(
+                        name="copy",
+                        source="Source.value",
+                        targets=["Target.copied"],
+                    )
+                ],
+            },
+            "source table 'Source' is not a scenario step",
+            id="binding-source-not-a-step",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Source": {"first": "text", "second": "text"},
+                    "Target": {"copied": "text"},
+                },
+                "steps": [
+                    ScenarioStep(name="source", table="Source"),
+                    ScenarioStep(name="target", table="Target"),
+                ],
+                "bindings": [
+                    ScenarioBinding(
+                        name="first",
+                        source="Source.first",
+                        targets=["Target.copied"],
+                    ),
+                    ScenarioBinding(
+                        name="second",
+                        source="Source.second",
+                        targets=["Target.copied"],
+                    ),
+                ],
+            },
+            "targeted by multiple bindings",
+            id="duplicate-binding-target",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Source": {"value": "text"},
+                    "Target": {"copied": "text"},
+                },
+                "steps": [ScenarioStep(name="source", table="Source")],
+                "bindings": [
+                    ScenarioBinding(
+                        name="copy",
+                        source="Source.value",
+                        targets=["Target.copied"],
+                    )
+                ],
+            },
+            "target table 'Target' is not a scenario step",
+            id="binding-target-not-a-step",
+        ),
+        pytest.param(
+            {
+                "schemas": {
+                    "Source": {"value": "text"},
+                    "Target": {"copied": "text"},
+                },
+                "steps": [
+                    ScenarioStep(name="target", table="Target"),
+                    ScenarioStep(name="source", table="Source"),
+                ],
+                "bindings": [
+                    ScenarioBinding(
+                        name="copy",
+                        source="Source.value",
+                        targets=["Target.copied"],
+                    )
+                ],
+            },
+            "must not come after target",
+            id="binding-source-after-target",
+        ),
+    ],
+)
+def test_rejects_invalid_definition_shapes(definition_kwargs, message):
+    with pytest.raises(ValidationError, match=message):
+        ScenarioDefinition(name="Invalid", **definition_kwargs)
+
+
 def test_structural_validation_rejects_tampered_ledger_fields():
     definition = ScenarioDefinition(
         name="Tamper check",
@@ -791,6 +1129,114 @@ def test_structural_validation_rejects_tampered_ledger_fields():
 
     with pytest.raises(ValueError, match="changed ledger field 'status'"):
         engine._validate_result(definition, plan, tables)
+
+
+def test_rejects_invalid_instance_and_batch_counts():
+    definition = ScenarioDefinition(
+        name="Count validation",
+        schemas={"Event": {"description": "text"}},
+        steps=[ScenarioStep(name="event", table="Event")],
+    )
+    engine = ScenarioEngine(FakeTableGenerator())
+
+    with pytest.raises(ValueError, match="instance_count must be at least 1"):
+        engine.plan(definition, instance_count=0)
+    with pytest.raises(ValueError, match="instance_count must be at least 1"):
+        engine.summarize(definition, instance_count=0)
+    with pytest.raises(ValueError, match="batch_size must be at least 1"):
+        engine.generate(
+            definition,
+            instance_count=1,
+            generation_kwargs={"batch_size": 0},
+        )
+
+
+def test_allocation_keeps_a_nonzero_instance_for_every_declared_path():
+    definition = ScenarioDefinition(
+        name="Rare path",
+        schemas={"Event": {"event_id": "integer"}},
+        steps=[ScenarioStep(name="event", table="Event")],
+        paths=[
+            ScenarioPath(name="common", steps=["event"], weight=999),
+            ScenarioPath(name="rare", steps=["event"], weight=1),
+        ],
+    )
+
+    summary = ScenarioEngine.summarize(definition, instance_count=2)
+
+    assert summary.path_counts == {"common": 1, "rare": 1}
+
+
+def test_plan_creates_uuid_and_text_primary_keys():
+    definition = ScenarioDefinition(
+        name="Identity types",
+        schemas={
+            "UuidEvent": {
+                "event_id": {
+                    "type": "uuid",
+                    "constraints": {"primary_key": True},
+                }
+            },
+            "TextEvent": {
+                "event_id": {
+                    "type": "text",
+                    "constraints": {"primary_key": True},
+                }
+            },
+        },
+        steps=[
+            ScenarioStep(name="uuid", table="UuidEvent"),
+            ScenarioStep(name="text", table="TextEvent"),
+        ],
+    )
+
+    plan = ScenarioEngine(FakeTableGenerator()).plan(definition, instance_count=1)
+
+    assert len(plan.tables["UuidEvent"].loc[0, "event_id"]) == 36
+    assert plan.tables["TextEvent"].loc[0, "event_id"].endswith("-000001")
+
+
+def test_rejects_generator_response_without_the_requested_table():
+    definition = ScenarioDefinition(
+        name="Missing output",
+        schemas={"Event": {"description": "text"}},
+        steps=[ScenarioStep(name="event", table="Event")],
+    )
+
+    with pytest.raises(ValueError, match="did not return scenario table 'Event'"):
+        ScenarioEngine(MissingTableGenerator()).generate(definition, instance_count=1)
+
+
+def test_structural_validation_reports_missing_duplicate_and_invalid_values():
+    definition = ScenarioDefinition(
+        name="Integrity failures",
+        schemas={
+            "Event": {
+                "event_id": {
+                    "type": "integer",
+                    "constraints": {"primary_key": True},
+                },
+                "status": "text",
+            }
+        },
+        steps=[
+            ScenarioStep(name="event", table="Event", values={"status": "complete"})
+        ],
+    )
+    engine = ScenarioEngine(UnexpectedTableGenerator())
+    plan = engine.plan(definition, instance_count=2)
+    tables = {name: frame.copy() for name, frame in plan.tables.items()}
+    tables["Event"] = tables["Event"].drop(columns="status")
+    tables["Event"]["event_id"] = [1, 1]
+    tables["Event"].loc[0, "scenario_path"] = "invented"
+
+    with pytest.raises(ValueError) as error:
+        engine._validate_result(definition, plan, tables)
+
+    message = str(error.value)
+    assert "missing column 'status'" in message
+    assert "duplicate primary key 'event_id'" in message
+    assert "invalid paths: invented" in message
 
 
 def test_rejects_generator_row_count_mismatch():

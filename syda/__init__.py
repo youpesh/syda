@@ -5,11 +5,10 @@ A Python library for AI-powered synthetic data generation with referential integ
 Supports multiple AI providers (OpenAI, Anthropic) and various schema formats.
 """
 
-from .generate import SyntheticDataGenerator
-from .schemas import ModelConfig
-from .db_schema_loader import DatabaseSchemaLoader
 from .codegen_cache import CodegenCache, compute_schema_hash
-from .run_report import RunReport, TableReport, ColumnReport
+from .db_schema_loader import DatabaseSchemaLoader
+from .generate import SyntheticDataGenerator
+from .run_report import ColumnReport, RunReport, TableReport
 from .scenarios import (
     ScenarioBinding,
     ScenarioDefinition,
@@ -20,28 +19,37 @@ from .scenarios import (
     ScenarioPlanSummary,
     ScenarioStep,
 )
+from .schemas import ModelConfig
 
 __all__ = [
-    'SyntheticDataGenerator',
-    'ModelConfig',
-    'DatabaseSchemaLoader',
-    'CodegenCache',
-    'compute_schema_hash',
-    'RunReport',
-    'TableReport',
-    'ColumnReport',
-    'ScenarioBinding',
-    'ScenarioDefinition',
-    'ScenarioEngine',
-    'ScenarioGenerationResult',
-    'ScenarioPath',
-    'ScenarioPlan',
-    'ScenarioPlanSummary',
-    'ScenarioStep',
+    "SyntheticDataGenerator",
+    "ModelConfig",
+    "DatabaseSchemaLoader",
+    "CodegenCache",
+    "compute_schema_hash",
+    "RunReport",
+    "TableReport",
+    "ColumnReport",
+    "ScenarioBinding",
+    "ScenarioDefinition",
+    "ScenarioEngine",
+    "ScenarioGenerationResult",
+    "ScenarioPath",
+    "ScenarioPlan",
+    "ScenarioPlanSummary",
+    "ScenarioStep",
 ]
 
-__version__ = '0.4.0'
-__author__ = 'Rama Krishna Kumar Lingamgunta'
-__email__ = 'ramkumar2606@gmail.com'
-__license__ = 'MIT'
-__description__ = 'Seamlessly generates realistic synthetic test data—including structured, unstructured, PDF, and HTML—using AI and large language models. It preserves referential integrity, maintains privacy compliance, and accelerates development workflows. SYDA enables both highly regulated industries such as healthcare and banking, as well as non-regulated environments like software testing, research, and analytics, to safely simulate diverse data scenarios without exposing sensitive information.'
+__version__ = "0.4.0"
+__author__ = "Rama Krishna Kumar Lingamgunta"
+__email__ = "ramkumar2606@gmail.com"
+__license__ = "MIT"
+__description__ = (
+    "Seamlessly generates realistic synthetic test data—including structured, "
+    "unstructured, PDF, and HTML—using AI and large language models. It preserves "
+    "referential integrity, maintains privacy compliance, and accelerates development "
+    "workflows. SYDA enables both highly regulated industries such as healthcare and "
+    "banking, as well as non-regulated environments like software testing, research, "
+    "and analytics, to safely simulate diverse data scenarios without exposing "
+    "sensitive information."
+)

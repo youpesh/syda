@@ -39,7 +39,16 @@ _SCENARIO_MODEL_CONFIG = ConfigDict(
 
 
 class ScenarioStep(BaseModel):
-    """One table-producing step in a scenario workflow."""
+    """One table-producing step in a scenario workflow.
+
+    Attributes:
+        name: Unique step name used by paths and overrides.
+        table: Schema and output-table name produced by the step.
+        records_per_instance: Number of rows produced for each scenario instance.
+        timestamp_field: Optional field owned by the ledger for workflow ordering.
+        time_offset_days: Optional day offset from the scenario start date.
+        values: Fixed field values applied to every row produced by the step.
+    """
 
     name: str = Field(min_length=1)
     table: str = Field(min_length=1)
@@ -52,7 +61,14 @@ class ScenarioStep(BaseModel):
 
 
 class ScenarioPath(BaseModel):
-    """A weighted workflow branch, such as approved or denied claims."""
+    """A weighted workflow branch, such as approved or denied claims.
+
+    Attributes:
+        name: Unique path name written to generated rows.
+        steps: Ordered step names included in the path.
+        weight: Relative allocation weight for this path.
+        overrides: Per-step field values that override step defaults.
+    """
 
     name: str = Field(min_length=1)
     steps: List[str] = Field(min_length=1)
@@ -63,7 +79,13 @@ class ScenarioPath(BaseModel):
 
 
 class ScenarioBinding(BaseModel):
-    """Copy one generated scenario value to other fields in the same instance."""
+    """Copy one generated value to other fields in the same scenario instance.
+
+    Attributes:
+        name: Unique binding name used in validation errors.
+        source: Source field reference in ``Table.field`` form.
+        targets: Target field references in ``Table.field`` form.
+    """
 
     name: str = Field(min_length=1)
     source: str
@@ -73,7 +95,18 @@ class ScenarioBinding(BaseModel):
 
 
 class ScenarioDefinition(BaseModel):
-    """Declarative definition of a multi-table business workflow."""
+    """Declarative definition of a multi-table business workflow.
+
+    Attributes:
+        name: Human-readable scenario name.
+        description: Optional scenario context supplied during enrichment.
+        schemas: Syda schemas keyed by table name.
+        steps: Workflow steps in dependency order.
+        paths: Weighted branches through the workflow.
+        bindings: Values copied between tables within each scenario instance.
+        instance_id_field: Output column containing the scenario instance ID.
+        path_field: Output column containing the assigned path name.
+    """
 
     name: str = Field(min_length=1)
     description: str = ""
@@ -90,6 +123,14 @@ class ScenarioDefinition(BaseModel):
 
     @model_validator(mode="after")
     def validate_workflow(self) -> "ScenarioDefinition":
+        """Validate workflow references, ordering, ownership, and bindings.
+
+        Returns:
+            The validated scenario definition.
+
+        Raises:
+            ValueError: If the workflow contains an invalid or ambiguous rule.
+        """
         if not self.steps:
             raise ValueError("A scenario requires at least one workflow step.")
 
@@ -144,14 +185,16 @@ class ScenarioDefinition(BaseModel):
             ).items():
                 if child_field not in _schema_fields(self.schemas[step.table]):
                     raise ValueError(
-                        f"Foreign key field '{step.table}.{child_field}' does not exist."
+                        f"Foreign key field '{step.table}.{child_field}' "
+                        "does not exist."
                     )
                 if (
                     parent_table not in self.schemas
                     or parent_field not in _schema_fields(self.schemas[parent_table])
                 ):
                     raise ValueError(
-                        f"Foreign key target '{parent_table}.{parent_field}' does not exist."
+                        f"Foreign key target '{parent_table}.{parent_field}' "
+                        "does not exist."
                     )
 
         paths = self.paths or [
@@ -287,6 +330,11 @@ class ScenarioDefinition(BaseModel):
         return self
 
     def resolved_paths(self) -> List[ScenarioPath]:
+        """Return declared paths or a default path containing every step.
+
+        Returns:
+            Paths used for scenario allocation.
+        """
         if self.paths:
             return self.paths
         return [
@@ -299,7 +347,14 @@ class ScenarioDefinition(BaseModel):
 
 
 class ScenarioGenerationResult(BaseModel):
-    """Generated tables and the scenario-instance distribution behind them."""
+    """Generated tables and the scenario-instance distribution behind them.
+
+    Attributes:
+        tables: Generated data frames keyed by table name.
+        instance_count: Number of complete business lifecycles generated.
+        instance_ids: Stable identifiers assigned to scenario instances.
+        path_counts: Exact number of instances allocated to each path.
+    """
 
     tables: Dict[str, Any]
     instance_count: int = Field(alias="instanceCount")
@@ -315,7 +370,16 @@ class ScenarioGenerationResult(BaseModel):
 
 
 class ScenarioPlan(BaseModel):
-    """Deterministic ledger that generation must enrich without contradicting."""
+    """Deterministic ledger that generation must enrich without contradicting.
+
+    Attributes:
+        tables: Planned data frames containing ledger-owned values.
+        instance_count: Number of planned scenario instances.
+        instance_ids: Stable identifiers assigned to scenario instances.
+        path_counts: Exact number of instances allocated to each path.
+        path_assignments: Path name assigned to each scenario instance.
+        row_plans: Internal row-allocation metadata used during generation.
+    """
 
     tables: Dict[str, Any]
     instance_count: int = Field(alias="instanceCount")
@@ -333,7 +397,14 @@ class ScenarioPlan(BaseModel):
 
 
 class ScenarioPlanSummary(BaseModel):
-    """Allocation and enrichment counts without materializing ledger rows."""
+    """Allocation and enrichment counts without materializing ledger rows.
+
+    Attributes:
+        instance_count: Number of scenario instances summarized.
+        path_counts: Exact number of instances allocated to each path.
+        table_row_counts: Planned row count for each output table.
+        enrichment_fields: Provider-owned fields for each output table.
+    """
 
     instance_count: int = Field(alias="instanceCount")
     path_counts: Dict[str, int] = Field(alias="pathCounts")
@@ -359,6 +430,11 @@ class ScenarioEngine:
     """Plan deterministic lifecycles, then enrich them with an existing generator."""
 
     def __init__(self, generator: TableGenerator):
+        """Initialize the scenario engine.
+
+        Args:
+            generator: Table generator used to enrich ledger-owned rows.
+        """
         self.generator = generator
 
     def generate(
@@ -377,6 +453,21 @@ class ScenarioEngine:
         ``instance_count`` counts business lifecycles, not rows. A step with one
         record per instance therefore receives ``instance_count`` rows, while a
         step with cardinality two receives twice that number.
+
+        Args:
+            definition: Scenario workflow to generate.
+            instance_count: Number of complete workflow instances to generate.
+            start_at: Optional date or datetime for the first workflow instance.
+            prompts: Optional enrichment prompts keyed by table name.
+            output_dir: Optional directory in which to save generated tables.
+            output_format: Output format passed to Syda's table writer.
+            generation_kwargs: Additional arguments for the table generator.
+
+        Returns:
+            Generated tables and their scenario allocation metadata.
+
+        Raises:
+            ValueError: If generation violates the scenario plan or integrity rules.
         """
         plan = self.plan(
             definition,
@@ -388,7 +479,9 @@ class ScenarioEngine:
         kwargs.pop("output_dir", None)
         kwargs.pop("output_format", None)
         requested_batch_size = kwargs.pop("batch_size", None)
-        context_batch_size = requested_batch_size or 50
+        context_batch_size = (
+            50 if requested_batch_size is None else requested_batch_size
+        )
         if context_batch_size < 1:
             raise ValueError("generation batch_size must be at least 1.")
 
@@ -428,7 +521,7 @@ class ScenarioEngine:
                     **schema,
                 }
                 base_prompt = (
-                    prompts.get(step.table)
+                    prompts[step.table]
                     if prompts and step.table in prompts
                     else _scenario_prompt(definition, step.table, plan.path_counts)
                 )
@@ -491,7 +584,19 @@ class ScenarioEngine:
         *,
         start_at: Optional[Union[date, datetime]] = None,
     ) -> ScenarioPlan:
-        """Build the deterministic scenario ledger without invoking a generator."""
+        """Build the deterministic scenario ledger without invoking a generator.
+
+        Args:
+            definition: Scenario workflow to plan.
+            instance_count: Number of complete workflow instances to allocate.
+            start_at: Optional date or datetime for the first workflow instance.
+
+        Returns:
+            A deterministic plan containing every ledger-owned value.
+
+        Raises:
+            ValueError: If ``instance_count`` is less than one.
+        """
         if instance_count < 1:
             raise ValueError("instance_count must be at least 1.")
 
@@ -556,7 +661,18 @@ class ScenarioEngine:
         definition: ScenarioDefinition,
         instance_count: int,
     ) -> ScenarioPlanSummary:
-        """Compute plan sizes and provider-owned fields without allocating rows."""
+        """Compute plan sizes and provider-owned fields without allocating rows.
+
+        Args:
+            definition: Scenario workflow to summarize.
+            instance_count: Number of complete workflow instances to estimate.
+
+        Returns:
+            Allocation, row-count, and enrichment-field totals.
+
+        Raises:
+            ValueError: If ``instance_count`` is less than one.
+        """
         if instance_count < 1:
             raise ValueError("instance_count must be at least 1.")
 
@@ -635,7 +751,15 @@ class ScenarioEngine:
         definition: ScenarioDefinition,
         plan: ScenarioPlan,
     ) -> Dict[str, Dict[str, Any]]:
-        """Return only fields that still require provider-generated enrichment."""
+        """Return fields that still require provider-generated enrichment.
+
+        Args:
+            definition: Scenario workflow associated with the plan.
+            plan: Deterministic plan whose missing values require enrichment.
+
+        Returns:
+            Reduced schemas keyed by table name.
+        """
         binding_targets: Dict[str, Set[str]] = {}
         for binding in definition.bindings:
             for target in binding.targets:
@@ -1227,7 +1351,7 @@ def _is_missing(value: Any) -> bool:
 def _json_safe(value: Any) -> Any:
     if _is_missing(value):
         return None
-    if isinstance(value, (date, datetime, pd.Timestamp)):
+    if isinstance(value, (date, datetime)):
         return value.isoformat()
     if hasattr(value, "item"):
         try:
