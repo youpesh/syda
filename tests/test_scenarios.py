@@ -19,10 +19,20 @@ class FakeTableGenerator:
     def __init__(self):
         self.sample_sizes = {}
         self.schemas = {}
+        self.prompts = {}
+        self.calls = []
 
     def generate_for_schemas(self, schemas, prompts=None, sample_sizes=None, **kwargs):
         self.schemas = schemas
         self.sample_sizes = dict(sample_sizes or {})
+        self.prompts = dict(prompts or {})
+        self.calls.append(
+            {
+                "schemas": schemas,
+                "prompts": prompts,
+                "sample_sizes": dict(sample_sizes or {}),
+            }
+        )
         generated = {}
         for table_index, (table, schema) in enumerate(schemas.items(), start=1):
             rows = []
@@ -41,7 +51,9 @@ class FakeTableGenerator:
                         if isinstance(definition, dict)
                         else {}
                     )
-                    if constraints.get("primary_key"):
+                    if field == "syda_scenario_row_key":
+                        row[field] = constraints["enum"][row_index]
+                    elif constraints.get("primary_key"):
                         row[field] = table_index * 10_000 + row_index + 1
                     elif field_type == "foreign_key":
                         row[field] = -1
@@ -63,6 +75,27 @@ class ShortTableGenerator(FakeTableGenerator):
         )
         first_table = next(iter(generated))
         generated[first_table] = generated[first_table].iloc[:-1]
+        return generated
+
+
+class ReorderingGenerator(FakeTableGenerator):
+    def generate_for_schemas(self, schemas, prompts=None, sample_sizes=None, **kwargs):
+        generated = super().generate_for_schemas(
+            schemas, prompts=prompts, sample_sizes=sample_sizes, **kwargs
+        )
+        return {
+            table: frame.iloc[::-1].reset_index(drop=True)
+            for table, frame in generated.items()
+        }
+
+
+class InvalidRowKeyGenerator(FakeTableGenerator):
+    def generate_for_schemas(self, schemas, prompts=None, sample_sizes=None, **kwargs):
+        generated = super().generate_for_schemas(
+            schemas, prompts=prompts, sample_sizes=sample_sizes, **kwargs
+        )
+        first_table = next(iter(generated))
+        generated[first_table].loc[0, "syda_scenario_row_key"] = "invented-row"
         return generated
 
 
@@ -200,7 +233,17 @@ def test_generates_complete_instances_with_shared_context_and_ordered_time():
     )
 
     assert generator.sample_sizes == {"Patient": 3}
-    assert generator.schemas == {"Patient": {"state": "text"}}
+    assert set(generator.schemas["Patient"]) == {
+        "syda_scenario_row_key",
+        "state",
+    }
+    assert generator.schemas["Patient"]["syda_scenario_row_key"]["constraints"][
+        "enum"
+    ] == [
+        "claims-lifecycle-000001:patient:0001",
+        "claims-lifecycle-000002:patient:0001",
+        "claims-lifecycle-000003:patient:0001",
+    ]
     assert result.instance_count == 3
     assert result.path_counts == {"default": 3}
     assert set(result.instance_ids) == {
@@ -286,6 +329,97 @@ def test_plan_is_structural_source_of_truth_before_enrichment():
                 check_dtype=False,
             )
     assert result.tables["Patient"]["state"].notna().all()
+
+
+def test_enrichment_joins_by_row_key_when_provider_reorders_rows():
+    definition = ScenarioDefinition(
+        name="Reordered customers",
+        schemas={
+            "Customer": {
+                "customer_id": {
+                    "type": "integer",
+                    "constraints": {"primary_key": True},
+                },
+                "name": "text",
+            }
+        },
+        steps=[ScenarioStep(name="customer", table="Customer")],
+    )
+
+    result = ScenarioEngine(ReorderingGenerator()).generate(
+        definition,
+        instance_count=3,
+    )
+
+    assert result.tables["Customer"]["name"].tolist() == [
+        "generated-name-1",
+        "generated-name-2",
+        "generated-name-3",
+    ]
+
+
+def test_later_steps_receive_generated_and_planned_instance_context():
+    generator = FakeTableGenerator()
+    definition = ScenarioDefinition(
+        name="Contextual orders",
+        schemas={
+            "Customer": {
+                "customer_id": {
+                    "type": "integer",
+                    "constraints": {"primary_key": True},
+                },
+                "name": "text",
+            },
+            "Order": {
+                "order_id": {
+                    "type": "integer",
+                    "constraints": {"primary_key": True},
+                },
+                "customer_id": "foreign_key",
+                "status": "text",
+                "description": "text",
+                "__foreign_keys__": {"customer_id": "Customer.customer_id"},
+            },
+        },
+        steps=[
+            ScenarioStep(name="customer", table="Customer"),
+            ScenarioStep(
+                name="order",
+                table="Order",
+                values={"status": "confirmed"},
+            ),
+        ],
+    )
+
+    result = ScenarioEngine(generator).generate(definition, instance_count=2)
+
+    order_prompt = generator.prompts["Order"]
+    assert '"scenarioInstanceId": "contextual-orders-000001"' in order_prompt
+    assert '"name": "generated-name-1"' in order_prompt
+    assert '"status": "confirmed"' in order_prompt
+    assert result.tables["Order"]["description"].notna().all()
+
+
+def test_rejects_provider_rows_without_expected_context_keys():
+    definition = ScenarioDefinition(
+        name="Invalid provider keys",
+        schemas={
+            "Customer": {
+                "customer_id": {
+                    "type": "integer",
+                    "constraints": {"primary_key": True},
+                },
+                "name": "text",
+            }
+        },
+        steps=[ScenarioStep(name="customer", table="Customer")],
+    )
+
+    with pytest.raises(ValueError, match="invalid row keys"):
+        ScenarioEngine(InvalidRowKeyGenerator()).generate(
+            definition,
+            instance_count=2,
+        )
 
 
 def test_fully_planned_scenario_skips_generator_calls():
@@ -452,6 +586,62 @@ def test_path_allocation_preserves_exact_weighted_distribution():
     }
 
 
+def test_generates_two_hundred_complete_instances_in_bounded_context_batches():
+    generator = FakeTableGenerator()
+    definition = ScenarioDefinition(
+        name="Claim outcomes",
+        schemas=_claim_schemas(),
+        steps=_claim_steps(),
+        paths=[
+            ScenarioPath(
+                name="approved",
+                steps=["patient", "policy", "diagnosis", "claim", "payment"],
+                weight=0.75,
+                overrides={"claim": {"status": "approved"}},
+            ),
+            ScenarioPath(
+                name="denied",
+                steps=["patient", "policy", "diagnosis", "claim"],
+                weight=0.15,
+                overrides={"claim": {"status": "denied"}},
+            ),
+            ScenarioPath(
+                name="pending",
+                steps=["patient", "policy", "diagnosis", "claim"],
+                weight=0.10,
+                overrides={"claim": {"status": "pending"}},
+            ),
+        ],
+    )
+
+    result = ScenarioEngine(generator).generate(
+        definition,
+        instance_count=200,
+        generation_kwargs={"batch_size": 40},
+    )
+
+    assert result.path_counts == {"approved": 150, "denied": 30, "pending": 20}
+    assert len(result.tables["Patient"]) == 200
+    assert len(result.tables["Claim"]) == 200
+    assert len(result.tables["Payment"]) == 150
+    assert len(generator.calls) == 10
+    assert [next(iter(call["sample_sizes"])) for call in generator.calls] == [
+        "Patient",
+        "Patient",
+        "Patient",
+        "Patient",
+        "Patient",
+        "Claim",
+        "Claim",
+        "Claim",
+        "Claim",
+        "Claim",
+    ]
+    assert all(
+        next(iter(call["sample_sizes"].values())) == 40 for call in generator.calls
+    )
+
+
 def test_default_timeline_uses_recent_dates_without_future_events():
     definition = ScenarioDefinition(
         name="Claims lifecycle",
@@ -476,6 +666,131 @@ def test_rejects_path_that_omits_a_required_parent_step():
             steps=_claim_steps(),
             paths=[ScenarioPath(name="broken", steps=["policy"])],
         )
+
+
+def test_scenario_models_reject_unknown_configuration_fields():
+    with pytest.raises(ValidationError, match="recordsPerInstnace"):
+        ScenarioStep(
+            name="customer",
+            table="Customer",
+            recordsPerInstnace=2,
+        )
+
+
+def test_rejects_empty_and_duplicate_path_steps():
+    with pytest.raises(ValidationError):
+        ScenarioPath(name="empty", steps=[])
+
+    with pytest.raises(ValidationError, match="duplicate steps"):
+        ScenarioDefinition(
+            name="Duplicate path",
+            schemas={"Event": {"event_id": "integer"}},
+            steps=[ScenarioStep(name="event", table="Event")],
+            paths=[ScenarioPath(name="duplicate", steps=["event", "event"])],
+        )
+
+
+def test_rejects_binding_target_path_without_its_source():
+    with pytest.raises(ValidationError, match="without source step 'source'"):
+        ScenarioDefinition(
+            name="Broken binding",
+            schemas={
+                "Source": {"value": "text"},
+                "Target": {"copied": "text"},
+            },
+            steps=[
+                ScenarioStep(name="source", table="Source"),
+                ScenarioStep(name="target", table="Target"),
+            ],
+            paths=[ScenarioPath(name="target_only", steps=["target"])],
+            bindings=[
+                ScenarioBinding(
+                    name="copy",
+                    source="Source.value",
+                    targets=["Target.copied"],
+                )
+            ],
+        )
+
+
+def test_rejects_ambiguous_multi_row_binding_source():
+    with pytest.raises(ValidationError, match="ambiguous multi-row source"):
+        ScenarioDefinition(
+            name="Ambiguous binding",
+            schemas={
+                "Source": {"value": "text"},
+                "Target": {"copied": "text"},
+            },
+            steps=[
+                ScenarioStep(
+                    name="source",
+                    table="Source",
+                    recordsPerInstance=2,
+                ),
+                ScenarioStep(name="target", table="Target"),
+            ],
+            bindings=[
+                ScenarioBinding(
+                    name="copy",
+                    source="Source.value",
+                    targets=["Target.copied"],
+                )
+            ],
+        )
+
+
+def test_rejects_non_increasing_workflow_timestamps():
+    with pytest.raises(ValidationError, match="timestamp offsets must increase"):
+        ScenarioDefinition(
+            name="Reverse time",
+            schemas={
+                "First": {"at": "datetime"},
+                "Second": {"at": "datetime"},
+            },
+            steps=[
+                ScenarioStep(
+                    name="first",
+                    table="First",
+                    timestampField="at",
+                    timeOffsetDays=2,
+                ),
+                ScenarioStep(
+                    name="second",
+                    table="Second",
+                    timestampField="at",
+                    timeOffsetDays=1,
+                ),
+            ],
+        )
+
+
+def test_structural_validation_rejects_tampered_ledger_fields():
+    definition = ScenarioDefinition(
+        name="Tamper check",
+        schemas={
+            "Event": {
+                "event_id": {
+                    "type": "integer",
+                    "constraints": {"primary_key": True},
+                },
+                "status": "text",
+            }
+        },
+        steps=[
+            ScenarioStep(
+                name="event",
+                table="Event",
+                values={"status": "complete"},
+            )
+        ],
+    )
+    engine = ScenarioEngine(UnexpectedTableGenerator())
+    plan = engine.plan(definition, instance_count=1)
+    tables = {name: frame.copy() for name, frame in plan.tables.items()}
+    tables["Event"].loc[0, "status"] = "corrupted"
+
+    with pytest.raises(ValueError, match="changed ledger field 'status'"):
+        engine._validate_result(definition, plan, tables)
 
 
 def test_rejects_generator_row_count_mismatch():

@@ -2,18 +2,20 @@
 
 Syda's scenario engine generates complete business lifecycles across related tables. An `instance_count` of 100 means 100 scenario instances—not 100 rows divided among the tables. Each output row includes `scenario_instance_id` and `scenario_path`, so records from one lifecycle can be joined and inspected directly.
 
-The engine layers on `SyntheticDataGenerator` through a plan-first architecture. `ScenarioEngine` first creates a deterministic ledger containing path assignments, row cardinality, primary and foreign keys, fixed statuses, and workflow timestamps. The existing generator then receives only the unconstrained fields and enriches the planned rows with realistic values. Generated values cannot overwrite non-null ledger values.
+The engine layers on `SyntheticDataGenerator` through a plan-first architecture. `ScenarioEngine` first creates a deterministic ledger containing path assignments, row cardinality, primary and foreign keys, fixed statuses, and workflow timestamps. The existing generator then receives only the unconstrained fields and enriches the planned rows with realistic values. Each enrichment request includes the current ledger row and known records from earlier workflow steps, so generated values can remain consistent with the same scenario instance. Generated values cannot overwrite non-null ledger values.
 
 ```text
 ScenarioDefinition
         ↓
 ScenarioPlan ledger
         ↓
-Generate unconstrained fields only
+Generate unconstrained fields with per-instance context
         ↓
-Merge enrichment into the ledger
+Join enrichment to the ledger by an internal row key
         ↓
-Apply shared-field bindings and validate
+Apply shared-field bindings
+        ↓
+Validate structural invariants
 ```
 
 ## Example
@@ -110,3 +112,13 @@ Use `ScenarioBinding` to copy a scenario-level value into other tables. For exam
 Set `recordsPerInstance` on a step when one lifecycle needs multiple rows of that table, such as two payments or several claim lines. Foreign keys are repaired after field generation so every child points to a parent in the same scenario instance.
 
 Invalid definitions fail before generation when a path references an unknown step, violates workflow order, or includes a child without its required parent.
+
+## Enrichment safety
+
+The provider receives a temporary row key with every row context and must return that key with the generated fields. The engine validates that every expected key appears exactly once and joins enrichment by key rather than response position. The temporary key is removed from final output.
+
+Generation proceeds in workflow order. A later step can therefore use both deterministic ledger values and generated values from earlier steps as context. Context is split using the configured generation `batch_size` (50 rows by default) to keep requests bounded.
+
+After enrichment, the engine verifies row counts, ledger-owned values, primary-key uniqueness, same-instance foreign keys, bindings, path membership, and timestamp order before returning or saving output.
+
+Scenario models reject unknown configuration fields. Paths cannot be empty or repeat a step, timestamp offsets must increase with workflow order, and a binding source must appear before its targets on every applicable path. Bindings with multi-row sources are rejected as ambiguous; model those with an explicit aggregation or selection step instead.

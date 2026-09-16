@@ -8,6 +8,7 @@ cross-table identity, foreign-key alignment, shared values, and workflow time or
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import (
@@ -29,41 +30,52 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .output import save_dataframes
 
+_ROW_KEY_FIELD = "syda_scenario_row_key"
+_SCENARIO_MODEL_CONFIG = ConfigDict(
+    extra="forbid",
+    populate_by_name=True,
+    serialize_by_alias=True,
+)
+
 
 class ScenarioStep(BaseModel):
     """One table-producing step in a scenario workflow."""
 
-    name: str
-    table: str
+    name: str = Field(min_length=1)
+    table: str = Field(min_length=1)
     records_per_instance: int = Field(default=1, alias="recordsPerInstance", ge=1)
     timestamp_field: Optional[str] = Field(default=None, alias="timestampField")
     time_offset_days: Optional[int] = Field(default=None, alias="timeOffsetDays")
     values: Dict[str, Any] = Field(default_factory=dict)
 
-    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+    model_config = _SCENARIO_MODEL_CONFIG
 
 
 class ScenarioPath(BaseModel):
     """A weighted workflow branch, such as approved or denied claims."""
 
-    name: str
-    steps: List[str]
+    name: str = Field(min_length=1)
+    steps: List[str] = Field(min_length=1)
     weight: float = Field(default=1.0, gt=0)
     overrides: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+    model_config = _SCENARIO_MODEL_CONFIG
 
 
 class ScenarioBinding(BaseModel):
     """Copy one generated scenario value to other fields in the same instance."""
 
-    name: str
+    name: str = Field(min_length=1)
     source: str
-    targets: List[str]
+    targets: List[str] = Field(min_length=1)
+
+    model_config = _SCENARIO_MODEL_CONFIG
 
 
 class ScenarioDefinition(BaseModel):
     """Declarative definition of a multi-table business workflow."""
 
-    name: str
+    name: str = Field(min_length=1)
     description: str = ""
     schemas: Dict[str, Dict[str, Any]]
     steps: List[ScenarioStep]
@@ -74,7 +86,7 @@ class ScenarioDefinition(BaseModel):
     )
     path_field: str = Field(default="scenario_path", alias="pathField")
 
-    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+    model_config = _SCENARIO_MODEL_CONFIG
 
     @model_validator(mode="after")
     def validate_workflow(self) -> "ScenarioDefinition":
@@ -88,6 +100,22 @@ class ScenarioDefinition(BaseModel):
         table_names = [step.table for step in self.steps]
         if len(table_names) != len(set(table_names)):
             raise ValueError("Each scenario step must produce a distinct table.")
+
+        if self.instance_id_field == self.path_field:
+            raise ValueError("Scenario instance and path fields must be distinct.")
+
+        reserved_fields = {
+            self.instance_id_field,
+            self.path_field,
+            _ROW_KEY_FIELD,
+        }
+        for table, schema in self.schemas.items():
+            collisions = reserved_fields & set(_schema_fields(schema))
+            if collisions:
+                raise ValueError(
+                    f"Schema '{table}' uses reserved scenario fields: "
+                    f"{', '.join(sorted(collisions))}."
+                )
 
         for step in self.steps:
             if step.table not in self.schemas:
@@ -138,6 +166,10 @@ class ScenarioDefinition(BaseModel):
             raise ValueError("Scenario path names must be unique.")
 
         for path in paths:
+            if len(path.steps) != len(set(path.steps)):
+                raise ValueError(
+                    f"Scenario path '{path.name}' contains duplicate steps."
+                )
             unknown = set(path.steps) - known_steps
             if unknown:
                 raise ValueError(
@@ -187,10 +219,70 @@ class ScenarioDefinition(BaseModel):
                         f"'{override_step}': {', '.join(sorted(unknown_values))}."
                     )
 
+        timestamp_offsets = [
+            (
+                step.name,
+                (
+                    step.time_offset_days
+                    if step.time_offset_days is not None
+                    else step_index
+                ),
+            )
+            for step_index, step in enumerate(self.steps)
+            if step.timestamp_field
+        ]
+        for previous, current in zip(timestamp_offsets, timestamp_offsets[1:]):
+            if current[1] <= previous[1]:
+                raise ValueError(
+                    "Scenario timestamp offsets must increase with workflow order: "
+                    f"'{current[0]}' must occur after '{previous[0]}'."
+                )
+
+        binding_names = [binding.name for binding in self.bindings]
+        if len(binding_names) != len(set(binding_names)):
+            raise ValueError("Scenario binding names must be unique.")
+
+        bound_targets: Set[str] = set()
         for binding in self.bindings:
             _validate_field_reference(binding.source, self.schemas)
+            source_table, _ = _split_reference(binding.source)
+            source_step = step_by_table.get(source_table)
+            if source_step is None:
+                raise ValueError(
+                    f"Binding '{binding.name}' source table '{source_table}' "
+                    "is not a scenario step."
+                )
+            source_definition = self.steps[step_position[source_step]]
+            if source_definition.records_per_instance != 1:
+                raise ValueError(
+                    f"Binding '{binding.name}' has an ambiguous multi-row source "
+                    f"'{binding.source}'."
+                )
             for target in binding.targets:
                 _validate_field_reference(target, self.schemas)
+                if target in bound_targets:
+                    raise ValueError(
+                        f"Scenario field '{target}' is targeted by multiple bindings."
+                    )
+                bound_targets.add(target)
+                target_table, _ = _split_reference(target)
+                target_step = step_by_table.get(target_table)
+                if target_step is None:
+                    raise ValueError(
+                        f"Binding '{binding.name}' target table '{target_table}' "
+                        "is not a scenario step."
+                    )
+                if step_position[source_step] > step_position[target_step]:
+                    raise ValueError(
+                        f"Binding '{binding.name}' source '{source_step}' must not "
+                        f"come after target '{target_step}'."
+                    )
+                for path in paths:
+                    if target_step in path.steps and source_step not in path.steps:
+                        raise ValueError(
+                            f"Scenario path '{path.name}' includes binding target "
+                            f"'{target_step}' without source step '{source_step}'."
+                        )
 
         return self
 
@@ -216,6 +308,7 @@ class ScenarioGenerationResult(BaseModel):
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
+        extra="forbid",
         populate_by_name=True,
         serialize_by_alias=True,
     )
@@ -233,6 +326,7 @@ class ScenarioPlan(BaseModel):
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
+        extra="forbid",
         populate_by_name=True,
         serialize_by_alias=True,
     )
@@ -246,7 +340,7 @@ class ScenarioPlanSummary(BaseModel):
     table_row_counts: Dict[str, int] = Field(alias="tableRowCounts")
     enrichment_fields: Dict[str, List[str]] = Field(alias="enrichmentFields")
 
-    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+    model_config = _SCENARIO_MODEL_CONFIG
 
 
 class TableGenerator(Protocol):
@@ -290,47 +384,91 @@ class ScenarioEngine:
             start_at=start_at,
         )
         enrichment_schemas = self.enrichment_schemas(definition, plan)
-        sample_sizes = {table: len(plan.tables[table]) for table in enrichment_schemas}
-        scenario_prompts = {
-            table: (
-                prompts.get(table)
-                if prompts and table in prompts
-                else _scenario_prompt(definition, table, plan.path_counts)
-            )
-            for table in enrichment_schemas
-        }
         kwargs = dict(generation_kwargs or {})
         kwargs.pop("output_dir", None)
         kwargs.pop("output_format", None)
-        generated: Dict[str, pd.DataFrame] = {
-            table: pd.DataFrame(index=range(len(frame)))
+        requested_batch_size = kwargs.pop("batch_size", None)
+        context_batch_size = requested_batch_size or 50
+        if context_batch_size < 1:
+            raise ValueError("generation batch_size must be at least 1.")
+
+        tables = {
+            table: frame.copy().reset_index(drop=True).astype(object)
             for table, frame in plan.tables.items()
         }
-        if enrichment_schemas:
-            enriched = self.generator.generate_for_schemas(
-                schemas=enrichment_schemas,
-                prompts=scenario_prompts,
-                sample_sizes=sample_sizes,
-                **kwargs,
+        for step_index, step in enumerate(definition.steps):
+            schema = enrichment_schemas.get(step.table)
+            if not schema:
+                continue
+
+            row_keys = _scenario_row_keys(
+                step.table,
+                tables[step.table],
+                definition.instance_id_field,
             )
-            missing = set(enrichment_schemas) - set(enriched)
-            if missing:
-                raise ValueError(
-                    "Generator did not return scenario tables: "
-                    f"{', '.join(sorted(missing))}."
+            contexts = self._build_row_contexts(
+                definition,
+                tables,
+                step_index,
+                step.table,
+                row_keys,
+            )
+            parts: List[pd.DataFrame] = []
+            for start in range(0, len(contexts), context_batch_size):
+                chunk_contexts = contexts[start : start + context_batch_size]
+                chunk_keys = [item["rowKey"] for item in chunk_contexts]
+                request_schema = {
+                    _ROW_KEY_FIELD: {
+                        "type": "text",
+                        "description": (
+                            "Copy the rowKey from the matching context exactly."
+                        ),
+                        "constraints": {"enum": chunk_keys},
+                    },
+                    **schema,
+                }
+                base_prompt = (
+                    prompts.get(step.table)
+                    if prompts and step.table in prompts
+                    else _scenario_prompt(definition, step.table, plan.path_counts)
                 )
-            for table, schema in enrichment_schemas.items():
-                missing_fields = set(_schema_fields(schema)) - set(
-                    enriched[table].columns
+                request_prompt = _scenario_enrichment_prompt(
+                    base_prompt,
+                    chunk_contexts,
                 )
-                if missing_fields:
+                request_kwargs = dict(kwargs)
+                request_kwargs["batch_size"] = len(chunk_contexts)
+                enriched = self.generator.generate_for_schemas(
+                    schemas={step.table: request_schema},
+                    prompts={step.table: request_prompt},
+                    sample_sizes={step.table: len(chunk_contexts)},
+                    **request_kwargs,
+                )
+                if step.table not in enriched:
                     raise ValueError(
-                        f"Generator omitted fields from '{table}': "
-                        f"{', '.join(sorted(missing_fields))}."
+                        f"Generator did not return scenario table '{step.table}'."
                     )
-            generated.update(enriched)
-        tables = self._enrich_plan(definition, plan, generated)
+                part = enriched[step.table]
+                self._validate_enrichment_chunk(
+                    step.table,
+                    schema,
+                    chunk_keys,
+                    part,
+                )
+                parts.append(part)
+
+            generated = pd.concat(parts, ignore_index=True)
+            tables[step.table] = self._merge_enrichment_table(
+                definition,
+                step.table,
+                tables[step.table],
+                schema,
+                row_keys,
+                generated,
+            )
+
         self._apply_bindings(definition, tables)
+        self._validate_result(definition, plan, tables)
 
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -527,39 +665,107 @@ class ScenarioEngine:
         return schemas
 
     @staticmethod
-    def _enrich_plan(
+    def _build_row_contexts(
         definition: ScenarioDefinition,
-        plan: ScenarioPlan,
-        generated: Mapping[str, pd.DataFrame],
-    ) -> Dict[str, pd.DataFrame]:
-        tables: Dict[str, pd.DataFrame] = {}
-        for step in definition.steps:
-            ledger = plan.tables[step.table]
-            if ledger.empty:
-                tables[step.table] = ledger.copy()
-                continue
-            if step.table not in generated:
-                raise ValueError(
-                    f"Generator did not return scenario table '{step.table}'."
-                )
-            frame = generated[step.table].copy().reset_index(drop=True).astype(object)
-            if len(frame) != len(ledger):
-                raise ValueError(
-                    f"Generator returned {len(frame)} rows for '{step.table}', "
-                    f"expected {len(ledger)}."
-                )
+        tables: Mapping[str, pd.DataFrame],
+        step_index: int,
+        table: str,
+        row_keys: Sequence[str],
+    ) -> List[Dict[str, Any]]:
+        instance_field = definition.instance_id_field
+        path_field = definition.path_field
+        frame = tables[table]
+        contexts: List[Dict[str, Any]] = []
 
-            for column in ledger.columns:
-                if column not in frame:
-                    frame[column] = pd.NA
-                planned = ledger[column]
-                mask = planned.notna()
-                frame.loc[mask, column] = planned.loc[mask].to_numpy()
+        for row_index, row_key in enumerate(row_keys):
+            row = frame.iloc[row_index]
+            instance_id = row[instance_field]
+            known_records: Dict[str, List[Dict[str, Any]]] = {}
+            for context_step in definition.steps[: step_index + 1]:
+                context_frame = tables[context_step.table]
+                matching = context_frame[context_frame[instance_field] == instance_id]
+                records = [
+                    _known_record(record, instance_field, path_field)
+                    for _, record in matching.iterrows()
+                ]
+                if records:
+                    known_records[context_step.table] = records
 
-            declared = list(_schema_fields(definition.schemas[step.table]))
-            metadata = [definition.instance_id_field, definition.path_field]
-            tables[step.table] = frame[[*declared, *metadata]]
-        return tables
+            contexts.append(
+                {
+                    "rowKey": row_key,
+                    "scenarioInstanceId": instance_id,
+                    "scenarioPath": row[path_field],
+                    "currentTable": table,
+                    "currentRow": _known_record(row, instance_field, path_field),
+                    "knownRecords": known_records,
+                }
+            )
+        return contexts
+
+    @staticmethod
+    def _validate_enrichment_chunk(
+        table: str,
+        schema: Mapping[str, Any],
+        expected_keys: Sequence[str],
+        frame: pd.DataFrame,
+    ) -> None:
+        required_fields = {_ROW_KEY_FIELD, *_schema_fields(schema)}
+        missing_fields = required_fields - set(frame.columns)
+        if missing_fields:
+            raise ValueError(
+                f"Generator omitted fields from '{table}': "
+                f"{', '.join(sorted(missing_fields))}."
+            )
+        if len(frame) != len(expected_keys):
+            raise ValueError(
+                f"Generator returned {len(frame)} rows for '{table}', "
+                f"expected {len(expected_keys)}."
+            )
+
+        actual_keys = frame[_ROW_KEY_FIELD].astype(str).tolist()
+        duplicate_keys = sorted(
+            {key for key in actual_keys if actual_keys.count(key) > 1}
+        )
+        if duplicate_keys:
+            raise ValueError(
+                f"Generator returned duplicate row keys for '{table}': "
+                f"{', '.join(duplicate_keys)}."
+            )
+        if set(actual_keys) != set(expected_keys):
+            missing = sorted(set(expected_keys) - set(actual_keys))
+            unexpected = sorted(set(actual_keys) - set(expected_keys))
+            details = []
+            if missing:
+                details.append(f"missing {', '.join(missing)}")
+            if unexpected:
+                details.append(f"unexpected {', '.join(unexpected)}")
+            raise ValueError(
+                f"Generator returned invalid row keys for '{table}': "
+                f"{'; '.join(details)}."
+            )
+
+    @staticmethod
+    def _merge_enrichment_table(
+        definition: ScenarioDefinition,
+        table: str,
+        ledger: pd.DataFrame,
+        schema: Mapping[str, Any],
+        row_keys: Sequence[str],
+        generated: pd.DataFrame,
+    ) -> pd.DataFrame:
+        indexed = generated.copy().set_index(_ROW_KEY_FIELD, drop=True)
+        indexed.index = indexed.index.astype(str)
+        indexed = indexed.loc[list(row_keys)].reset_index(drop=True).astype(object)
+        frame = ledger.copy().reset_index(drop=True).astype(object)
+
+        for column in _schema_fields(schema):
+            mask = frame[column].isna()
+            frame.loc[mask, column] = indexed.loc[mask, column].to_numpy()
+
+        declared = list(_schema_fields(definition.schemas[table]))
+        metadata = [definition.instance_id_field, definition.path_field]
+        return frame[[*declared, *metadata]]
 
     @staticmethod
     def _apply_values(
@@ -681,18 +887,162 @@ class ScenarioEngine:
         for binding in definition.bindings:
             source_table, source_field = _split_reference(binding.source)
             source = tables[source_table]
-            values = (
-                source.groupby(instance_field, sort=False)[source_field]
-                .first()
-                .to_dict()
-            )
+            values = source.set_index(instance_field)[source_field].to_dict()
             for target in binding.targets:
                 target_table, target_field = _split_reference(target)
                 frame = tables[target_table]
                 if not frame.empty:
-                    frame[target_field] = (
-                        frame[instance_field].map(values).astype(object)
+                    missing_instances = sorted(set(frame[instance_field]) - set(values))
+                    if missing_instances:
+                        raise ValueError(
+                            f"Binding '{binding.name}' has no source value for "
+                            f"scenario instances: {', '.join(missing_instances)}."
+                        )
+                    frame[target_field] = pd.Series(
+                        [values[instance_id] for instance_id in frame[instance_field]],
+                        index=frame.index,
+                        dtype=object,
                     )
+                    if frame[target_field].isna().any():
+                        raise ValueError(
+                            f"Binding '{binding.name}' produced missing values for "
+                            f"target '{target}'."
+                        )
+
+    @staticmethod
+    def _validate_result(
+        definition: ScenarioDefinition,
+        plan: ScenarioPlan,
+        tables: Mapping[str, pd.DataFrame],
+    ) -> None:
+        """Reject output that violates ledger-owned structural invariants."""
+        errors: List[str] = []
+        instance_field = definition.instance_id_field
+        path_field = definition.path_field
+
+        for step in definition.steps:
+            table = step.table
+            expected = plan.tables[table].reset_index(drop=True)
+            actual = tables.get(table)
+            if actual is None:
+                errors.append(f"missing table '{table}'")
+                continue
+            actual = actual.reset_index(drop=True)
+            if len(actual) != len(expected):
+                errors.append(
+                    f"table '{table}' has {len(actual)} rows; expected {len(expected)}"
+                )
+                continue
+
+            for column in expected.columns:
+                if column not in actual:
+                    errors.append(f"table '{table}' is missing column '{column}'")
+                    continue
+                planned = expected[column]
+                for row_index in planned[planned.notna()].index:
+                    if not _values_equal(
+                        actual.at[row_index, column], planned.at[row_index]
+                    ):
+                        errors.append(
+                            f"table '{table}' row {row_index + 1} changed "
+                            f"ledger field '{column}'"
+                        )
+                        break
+
+            for primary_key in _primary_key_fields(definition.schemas[table]):
+                if actual[primary_key].isna().any():
+                    errors.append(
+                        f"table '{table}' has missing primary key '{primary_key}'"
+                    )
+                if actual[primary_key].duplicated().any():
+                    errors.append(
+                        f"table '{table}' has duplicate primary key '{primary_key}'"
+                    )
+
+            if not actual.empty:
+                valid_paths = {
+                    path.name
+                    for path in definition.resolved_paths()
+                    if step.name in path.steps
+                }
+                unexpected_paths = set(actual[path_field]) - valid_paths
+                if unexpected_paths:
+                    errors.append(
+                        f"table '{table}' contains invalid paths: "
+                        f"{', '.join(sorted(unexpected_paths))}"
+                    )
+
+        for step in definition.steps:
+            child = tables[step.table]
+            for child_field, (parent_table, parent_field) in _foreign_keys(
+                definition.schemas[step.table]
+            ).items():
+                parent = tables[parent_table]
+                parent_instances: Dict[Any, Set[str]] = {}
+                for _, parent_row in parent.iterrows():
+                    parent_instances.setdefault(parent_row[parent_field], set()).add(
+                        parent_row[instance_field]
+                    )
+                for _, child_row in child.iterrows():
+                    matching_instances = parent_instances.get(
+                        child_row[child_field], set()
+                    )
+                    if child_row[instance_field] not in matching_instances:
+                        errors.append(
+                            f"foreign key {step.table}.{child_field} does not resolve "
+                            "within its scenario instance"
+                        )
+                        break
+
+        for binding in definition.bindings:
+            source_table, source_field = _split_reference(binding.source)
+            source_values = (
+                tables[source_table].set_index(instance_field)[source_field].to_dict()
+            )
+            for target in binding.targets:
+                target_table, target_field = _split_reference(target)
+                for _, target_row in tables[target_table].iterrows():
+                    expected_value = source_values.get(
+                        target_row[instance_field], pd.NA
+                    )
+                    if not _values_equal(target_row[target_field], expected_value):
+                        errors.append(
+                            f"binding '{binding.name}' does not match target '{target}'"
+                        )
+                        break
+
+        for instance_id in plan.instance_ids:
+            previous_max: Optional[pd.Timestamp] = None
+            previous_step: Optional[str] = None
+            for step in definition.steps:
+                if not step.timestamp_field:
+                    continue
+                rows = tables[step.table]
+                rows = rows[rows[instance_field] == instance_id]
+                if rows.empty:
+                    continue
+                timestamps = pd.to_datetime(rows[step.timestamp_field], errors="coerce")
+                if timestamps.isna().any():
+                    errors.append(
+                        f"scenario '{instance_id}' has invalid timestamps in "
+                        f"step '{step.name}'"
+                    )
+                    continue
+                current_min = timestamps.min()
+                current_max = timestamps.max()
+                if previous_max is not None and current_min <= previous_max:
+                    errors.append(
+                        f"scenario '{instance_id}' step '{step.name}' does not occur "
+                        f"after '{previous_step}'"
+                    )
+                previous_max = current_max
+                previous_step = step.name
+
+        if errors:
+            details = "; ".join(errors[:10])
+            if len(errors) > 10:
+                details += f"; and {len(errors) - 10} more"
+            raise ValueError(f"Scenario integrity validation failed: {details}.")
 
 
 def _allocate_path_counts(
@@ -849,6 +1199,66 @@ def _slugify(value: str) -> str:
     return slug or "scenario"
 
 
+def _scenario_row_keys(
+    table: str,
+    frame: pd.DataFrame,
+    instance_field: str,
+) -> List[str]:
+    occurrences: Dict[str, int] = {}
+    keys: List[str] = []
+    table_slug = _slugify(table)
+    for instance_id in frame[instance_field]:
+        occurrence = occurrences.get(instance_id, 0) + 1
+        occurrences[instance_id] = occurrence
+        keys.append(f"{instance_id}:{table_slug}:{occurrence:04d}")
+    return keys
+
+
+def _is_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(result) if isinstance(result, (bool, type(pd.NA))) else False
+
+
+def _json_safe(value: Any) -> Any:
+    if _is_missing(value):
+        return None
+    if isinstance(value, (date, datetime, pd.Timestamp)):
+        return value.isoformat()
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except (TypeError, ValueError):
+            pass
+    return value
+
+
+def _known_record(
+    row: pd.Series,
+    instance_field: str,
+    path_field: str,
+) -> Dict[str, Any]:
+    return {
+        field: _json_safe(value)
+        for field, value in row.items()
+        if field not in {instance_field, path_field} and not _is_missing(value)
+    }
+
+
+def _values_equal(left: Any, right: Any) -> bool:
+    if _is_missing(left) or _is_missing(right):
+        return _is_missing(left) and _is_missing(right)
+    try:
+        result = left == right
+        return bool(result) if not hasattr(result, "all") else bool(result.all())
+    except (TypeError, ValueError):
+        return False
+
+
 def _scenario_prompt(
     definition: ScenarioDefinition,
     table: str,
@@ -862,4 +1272,20 @@ def _scenario_prompt(
         f"The deterministic scenario ledger uses these paths: {distribution}. "
         "Focus on realistic descriptive values; structural identifiers, foreign "
         "keys, statuses, and workflow timestamps are enforced by the ledger."
+    )
+
+
+def _scenario_enrichment_prompt(
+    base_prompt: str,
+    contexts: Sequence[Mapping[str, Any]],
+) -> str:
+    serialized_contexts = json.dumps(contexts, ensure_ascii=False, indent=2)
+    return (
+        f"{base_prompt}\n\n"
+        "Generate exactly one output object for each row context below. "
+        f"Copy each rowKey exactly into the '{_ROW_KEY_FIELD}' field, use every "
+        "rowKey once, and do not invent or omit keys. Generate the remaining fields "
+        "so they are consistent with the scenario path, current row, and known "
+        "records from earlier workflow steps. Return rows in any order.\n\n"
+        f"Row contexts:\n{serialized_contexts}"
     )
