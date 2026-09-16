@@ -10,6 +10,16 @@ from .schemas import ModelConfig
 from .db_schema_loader import DatabaseSchemaLoader
 from .codegen_cache import CodegenCache, compute_schema_hash
 from .run_report import RunReport, TableReport, ColumnReport
+from .scenarios import (
+    ScenarioBinding,
+    ScenarioDefinition,
+    ScenarioEngine,
+    ScenarioGenerationResult,
+    ScenarioPath,
+    ScenarioPlan,
+    ScenarioPlanSummary,
+    ScenarioStep,
+)
 
 __all__ = [
     'SyntheticDataGenerator',
@@ -20,6 +30,14 @@ __all__ = [
     'RunReport',
     'TableReport',
     'ColumnReport',
+    'ScenarioBinding',
+    'ScenarioDefinition',
+    'ScenarioEngine',
+    'ScenarioGenerationResult',
+    'ScenarioPath',
+    'ScenarioPlan',
+    'ScenarioPlanSummary',
+    'ScenarioStep',
 ]
 
 __version__ = '0.4.0'
