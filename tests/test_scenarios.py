@@ -1131,6 +1131,113 @@ def test_structural_validation_rejects_tampered_ledger_fields():
         engine._validate_result(definition, plan, tables)
 
 
+def test_rejects_fixed_value_for_referenced_parent_identity():
+    with pytest.raises(ValidationError, match="sets ledger-owned fields: code"):
+        ScenarioDefinition(
+            name="Ambiguous parent identity",
+            schemas={
+                "Parent": {"code": "text"},
+                "Child": {
+                    "parent_code": "foreign_key",
+                    "__foreign_keys__": {"parent_code": "Parent.code"},
+                },
+            },
+            steps=[
+                ScenarioStep(
+                    name="parent",
+                    table="Parent",
+                    values={"code": "shared"},
+                ),
+                ScenarioStep(name="child", table="Child"),
+            ],
+        )
+
+
+def test_rejects_path_override_for_referenced_parent_identity():
+    with pytest.raises(
+        ValidationError,
+        match="overrides ledger-owned fields on 'parent': code",
+    ):
+        ScenarioDefinition(
+            name="Ambiguous path identity",
+            schemas={
+                "Parent": {"code": "text"},
+                "Child": {
+                    "parent_code": "foreign_key",
+                    "__foreign_keys__": {"parent_code": "Parent.code"},
+                },
+            },
+            steps=[
+                ScenarioStep(name="parent", table="Parent"),
+                ScenarioStep(name="child", table="Child"),
+            ],
+            paths=[
+                ScenarioPath(
+                    name="shared",
+                    steps=["parent", "child"],
+                    overrides={"parent": {"code": "shared"}},
+                )
+            ],
+        )
+
+
+def test_rejects_binding_target_for_ledger_owned_foreign_key():
+    with pytest.raises(
+        ValidationError,
+        match="targets ledger-owned field 'Child.parent_code'",
+    ):
+        ScenarioDefinition(
+            name="Conflicting foreign key binding",
+            schemas={
+                "Parent": {"code": "text"},
+                "Child": {
+                    "parent_code": "foreign_key",
+                    "__foreign_keys__": {"parent_code": "Parent.code"},
+                },
+            },
+            steps=[
+                ScenarioStep(name="parent", table="Parent"),
+                ScenarioStep(name="child", table="Child"),
+            ],
+            bindings=[
+                ScenarioBinding(
+                    name="redundant-parent-code",
+                    source="Parent.code",
+                    targets=["Child.parent_code"],
+                )
+            ],
+        )
+
+
+def test_structural_validation_rejects_duplicate_referenced_parent_values():
+    definition = ScenarioDefinition(
+        name="Duplicate parent identity",
+        schemas={
+            "Parent": {"code": "text"},
+            "Child": {
+                "parent_code": "foreign_key",
+                "__foreign_keys__": {"parent_code": "Parent.code"},
+            },
+        },
+        steps=[
+            ScenarioStep(name="parent", table="Parent"),
+            ScenarioStep(name="child", table="Child"),
+        ],
+    )
+    engine = ScenarioEngine(UnexpectedTableGenerator())
+    plan = engine.plan(definition, instance_count=2)
+    tables = {name: frame.copy() for name, frame in plan.tables.items()}
+    shared_value = tables["Parent"].loc[0, "code"]
+    tables["Parent"].loc[1, "code"] = shared_value
+    tables["Child"].loc[1, "parent_code"] = shared_value
+
+    with pytest.raises(
+        ValueError,
+        match="referenced parent field Parent.code contains duplicate values",
+    ):
+        engine._validate_result(definition, plan, tables)
+
+
 def test_rejects_invalid_instance_and_batch_counts():
     definition = ScenarioDefinition(
         name="Count validation",

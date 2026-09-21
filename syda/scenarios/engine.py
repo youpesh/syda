@@ -739,6 +739,16 @@ class ScenarioEngine:
                 definition.schemas[step.table]
             ).items():
                 parent = tables[parent_table]
+                if parent[parent_field].isna().any():
+                    errors.append(
+                        f"referenced parent field {parent_table}.{parent_field} "
+                        "contains missing values"
+                    )
+                if parent[parent_field].duplicated().any():
+                    errors.append(
+                        f"referenced parent field {parent_table}.{parent_field} "
+                        "contains duplicate values"
+                    )
                 parent_instances: Dict[Any, Set[str]] = {}
                 for _, parent_row in parent.iterrows():
                     parent_instances.setdefault(parent_row[parent_field], set()).add(

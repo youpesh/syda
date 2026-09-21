@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ._utils import (
     _ROW_KEY_FIELD,
     _foreign_keys,
+    _identity_fields,
     _schema_fields,
     _split_reference,
     _validate_field_reference,
@@ -186,6 +187,21 @@ class ScenarioDefinition(BaseModel):
         known_steps = set(step_names)
         step_position = {name: index for index, name in enumerate(step_names)}
         step_by_table = {step.table: step.name for step in self.steps}
+        identity_fields = _identity_fields(self)
+        ledger_owned_fields: Dict[str, Set[str]] = {}
+        for step in self.steps:
+            owned = set(identity_fields[step.table])
+            owned.update(_foreign_keys(self.schemas[step.table]))
+            if step.timestamp_field:
+                owned.add(step.timestamp_field)
+            ledger_owned_fields[step.table] = owned
+
+            conflicting_values = set(step.values) & owned
+            if conflicting_values:
+                raise ValueError(
+                    f"Scenario step '{step.name}' sets ledger-owned fields: "
+                    f"{', '.join(sorted(conflicting_values))}."
+                )
 
         path_names = [path.name for path in paths]
         if len(path_names) != len(set(path_names)):
@@ -244,6 +260,13 @@ class ScenarioDefinition(BaseModel):
                         f"Scenario path '{path.name}' overrides unknown fields on "
                         f"'{override_step}': {', '.join(sorted(unknown_values))}."
                     )
+                conflicting_values = set(values) & ledger_owned_fields[step.table]
+                if conflicting_values:
+                    raise ValueError(
+                        f"Scenario path '{path.name}' overrides ledger-owned fields "
+                        f"on '{override_step}': "
+                        f"{', '.join(sorted(conflicting_values))}."
+                    )
 
         timestamp_offsets = [
             (
@@ -291,12 +314,17 @@ class ScenarioDefinition(BaseModel):
                         f"Scenario field '{target}' is targeted by multiple bindings."
                     )
                 bound_targets.add(target)
-                target_table, _ = _split_reference(target)
+                target_table, target_field = _split_reference(target)
                 target_step = step_by_table.get(target_table)
                 if target_step is None:
                     raise ValueError(
                         f"Binding '{binding.name}' target table '{target_table}' "
                         "is not a scenario step."
+                    )
+                if target_field in ledger_owned_fields[target_table]:
+                    raise ValueError(
+                        f"Binding '{binding.name}' targets ledger-owned field "
+                        f"'{target}'."
                     )
                 if step_position[source_step] > step_position[target_step]:
                     raise ValueError(

@@ -122,3 +122,9 @@ Generation proceeds in workflow order. A later step can therefore use both deter
 After enrichment, the engine verifies row counts, ledger-owned values, primary-key uniqueness, same-instance foreign keys, bindings, path membership, and timestamp order before returning or saving output.
 
 Scenario models reject unknown configuration fields. Paths cannot be empty or repeat a step, timestamp offsets must increase with workflow order, and a binding source must appear before its targets on every applicable path. Bindings with multi-row sources are rejected as ambiguous; model those with an explicit aggregation or selection step instead.
+
+Primary keys, referenced parent identities, child foreign keys, and workflow
+timestamps are owned by the structural ledger. Fixed step values, path overrides,
+and binding targets cannot write to those fields. Referenced parent identities must
+also remain non-null and globally unique so every child foreign key identifies
+exactly one parent row in the same scenario instance.
