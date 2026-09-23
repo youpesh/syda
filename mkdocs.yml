@@ -71,10 +71,10 @@ markdown_extensions:
 # Navigation structure
 nav:
   - Home:
-      Introduction: index.md
-      Quick Start: quickstart.md
-      Scenario Engine: scenario-engine.md
-      MCP Server: mcp.md
+      - Introduction: index.md
+      - Quick Start: quickstart.md
+      - Scenario Engine: scenario-engine.md
+      - MCP Server: mcp.md
   - Deep Dive:
       - Structured Data: 'deep_dive/structured_data.md'
       - Foreign Keys: 'deep_dive/foreign_keys.md'
