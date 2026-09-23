@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Callable, Union, Type, Any, Tuple
 from pydantic import create_model, TypeAdapter, Field
 from .schemas import ModelConfig
 from .llm import create_llm_client, LLMClient
-from .output import save_dataframe, save_dataframes, append_dataframe
+from .output import save_dataframe, save_dataframes, append_dataframe, load_dataframe
 from datetime import datetime, timezone
 from .codegen_cache import CodegenCache, compute_schema_hash
 from .run_report import RunReport, TableReport, ColumnReport
@@ -252,13 +252,16 @@ class SyntheticDataGenerator:
             # Add each foreign key relationship
             for fk_column, fk_info in fks.items():
                 # Handle different formats of foreign key info
-                if isinstance(fk_info, tuple) and len(fk_info) == 2:
-                    # Already in the correct format: (parent_schema, parent_column)
-                    parent_schema, parent_column = fk_info
+                if isinstance(fk_info, (tuple, list)) and len(fk_info) == 2:
+                    parent_schema, parent_column = fk_info[0], fk_info[1]
                 elif isinstance(fk_info, dict) and 'references' in fk_info:
-                    # Dictionary format with 'references' key
                     ref_parts = fk_info['references'].split('.')
                     parent_schema, parent_column = ref_parts[0], ref_parts[1]
+                elif isinstance(fk_info, str) and '.' in fk_info:
+                    ref_parts = fk_info.split('.')
+                    parent_schema, parent_column = ref_parts[0], ref_parts[1]
+                else:
+                    continue
                 extracted_foreign_keys[schema_name][fk_column] = (parent_schema, parent_column)
                 print(f"Using schema-defined foreign key: {schema_name}.{fk_column} -> {parent_schema}.{parent_column}")
                 
@@ -455,31 +458,26 @@ class SyntheticDataGenerator:
         generation_order = list(schemas.keys())
         parallel_levels: Optional[List[List[str]]] = None
 
-        try:
-            # Build dependency graph and determine generation order
-            dependency_graph = DependencyHandler.build_dependency_graph(
-                nodes=list(schemas.keys()),
-                dependencies=all_dependencies
-            )
-            generation_order = DependencyHandler.determine_generation_order(dependency_graph)
-            parallel_levels = DependencyHandler.compute_parallel_levels(dependency_graph)
+        dependency_graph = DependencyHandler.build_dependency_graph(
+            nodes=list(schemas.keys()),
+            dependencies=all_dependencies
+        )
+        generation_order = DependencyHandler.determine_generation_order(dependency_graph)
+        parallel_levels = DependencyHandler.compute_parallel_levels(dependency_graph)
 
-            print("\n[INFO] Generation order determined:")
-            for i, schema in enumerate(generation_order):
-                deps = all_dependencies.get(schema, [])
-                if deps:
-                    print(f"  {i+1}. {schema} (depends on: {', '.join(deps)})")
-                else:
-                    print(f"  {i+1}. {schema} (no dependencies)")
-            if _max_workers > 1 and parallel_levels:
-                parallelisable = sum(1 for lvl in parallel_levels if len(lvl) > 1)
-                print(f"[syda] Parallel mode: {_max_workers} workers, "
-                      f"{len(parallel_levels)} level(s), "
-                      f"{parallelisable} level(s) with concurrent tables")
-            print("")
-        except Exception as e:
-            print(f"Warning: Could not determine optimal generation order: {str(e)}")
-            print("Using the order provided in the schemas dictionary.")
+        print("\n[INFO] Generation order determined:")
+        for i, schema in enumerate(generation_order):
+            deps = all_dependencies.get(schema, [])
+            if deps:
+                print(f"  {i+1}. {schema} (depends on: {', '.join(deps)})")
+            else:
+                print(f"  {i+1}. {schema} (no dependencies)")
+        if _max_workers > 1 and parallel_levels:
+            parallelisable = sum(1 for lvl in parallel_levels if len(lvl) > 1)
+            print(f"[syda] Parallel mode: {_max_workers} workers, "
+                  f"{len(parallel_levels)} level(s), "
+                  f"{parallelisable} level(s) with concurrent tables")
+        print("")
         
         # Dictionary to hold generated data
         results = {}
@@ -540,12 +538,32 @@ class SyntheticDataGenerator:
             # Verify referential integrity using ForeignKeyHandler.
             # Pass output_dir + streamed_schemas so the verifier can reload
             # parent tables that were freed from memory after being flushed to disk.
-            self.fk_handler.verify_referential_integrity(
+            integrity_valid = self.fk_handler.verify_referential_integrity(
                 results, extracted_foreign_keys,
                 output_dir=output_dir,
                 streamed_schemas=streamed_schemas,
                 output_format=output_format,
             )
+            if not integrity_valid:
+                raise ValueError(
+                    "Referential integrity validation failed for generated data."
+                )
+
+            # The public method promises complete DataFrames for every schema.
+            # Tables may be slimmed or freed while children are generated to keep
+            # peak memory down, so restore their complete artifacts before return.
+            if output_dir:
+                ext = "json" if output_format == "json" else "csv"
+                for schema_name in streamed_schemas:
+                    artifact_path = os.path.join(
+                        output_dir, f"{schema_name.lower()}.{ext}"
+                    )
+                    if not os.path.exists(artifact_path):
+                        raise ValueError(
+                            f"Generated artifact missing for schema '{schema_name}': "
+                            f"{artifact_path}"
+                        )
+                    results[schema_name] = load_dataframe(artifact_path)
                     
         except Exception as e:
             raise e
@@ -808,12 +826,9 @@ class SyntheticDataGenerator:
                     if output_dir:
                         del results[parent]
                         print(f"[syda] Freed '{parent}' from memory (all FK children generated)")
-                    else:
-                        fk_cols = list(fk_exposed.get(parent, set()) & set(results[parent].columns))
-                        results[parent] = (
-                            results[parent][fk_cols] if fk_cols
-                            else pd.DataFrame(columns=list(results[parent].columns))
-                        )
+                    # In-memory callers expect full DataFrames in the public result.
+                    # Keep the parent intact when there is no persisted artifact to
+                    # restore it from.
 
         return results, streamed_schemas
         

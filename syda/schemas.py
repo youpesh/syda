@@ -4,7 +4,7 @@ Contains Pydantic models used for data validation and configuration.
 """
 
 from pydantic import BaseModel, Field, model_validator, field_validator
-from typing import Dict, Optional, Any, Literal, List, Union, Set, Annotated
+from typing import ClassVar, Dict, Optional, Any, Literal, List, Union, Set, Annotated
 import re
 
 
@@ -315,7 +315,7 @@ class Schema(BaseModel):
     fields: Dict[str, Union[str, Dict, SchemaField]] = Field(default_factory=dict)
     
     # Valid field types
-    VALID_TYPES: Set[str] = {
+    VALID_TYPES: ClassVar[Set[str]] = {
         # Core types
         'text', 'string', 'integer', 'int', 'float', 'number', 
         'boolean', 'bool', 'date', 'datetime', 'array', 'object',

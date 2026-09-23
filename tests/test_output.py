@@ -9,6 +9,8 @@ import csv
 from unittest.mock import patch, mock_open
 
 from syda.output import (
+    append_dataframe,
+    load_dataframe,
     save_dataframe,
     save_dataframes
 )
@@ -218,3 +220,25 @@ class TestSaveDataframes:
         # Check that the expected custom filenames were used
         assert "customers_data.csv" in called_paths
         assert "orders_data.csv" in called_paths
+
+
+class TestLoadDataframe:
+    def test_loads_regular_json_array(self, sample_df, tmp_path):
+        path = tmp_path / "regular.json"
+        sample_df.to_json(path, orient="records")
+
+        loaded = load_dataframe(str(path))
+
+        assert loaded.to_dict(orient="records") == sample_df.to_dict(orient="records")
+
+    def test_loads_streamed_json_lines_and_selects_columns(
+        self, sample_df, tmp_path
+    ):
+        path = tmp_path / "streamed.json"
+        append_dataframe(sample_df.iloc[:2], str(path), format="json")
+        append_dataframe(sample_df.iloc[2:], str(path), format="json")
+
+        loaded = load_dataframe(str(path), columns=["id", "name"])
+
+        assert list(loaded.columns) == ["id", "name"]
+        assert loaded["id"].tolist() == [1, 2, 3]

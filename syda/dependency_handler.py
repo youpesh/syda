@@ -8,6 +8,7 @@ process.
 import networkx as nx
 from typing import Dict, List, Tuple, Any, Set
 from .custom_generators import GeneratorManager
+from .output import load_dataframe
 import pandas as pd
 
 
@@ -153,10 +154,9 @@ class ForeignKeyHandler:
                     path = os.path.join(output_dir, f"{parent_schema.lower()}.{ext}")
                     if os.path.exists(path):
                         try:
-                            if ext == "csv":
-                                _disk_cache[cache_key] = pd.read_csv(path, usecols=[parent_column])
-                            else:
-                                _disk_cache[cache_key] = pd.read_json(path)[parent_column].to_frame()
+                            _disk_cache[cache_key] = load_dataframe(
+                                path, columns=[parent_column]
+                            )
                         except Exception as e:
                             print(f"  [WARNING] Could not reload {parent_schema} from disk: {e}")
                             return None
@@ -321,8 +321,11 @@ class DependencyHandler:
         while len(graph) > 0:
             ready = sorted(n for n in graph.nodes() if graph.in_degree(n) == 0)
             if not ready:
-                # Cycle guard: take all remaining nodes to avoid infinite loop
-                ready = sorted(graph.nodes())
+                cycle = nx.find_cycle(graph)
+                cycle_nodes = " -> ".join(str(edge[0]) for edge in cycle)
+                raise ValueError(
+                    f"Circular dependencies detected in schemas: {cycle_nodes}"
+                )
             levels.append(ready)
             graph.remove_nodes_from(ready)
         return levels
@@ -342,11 +345,12 @@ class DependencyHandler:
         """
         try:
             return list(nx.topological_sort(dependency_graph))
-        except nx.NetworkXUnfeasible:
-            # If there's a cycle in the graph, we can't sort topologically
-            # Fall back to using nodes in arbitrary order
-            print(f"Warning: Cycle detected in dependency graph. Using arbitrary order.")
-            return list(dependency_graph.nodes())
+        except nx.NetworkXUnfeasible as exc:
+            raise ValueError(
+                "Circular dependencies detected in schemas; generation order "
+                "cannot be determined."
+            ) from exc
         except Exception as e:
-            print(f"Warning: Could not determine optimal generation order: {str(e)}")
-            return list(dependency_graph.nodes())
+            raise ValueError(
+                f"Could not determine schema generation order: {e}"
+            ) from e

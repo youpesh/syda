@@ -73,6 +73,7 @@ nav:
   - Home:
       Introduction: index.md
       Quick Start: quickstart.md
+      Scenario Engine: scenario-engine.md
       MCP Server: mcp.md
   - Deep Dive:
       - Structured Data: 'deep_dive/structured_data.md'
@@ -110,7 +111,3 @@ nav:
       - SQLite File-Based Schemas: 'examples/database_integration/sqlite_save_schemas.md'
       - PostgreSQL: 'examples/database_integration/postgresql.md'
     - Miscellaneous: 'examples/miscellaneous.md'
-  
-    
-      
-  

@@ -7,6 +7,32 @@ import pandas as pd
 from typing import Dict, Optional, Union, List
 
 
+def load_dataframe(file_path: str, columns: Optional[List[str]] = None) -> pd.DataFrame:
+    """Load a generated CSV or JSON artifact.
+
+    JSON artifacts can be regular JSON arrays (the non-streaming writer) or
+    newline-delimited records (the streaming writer). This helper keeps that
+    storage detail out of generation and integrity-validation code.
+    """
+    if file_path.endswith(".csv"):
+        return pd.read_csv(file_path, usecols=columns)
+
+    if file_path.endswith(".json"):
+        with open(file_path, "r", encoding="utf-8") as artifact:
+            first_character = ""
+            while not first_character:
+                character = artifact.read(1)
+                if not character:
+                    break
+                if not character.isspace():
+                    first_character = character
+
+        dataframe = pd.read_json(file_path, lines=first_character != "[")
+        return dataframe[columns] if columns else dataframe
+
+    raise ValueError(f"Unsupported generated artifact format: {file_path}")
+
+
 def save_dataframe(
     df: pd.DataFrame,
     file_path: str,

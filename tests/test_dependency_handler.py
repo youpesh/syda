@@ -156,6 +156,16 @@ class TestDependencyHandler:
         # Check that no cycle was detected
         assert has_cycle is False
 
+    def test_cycle_cannot_be_sorted_or_parallelized(self):
+        graph = nx.DiGraph()
+        graph.add_edges_from([("A", "B"), ("B", "A")])
+
+        with pytest.raises(ValueError, match="Circular dependencies"):
+            DependencyHandler.determine_generation_order(graph)
+
+        with pytest.raises(ValueError, match="Circular dependencies"):
+            DependencyHandler.compute_parallel_levels(graph)
+
 
 class TestForeignKeyHandler:
     """Tests for the ForeignKeyHandler class."""

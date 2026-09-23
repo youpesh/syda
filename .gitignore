@@ -68,3 +68,15 @@ examples/structured_only/**/output/
 examples/unstructured_only/**/output/
 examples/large_dataset/output/
 examples/**/*.db
+
+# Web Platform
+platform/**/node_modules/
+platform/**/.react-router/
+platform/**/build/
+platform/**/dist/
+platform/**/.vite/
+platform/**/.venv/
+platform/**/.env
+platform/**/.env.*.local
+platform/backend/*.db
+platform/frontend/.agents/
