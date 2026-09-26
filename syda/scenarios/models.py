@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -78,12 +78,92 @@ class ScenarioBinding(BaseModel):
     model_config = _SCENARIO_MODEL_CONFIG
 
 
+class ScenarioCheck(BaseModel):
+    """Machine-checkable rule that Syda can enforce or evaluate after generation.
+
+    ``allowed_values`` constrains one field. ``temporal_order`` requires every
+    earlier timestamp for a scenario instance to be no later than its later
+    timestamp. Free-form business rules remain in ``ScenarioDefinition.rules``;
+    they are included in enrichment prompts but are not treated as executable.
+    """
+
+    name: str = Field(min_length=1)
+    kind: Literal["allowed_values", "temporal_order", "absence_by_value"]
+    table: Optional[str] = None
+    field: Optional[str] = None
+    values: List[Any] = Field(default_factory=list)
+    before: Optional[str] = None
+    after: Optional[str] = None
+    source: Optional[str] = None
+    value: Any = None
+    absent_table: Optional[str] = None
+
+    model_config = _SCENARIO_MODEL_CONFIG
+
+    @model_validator(mode="after")
+    def validate_check_shape(self) -> "ScenarioCheck":
+        if self.kind == "allowed_values":
+            if not self.table or not self.field or not self.values:
+                raise ValueError(
+                    "allowed_values checks require table, field, and at least one value."
+                )
+            if self.before or self.after or self.source or self.absent_table or self.value is not None:
+                raise ValueError("allowed_values checks cannot use other check fields.")
+        elif self.kind == "temporal_order":
+            if not self.before or not self.after or "." not in self.before or "." not in self.after:
+                raise ValueError(
+                    "temporal_order checks require before and after as Table.field references."
+                )
+            if self.table or self.field or self.values:
+                raise ValueError("temporal_order checks cannot use table/field/values.")
+            if self.source or self.absent_table or self.value is not None:
+                raise ValueError("temporal_order checks cannot use source/absent_table.")
+        elif self.kind == "absence_by_value":
+            if not self.source or "." not in self.source or not self.absent_table:
+                raise ValueError(
+                    "absence_by_value checks require source as Table.field and absent_table."
+                )
+            if self.before or self.after or self.table or self.field or self.values:
+                raise ValueError("absence_by_value checks cannot use other check fields.")
+        return self
+
+    def validate_references(self, schemas: Dict[str, Dict[str, Any]]) -> None:
+        """Validate table/field references and the types required by this check."""
+        if self.kind == "allowed_values":
+            if self.table not in schemas or self.field not in _schema_fields(schemas[self.table]):
+                raise ValueError(f"unknown field '{self.table}.{self.field}'")
+        elif self.kind == "temporal_order":
+            for reference in (self.before, self.after):
+                table, field = _split_reference(reference or "")
+                if table not in schemas or field not in _schema_fields(schemas[table]):
+                    raise ValueError(f"unknown field '{reference}'")
+                definition = schemas[table][field]
+                field_type = (
+                    definition if isinstance(definition, str)
+                    else definition.get("type") if isinstance(definition, dict)
+                    else None
+                )
+                if field_type not in {"date", "datetime"}:
+                    raise ValueError(
+                        f"'{reference}' is {field_type or 'untyped'}; expected date or datetime"
+                    )
+        else:
+            table, field = _split_reference(self.source or "")
+            if table not in schemas or field not in _schema_fields(schemas[table]):
+                raise ValueError(f"unknown field '{self.source}'")
+            if self.absent_table not in schemas:
+                raise ValueError(f"unknown table '{self.absent_table}'")
+
+
 class ScenarioDefinition(BaseModel):
     """Declarative definition of a multi-table business workflow.
 
     Attributes:
         name: Human-readable scenario name.
         description: Optional scenario context supplied during enrichment.
+        secondary_metric: Optional domain target supplied as generation context.
+        rules: Human-readable business rules supplied to the enrichment model.
+        checks: Typed rules enforced or evaluated by Syda.
         schemas: Syda schemas keyed by table name.
         steps: Workflow steps in dependency order.
         paths: Weighted branches through the workflow.
@@ -94,6 +174,9 @@ class ScenarioDefinition(BaseModel):
 
     name: str = Field(min_length=1)
     description: str = ""
+    secondary_metric: Dict[str, str] = Field(default_factory=dict, alias="secondaryMetric")
+    rules: List[str] = Field(default_factory=list)
+    checks: List[ScenarioCheck] = Field(default_factory=list)
     schemas: Dict[str, Dict[str, Any]]
     steps: List[ScenarioStep]
     paths: List[ScenarioPath] = Field(default_factory=list)
@@ -181,6 +264,11 @@ class ScenarioDefinition(BaseModel):
                         "does not exist."
                     )
 
+        for check in self.checks:
+            try:
+                check.validate_references(self.schemas)
+            except ValueError as error:
+                raise ValueError(f"Check '{check.name}': {error}.") from error
         paths = self.paths or [
             ScenarioPath(name="default", steps=step_names, weight=1.0)
         ]

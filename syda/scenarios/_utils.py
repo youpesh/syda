@@ -246,12 +246,25 @@ def _scenario_prompt(
 ) -> str:
     summary = definition.description or definition.name
     distribution = ", ".join(f"{path}={count}" for path, count in path_counts.items())
+    rules = "; ".join(definition.rules)
+    checks = "; ".join(check.name for check in definition.checks)
+    metric = ": ".join(
+        value for value in (
+            definition.secondary_metric.get("label"),
+            definition.secondary_metric.get("value"),
+        ) if value
+    )
+    rule_context = f" Business rules: {rules}." if rules else ""
+    check_context = f" Executable checks: {checks}." if checks else ""
+    metric_context = f" Target metric: {metric}." if metric else ""
     return (
         f"Generate realistic synthetic data for the '{table}' step of the "
         f"'{definition.name}' business scenario. Scenario: {summary}. "
+        f"{metric_context}{rule_context}{check_context} "
         f"The deterministic scenario ledger uses these paths: {distribution}. "
         "Focus on realistic descriptive values; structural identifiers, foreign "
-        "keys, statuses, and workflow timestamps are enforced by the ledger."
+        "keys, path overrides, and workflow timestamps are preserved by the ledger. "
+        "Executable allowed-values checks further constrain categorical fields."
     )
 
 

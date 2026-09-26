@@ -24,16 +24,16 @@ services:
     container_name: syda-backend
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-syda}
       CORS_ORIGINS: "http://localhost:5173,http://localhost:3000"
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     env_file:
       - path: ./backend/.env
         required: false
+    volumes:
+      - job_data:/app/platform/backend/data/jobs
+      - settings_data:/app/platform/backend/data/settings
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,7 +45,7 @@ services:
     container_name: syda-frontend
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       PORT: 3000
       BACKEND_URL: http://backend:8000
@@ -54,3 +54,5 @@ services:
 
 volumes:
   postgres_data:
+  job_data:
+  settings_data:

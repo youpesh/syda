@@ -10,6 +10,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -84,6 +85,7 @@ class ScenarioEngine:
         output_dir: Optional[str | Path] = None,
         output_format: str = "csv",
         generation_kwargs: Optional[Dict[str, Any]] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None,
     ) -> ScenarioGenerationResult:
         """Generate ``instance_count`` complete workflows.
 
@@ -126,6 +128,10 @@ class ScenarioEngine:
             table: frame.copy().reset_index(drop=True).astype(object)
             for table, frame in plan.tables.items()
         }
+        total_enrichment_rows = sum(
+            len(plan.tables[table]) for table in enrichment_schemas
+        )
+        completed_enrichment_rows = 0
         for step_index, step in enumerate(definition.steps):
             schema = enrichment_schemas.get(step.table)
             if not schema:
@@ -186,6 +192,13 @@ class ScenarioEngine:
                     part,
                 )
                 parts.append(part)
+                completed_enrichment_rows += len(chunk_contexts)
+                if progress_callback:
+                    progress_callback(
+                        completed_enrichment_rows,
+                        total_enrichment_rows,
+                        step.table,
+                    )
 
             generated = pd.concat(parts, ignore_index=True)
             tables[step.table] = self._merge_enrichment_table(
@@ -422,8 +435,85 @@ class ScenarioEngine:
                 for key, value in source_schema.items()
                 if key in {"__description__", "__table_description__"}
             }
+            for check in definition.checks:
+                if check.kind != "allowed_values" or check.table != step.table:
+                    continue
+                field_schema = fields.get(check.field)
+                if field_schema is None:
+                    continue
+                if isinstance(field_schema, str):
+                    field_schema = {"type": field_schema}
+                else:
+                    field_schema = dict(field_schema)
+                constraints = dict(field_schema.get("constraints", {}))
+                constraints["enum"] = list(check.values)
+                field_schema["constraints"] = constraints
+                fields[check.field] = field_schema
             schemas[step.table] = {**metadata, **fields}
         return schemas
+
+    @staticmethod
+    def evaluate_checks(
+        definition: ScenarioDefinition,
+        tables: Mapping[str, pd.DataFrame],
+    ) -> List[Dict[str, Any]]:
+        """Evaluate declared executable checks against generated table frames."""
+        results: List[Dict[str, Any]] = []
+        instance_field = definition.instance_id_field
+        for check in definition.checks:
+            violations = 0
+            if check.kind == "allowed_values":
+                frame = tables.get(check.table or "")
+                if frame is not None and check.field in frame:
+                    violations = int((~frame[check.field].isin(check.values)).sum())
+                else:
+                    violations = 1
+            elif check.kind == "temporal_order":
+                before_table, before_field = _split_reference(check.before or "")
+                after_table, after_field = _split_reference(check.after or "")
+                before = tables.get(before_table)
+                after = tables.get(after_table)
+                if (
+                    before is None or after is None
+                    or instance_field not in before or instance_field not in after
+                    or before_field not in before or after_field not in after
+                ):
+                    violations = 1
+                else:
+                    before_values = before[[instance_field, before_field]].copy()
+                    after_values = after[[instance_field, after_field]].copy()
+                    before_values[before_field] = pd.to_datetime(
+                        before_values[before_field], errors="coerce", utc=True
+                    )
+                    after_values[after_field] = pd.to_datetime(
+                        after_values[after_field], errors="coerce", utc=True
+                    )
+                    before_groups = before_values.groupby(instance_field)[before_field]
+                    after_groups = after_values.groupby(instance_field)[after_field]
+                    shared_instances = before_groups.indices.keys() & after_groups.indices.keys()
+                    for instance_id in shared_instances:
+                        earlier = before_groups.get_group(instance_id).dropna()
+                        later = after_groups.get_group(instance_id).dropna()
+                        if earlier.empty or later.empty or earlier.max() > later.min():
+                            violations += 1
+            else:
+                source_table, source_field = _split_reference(check.source or "")
+                source = tables.get(source_table)
+                absent = tables.get(check.absent_table or "")
+                if (
+                    source is None or absent is None
+                    or instance_field not in source or instance_field not in absent
+                    or source_field not in source
+                ):
+                    violations = 1
+                else:
+                    source_instances = set(
+                        source.loc[source[source_field] == check.value, instance_field]
+                    )
+                    forbidden_instances = source_instances & set(absent[instance_field])
+                    violations = len(forbidden_instances)
+            results.append({"name": check.name, "violations": violations})
+        return results
 
     @staticmethod
     def _build_row_contexts(
@@ -437,18 +527,26 @@ class ScenarioEngine:
         path_field = definition.path_field
         frame = tables[table]
         contexts: List[Dict[str, Any]] = []
+        records_by_table: Dict[str, Dict[Any, List[Dict[str, Any]]]] = {}
 
-        for row_index, row_key in enumerate(row_keys):
-            row = frame.iloc[row_index]
+        for context_step in definition.steps[: step_index + 1]:
+            context_frame = tables[context_step.table]
+            by_instance: Dict[Any, List[Dict[str, Any]]] = {}
+            for instance_id, group in context_frame.groupby(
+                instance_field,
+                sort=False,
+            ):
+                by_instance[instance_id] = [
+                    _known_record(record, instance_field, path_field)
+                    for record in group.to_dict(orient="records")
+                ]
+            records_by_table[context_step.table] = by_instance
+
+        for row_key, row in zip(row_keys, frame.to_dict(orient="records")):
             instance_id = row[instance_field]
             known_records: Dict[str, List[Dict[str, Any]]] = {}
             for context_step in definition.steps[: step_index + 1]:
-                context_frame = tables[context_step.table]
-                matching = context_frame[context_frame[instance_field] == instance_id]
-                records = [
-                    _known_record(record, instance_field, path_field)
-                    for _, record in matching.iterrows()
-                ]
+                records = records_by_table[context_step.table].get(instance_id, [])
                 if records:
                     known_records[context_step.table] = records
 

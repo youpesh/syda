@@ -9,7 +9,7 @@ from app.models.scenario import (
     EvaluationMetric,
     CostEstimate,
 )
-from app.models.entities import JobRecord, ScenarioRecord
+from app.models.entities import ChatConversation, JobRecord, ScenarioRecord, UserPreference, UserProviderCredential
 
 __all__ = [
     "SecondaryMetric",
@@ -23,4 +23,7 @@ __all__ = [
     "CostEstimate",
     "JobRecord",
     "ScenarioRecord",
+    "ChatConversation",
+    "UserPreference",
+    "UserProviderCredential",
 ]

@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any, Literal
+from syda.scenarios import ScenarioCheck
 
 class SecondaryMetric(BaseModel):
     label: str
@@ -33,7 +34,18 @@ class ScenarioConfiguration(BaseModel):
         description="Optional weighted workflow branches; an empty list uses the full workflow",
     )
     rules: List[str] = Field(description="Causal, temporal, and referential rules to enforce")
-    schemas: Optional[Dict[str, Any]] = Field(default=None, description="Native syda table schema definitions with types and foreign keys")
+    checks: List[ScenarioCheck] = Field(
+        default_factory=list,
+        description="Machine-checkable rules Syda can enforce and evaluate",
+    )
+    schemas: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Map each table name to an object of field definitions and optional __foreign_keys__. "
+            "Every table value must be an object, never null. Field definitions are a type string "
+            "or an object such as {type: date, constraints: {...}}."
+        ),
+    )
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -53,10 +65,16 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     message: str = Field(description="Conversational explanation of the scenario generated or modified")
-    scenario: ScenarioConfiguration = Field(description="Structured scenario configuration")
+    scenario: Optional[ScenarioConfiguration] = Field(
+        default=None,
+        description="Structured scenario configuration, only when the conversation has enough detail to draft one",
+    )
 
 class GenerateRequest(BaseModel):
     scenario: ScenarioConfiguration
+    scenario_id: Optional[str] = Field(default=None, alias="scenarioId")
+
+    model_config = ConfigDict(populate_by_name=True)
 
 class EvaluationMetric(BaseModel):
     key: str

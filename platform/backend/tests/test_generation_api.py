@@ -1,5 +1,6 @@
 import csv
 import io
+import uuid
 import zipfile
 
 from fastapi.testclient import TestClient
@@ -12,6 +13,19 @@ from app import database
 from app.api import generation
 from app.main import app
 from app.models.entities import JobRecord
+from app.models.user import User
+from app.api.auth import require_authenticated
+
+
+_TEST_USER = User(
+    id=uuid.uuid4(),
+    email="syda-test@example.com",
+    hashed_password="test-only",
+    is_active=True,
+    is_superuser=False,
+    is_verified=True,
+    display_name="Syda Test",
+)
 
 
 def _scenario(record_count: int = 11, paths: list[dict] | None = None) -> dict:
@@ -53,6 +67,7 @@ def _client(monkeypatch, tmp_path) -> TestClient:
     for key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     app.dependency_overrides.clear()
+    app.dependency_overrides[require_authenticated] = lambda: _TEST_USER
     return TestClient(app)
 
 
@@ -82,7 +97,13 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
             "scenario_coverage",
             "privacy_leakage",
             "referential_integrity",
+            "declared_rules",
         }
+        declared_rules = next(
+            metric for metric in stats["evaluationMetrics"]
+            if metric["key"] == "declared_rules"
+        )
+        assert declared_rules["status"] == "not_evaluated"
 
         download = client.get(result["downloadUrl"])
         assert download.status_code == 200
@@ -111,7 +132,7 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         report = client.get(f"/api/evaluation/{job_id}/report?format=json")
         assert report.status_code == 200
         assert report.json()["result"] == "partial"
-        assert len(report.json()["metrics"]) == 6
+        assert len(report.json()["metrics"]) == 7
 
         html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
         assert html_report.status_code == 200
@@ -194,8 +215,16 @@ def test_generation_estimate_discloses_offline_fallback(monkeypatch, tmp_path):
             "estimatedInputTokens": 0,
             "estimatedOutputTokens": 0,
             "estimatedCostUsd": 0.0,
-            "note": "No LLM provider key is configured; generation will use the local fallback.",
+            "note": "Local generation selected; no model API calls are estimated.",
         }
+
+
+def test_validation_distinguishes_executable_checks_from_text_guidance(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/validate", json={"scenario": _scenario()})
+        assert response.status_code == 200
+        assert response.json()["executable_checks_count"] == 0
+        assert response.json()["guidance_rules_count"] == 1
 
 
 def test_generation_estimate_counts_only_unconstrained_fields(monkeypatch, tmp_path):
@@ -214,7 +243,18 @@ def test_generation_estimate_counts_only_unconstrained_fields(monkeypatch, tmp_p
         },
     ]
     with _client(monkeypatch, tmp_path) as client:
-        monkeypatch.setenv("OPENAI_API_KEY", "estimate-only")
+        monkeypatch.setattr(
+            generation,
+            "resolve_provider",
+            lambda _db, _user_id: {
+                "id": "openai",
+                "name": "OpenAI",
+                "model": "gpt-4o-mini",
+                "agent_model": "openai:gpt-4o-mini",
+                "key": "test-only",
+                "base_url": None,
+            },
+        )
         response = client.post(
             "/api/estimate",
             json={"scenario": _scenario(record_count=8, paths=paths)},
@@ -263,6 +303,7 @@ def test_completed_job_without_files_returns_404(monkeypatch, tmp_path):
                     progress=100,
                     current_stage="Complete",
                     scenario=_scenario(),
+                    user_id=_TEST_USER.id,
                 )
             )
             session.commit()
@@ -282,6 +323,7 @@ def test_incomplete_job_can_be_polled_but_not_downloaded(monkeypatch, tmp_path):
                     progress=55,
                     current_stage="Generating records",
                     scenario=_scenario(),
+                    user_id=_TEST_USER.id,
                 )
             )
             session.commit()

@@ -3,6 +3,7 @@
 from .engine import ScenarioEngine, TableGenerator
 from .models import (
     ScenarioBinding,
+    ScenarioCheck,
     ScenarioDefinition,
     ScenarioGenerationResult,
     ScenarioPath,
@@ -13,6 +14,7 @@ from .models import (
 
 __all__ = [
     "ScenarioBinding",
+    "ScenarioCheck",
     "ScenarioDefinition",
     "ScenarioEngine",
     "ScenarioGenerationResult",

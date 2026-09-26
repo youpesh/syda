@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type FormEvent,
@@ -7,17 +8,16 @@ import {
 } from "react";
 import { DefaultChatTransport, type UIMessage } from "ai";
 import { useChat } from "@ai-sdk/react";
+import { Link, useLocation, useNavigate, useParams } from "react-router";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
-  Add01Icon,
   AiMagicIcon,
-  Analytics01Icon,
   ArrowUp02Icon,
   SparklesIcon,
 } from "@hugeicons/core-free-icons";
 
 import type { Route } from "./+types/home";
-import { Button } from "~/components/ui/button";
+import { Button, buttonVariants } from "~/components/ui/button";
 import {
   Card,
   CardContent,
@@ -28,14 +28,6 @@ import {
 } from "~/components/ui/card";
 import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
 import { Badge } from "~/components/ui/badge";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "~/components/ui/dialog";
 import {
   Bubble,
   BubbleContent,
@@ -53,31 +45,20 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from "~/components/ui/message-scroller";
-import { Separator } from "~/components/ui/separator";
 import { Spinner } from "~/components/ui/spinner";
-import { Progress, ProgressLabel, ProgressValue } from "~/components/ui/progress";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
-import {
-  Sidebar,
-  SidebarContent,
-  SidebarFooter,
-  SidebarGroup,
-  SidebarGroupContent,
-  SidebarGroupLabel,
-  SidebarHeader,
-  SidebarInset,
-  SidebarMenu,
-  SidebarMenuButton,
-  SidebarMenuItem,
-  SidebarProvider,
-  SidebarRail,
-  SidebarTrigger,
-} from "~/components/ui/sidebar";
 import { Textarea } from "~/components/ui/textarea";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "~/components/ui/dialog";
+import { Progress, ProgressLabel, ProgressValue } from "~/components/ui/progress";
+import { AppShell } from "~/components/studio/app-shell";
 import { DataPreview } from "~/components/studio/data-preview";
-import { EvaluationReport } from "~/components/studio/evaluation-report";
-import { ScenarioConfigurator } from "~/components/studio/scenario-configurator";
-import type { JobStats, ScenarioConfiguration } from "~/lib/studio-types";
+import type { ChatRunReference, CostEstimate, GenerationJob, SavedConversation, ScenarioConfiguration } from "~/lib/studio-types";
 
 export function meta({}: Route.MetaArgs) {
   return [
@@ -89,53 +70,59 @@ export function meta({}: Route.MetaArgs) {
   ];
 }
 
-const recentScenarios = [
-  { name: "Insurance claims", subtitle: "10k records · 15% denied" },
-  { name: "Patient journey", subtitle: "Last edited yesterday" },
-  { name: "E-commerce orders", subtitle: "25k records · 4 tables" },
-];
-
 const promptSuggestions = [
   {
     label: "Insurance claims",
     prompt:
-      "Generate 10,000 insurance claims where 15% are denied, with realistic diagnoses, providers, and payment timelines.",
+      "Design a synthetic data scenario for 10,000 insurance claims where 15% are denied, with realistic diagnoses, providers, and payment timelines.",
   },
   {
     label: "Patient journeys",
     prompt:
-      "Create 5,000 longitudinal patient journeys with diagnoses, treatments, follow-ups, and realistic care gaps.",
+      "Design a scenario for 5,000 longitudinal patient journeys with diagnoses, treatments, follow-ups, and realistic care gaps.",
   },
   {
     label: "E-commerce orders",
     prompt:
-      "Build an e-commerce dataset with 25,000 orders, customers, products, refunds, and seasonal purchasing patterns.",
+      "Plan an e-commerce dataset with 25,000 orders, customers, products, refunds, and seasonal purchasing patterns.",
   },
 ];
 
-type GenerationStatus =
-  | "idle"
-  | "generating"
-  | "validating"
-  | "evaluating"
-  | "complete"
-  | "failed";
-
-type ScenarioGeneration = {
-  status: GenerationStatus;
-  jobId?: string;
-  stats?: JobStats;
-  downloadUrl?: string;
-  error?: string;
-  progress?: number;
-  currentStage?: string;
-};
-
 type SydaMessage = UIMessage<unknown, { scenario: ScenarioConfiguration }>;
 
-const chatTransport = new DefaultChatTransport<SydaMessage>({
-  api: "/api/agent/chat",
-});
+type ChatRun = ChatRunReference;
+
+function titleForPrompt(prompt: string) {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (/^(hi|hello|hey|thanks|thank you|ok|okay|test)\W*$/i.test(normalized)) return "New conversation";
+  return normalized.length > 72 ? `${normalized.slice(0, 69).trimEnd()}…` : normalized || "New conversation";
+}
+
+function isUntitledConversation(title: string) {
+  return !title || title === "New conversation" || /^(hi|hello|hey|thanks|thank you|ok|okay|test)\W*$/i.test(title);
+}
+
+function firstUserPrompt(messages: SydaMessage[]) {
+  const firstUser = messages.find((message) => message.role === "user");
+  return firstUser?.parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join(" ") ?? "New conversation";
+}
+
+let legacyChatMigration: Promise<SavedConversation> | undefined;
+
+function createMigratedConversation(title: string) {
+  legacyChatMigration ??= fetch("/api/conversations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  }).then(async (response) => {
+    if (!response.ok) throw new Error(`Could not save the previous chat (${response.status}).`);
+    return await response.json() as SavedConversation;
+  }).finally(() => { legacyChatMigration = undefined; });
+  return legacyChatMigration;
+}
 
 function PromptComposer({
   value,
@@ -169,29 +156,24 @@ function PromptComposer({
         }
       }}
     >
-      <div className="border bg-card shadow-[0_14px_44px_-28px_oklch(0.2_0.02_260/0.45)] focus-within:border-ring focus-within:ring-1 focus-within:ring-ring/30">
+      <div className="relative overflow-hidden rounded-3xl border bg-card shadow-[0_14px_44px_-28px_oklch(0.2_0.02_260/0.45)] focus-within:border-ring focus-within:ring-1 focus-within:ring-ring/30">
         <Textarea
           aria-label="Describe your synthetic data scenario"
           autoFocus={!compact}
-          className={compact ? "min-h-20 resize-none border-0" : "min-h-28 resize-none border-0"}
+          className={compact ? "min-h-20 resize-none rounded-none border-0 pb-14 pr-16" : "min-h-28 resize-none rounded-none border-0 pb-14 pr-16"}
           disabled={disabled || isLoading}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={isLoading ? "Syda Agent is analyzing and compiling your scenario…" : "Describe the data you want to generate…"}
           value={value}
         />
-        <div className="flex items-center justify-between gap-3 px-2.5 pb-2.5">
-          <span className="hidden text-xs text-muted-foreground sm:inline">
-            {isLoading ? "Compiling scenario rules…" : "Enter to send · Shift + Enter for a new line"}
-          </span>
-          <Button aria-label="Send prompt" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">
-            {isLoading ? (
-              <Spinner />
-            ) : (
-              <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />
-            )}
-          </Button>
-        </div>
+        <Button aria-label="Send prompt" className="absolute right-3 bottom-3" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">
+          {isLoading ? (
+            <Spinner />
+          ) : (
+            <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />
+          )}
+        </Button>
       </div>
       {!compact && (
         <p className="mt-3 text-center text-xs text-muted-foreground">
@@ -204,45 +186,71 @@ function PromptComposer({
 
 function ScenarioCard({
   scenario,
-  status,
-  stats,
-  jobId,
-  error,
-  progress,
-  currentStage,
+  onEdit,
   onGenerate,
+  messageId,
 }: {
   scenario: ScenarioConfiguration;
-  status: GenerationStatus;
-  stats?: JobStats;
-  jobId?: string;
-  error?: string;
-  progress?: number;
-  currentStage?: string;
-  onGenerate: (scenario: ScenarioConfiguration) => void;
+  onEdit: (scenario: ScenarioConfiguration, messageId: string) => Promise<void>;
+  onGenerate: (scenario: ScenarioConfiguration) => Promise<void>;
+  messageId: string;
 }) {
-  const [draft, setDraft] = useState(scenario);
-  const [editDraft, setEditDraft] = useState(scenario);
-  const [configurationOpen, setConfigurationOpen] = useState(false);
-  const isRunning = ["generating", "validating", "evaluating"].includes(status);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string>();
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [estimate, setEstimate] = useState<CostEstimate>();
+  const [estimateLoading, setEstimateLoading] = useState(false);
+  const [estimateError, setEstimateError] = useState<string>();
+  const [generationError, setGenerationError] = useState<string>();
 
-  useEffect(() => {
-    setDraft(scenario);
-    setEditDraft(scenario);
-  }, [scenario]);
-
-  const openConfiguration = () => {
-    setEditDraft(draft);
-    setConfigurationOpen(true);
+  const openEditor = async () => {
+    setSaving(true);
+    setSaveError(undefined);
+    try {
+      await onEdit(scenario, messageId);
+    } catch (error) {
+      setSaveError(error instanceof Error ? error.message : "Could not save the scenario.");
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const saveConfiguration = () => {
-    setDraft(editDraft);
-    setConfigurationOpen(false);
+  const openReview = async () => {
+    setReviewOpen(true);
+    setEstimate(undefined);
+    setEstimateError(undefined);
+    setGenerationError(undefined);
+    setEstimateLoading(true);
+    try {
+      const response = await fetch("/api/estimate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenario }),
+      });
+      if (!response.ok) throw new Error(`Could not estimate this run (${response.status}).`);
+      setEstimate(await response.json() as CostEstimate);
+    } catch (error) {
+      setEstimateError(error instanceof Error ? error.message : "Could not estimate this run.");
+    } finally {
+      setEstimateLoading(false);
+    }
   };
 
-  const tableEntries = Object.entries(draft.schemas ?? {});
-  const totalPathWeight = draft.paths?.reduce((total, path) => total + path.weight, 0) ?? 0;
+  const startGeneration = async () => {
+    setSaving(true);
+    setGenerationError(undefined);
+    try {
+      await onGenerate(scenario);
+      setReviewOpen(false);
+    } catch (error) {
+      setGenerationError(error instanceof Error ? error.message : "Could not start dataset generation.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const tableEntries = Object.entries(scenario.schemas ?? {});
+  const totalPathWeight = scenario.paths?.reduce((total, path) => total + path.weight, 0) ?? 0;
 
   return (
     <div className="flex flex-col gap-4">
@@ -250,29 +258,30 @@ function ScenarioCard({
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
-              <CardTitle>{draft.title}</CardTitle>
-              <CardDescription>{draft.description}</CardDescription>
+              <CardTitle>{scenario.title}</CardTitle>
+              <CardDescription>{scenario.description}</CardDescription>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Badge variant="outline">{draft.recordCount.toLocaleString()} instances</Badge>
-              <Badge variant="outline">{Object.keys(draft.schemas ?? {}).length} tables</Badge>
+              <Badge variant="secondary">Draft plan</Badge>
+              <Badge variant="outline">{scenario.recordCount.toLocaleString()} instances</Badge>
+              <Badge variant="outline">{Object.keys(scenario.schemas ?? {}).length} tables</Badge>
             </div>
           </div>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <section className="flex flex-col gap-2" aria-labelledby="scenario-workflow">
+          {!!scenario.workflow.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-workflow">
             <h3 className="text-xs font-medium" id="scenario-workflow">Workflow</h3>
             <div className="flex flex-wrap gap-1.5">
-              {draft.workflow.map((step, index) => (
+              {scenario.workflow.map((step, index) => (
                 <Badge key={`${step}-${index}`} variant="secondary">{index + 1}. {step}</Badge>
               ))}
             </div>
-          </section>
-          {!!draft.paths?.length && (
+          </section>}
+          {!!scenario.paths?.length && (
             <section className="flex flex-col gap-2" aria-labelledby="scenario-paths">
               <h3 className="text-xs font-medium" id="scenario-paths">Scenario paths</h3>
               <div className="flex flex-wrap gap-1.5">
-                {draft.paths.map((path) => (
+                {scenario.paths.map((path) => (
                   <Badge key={path.name} variant="outline">
                     {path.name} · {Math.round((path.weight / totalPathWeight) * 100)}%
                   </Badge>
@@ -280,7 +289,7 @@ function ScenarioCard({
               </div>
             </section>
           )}
-          <section className="flex flex-col gap-2" aria-labelledby="scenario-schema">
+          {!!tableEntries.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-schema">
             <h3 className="text-xs font-medium" id="scenario-schema">Schema preview</h3>
             <div className="flex flex-wrap gap-1.5">
               {tableEntries.map(([tableName, table]) => (
@@ -289,299 +298,448 @@ function ScenarioCard({
                 </Badge>
               ))}
             </div>
-          </section>
-          <section className="flex flex-col gap-2" aria-labelledby="scenario-rules">
+          </section>}
+          {!!scenario.rules.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-rules">
             <h3 className="text-xs font-medium" id="scenario-rules">Rules</h3>
             <ul className="list-disc pl-4 text-xs text-muted-foreground">
-              {draft.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
+              {scenario.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
             </ul>
-            {draft.rules.length > 3 && <p className="text-xs text-muted-foreground">+{draft.rules.length - 3} more rules</p>}
-          </section>
+            {scenario.rules.length > 3 && <p className="text-xs text-muted-foreground">+{scenario.rules.length - 3} more rules</p>}
+          </section>}
         </CardContent>
-        <CardFooter className="justify-end gap-2">
-          <Button disabled={isRunning} onClick={openConfiguration} type="button" variant="outline">
-            Edit configuration
+        <CardFooter className="justify-between gap-2">
+          <Button disabled={saving} onClick={() => void openEditor()} type="button" variant="outline">
+            {saving ? <Spinner data-icon="inline-start" /> : null}{saving ? "Opening editor…" : "Edit full scenario"}
           </Button>
-          <Button disabled={isRunning} onClick={() => onGenerate(draft)} type="button">
-            {isRunning ? <Spinner data-icon="inline-start" /> : <HugeiconsIcon data-icon="inline-start" icon={SparklesIcon} strokeWidth={2} />}
-            {status === "failed" ? "Retry generation" : status === "complete" ? "Generate again" : isRunning ? "Generating…" : "Generate dataset"}
+          <Button onClick={() => void openReview()} type="button">
+            <HugeiconsIcon data-icon="inline-start" icon={SparklesIcon} strokeWidth={2} /> Review plan
           </Button>
         </CardFooter>
       </Card>
 
-      <Dialog onOpenChange={setConfigurationOpen} open={configurationOpen}>
-        <DialogContent className="max-h-[calc(100svh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] sm:max-w-5xl">
+      {saveError && <Alert variant="destructive"><AlertTitle>Could not open editor</AlertTitle><AlertDescription>{saveError}</AlertDescription></Alert>}
+
+      <Dialog onOpenChange={setReviewOpen} open={reviewOpen}>
+        <DialogContent className="max-h-[calc(100svh-2rem)] max-w-lg overflow-y-auto">
           <DialogHeader>
-            <DialogTitle>Edit generation configuration</DialogTitle>
-            <DialogDescription>
-              Review the schema, workflow, rules, validation, and estimated run cost before generation.
-            </DialogDescription>
+            <DialogTitle>Review before generating</DialogTitle>
+            <DialogDescription>This scenario is a plan. No dataset has been generated yet.</DialogDescription>
           </DialogHeader>
-          <div className="min-h-0 overflow-y-auto pr-1">
-            <ScenarioConfigurator onChange={setEditDraft} scenario={editDraft} />
+          <div className="space-y-5">
+            <div>
+              <h3 className="font-medium">{scenario.title}</h3>
+              <p className="mt-1 text-xs leading-5 text-muted-foreground">{scenario.description}</p>
+            </div>
+            <dl className="grid grid-cols-2 gap-3 rounded-2xl border bg-muted/30 p-4 text-xs">
+              <div><dt className="text-muted-foreground">Scenario instances</dt><dd className="mt-1 font-medium tabular-nums">{scenario.recordCount.toLocaleString()}</dd></div>
+              <div><dt className="text-muted-foreground">Connected tables</dt><dd className="mt-1 font-medium tabular-nums">{tableEntries.length || scenario.workflow.length}</dd></div>
+              <div><dt className="text-muted-foreground">Workflow steps</dt><dd className="mt-1 font-medium tabular-nums">{scenario.workflow.length}</dd></div>
+              <div><dt className="text-muted-foreground">Rules</dt><dd className="mt-1 font-medium tabular-nums">{scenario.rules.length}</dd></div>
+            </dl>
+            <section className="space-y-2">
+              <h3 className="text-xs font-medium">Workflow</h3>
+              <p className="text-xs leading-5 text-muted-foreground">{scenario.workflow.join(" → ")}</p>
+            </section>
+            <section className="space-y-2">
+              <h3 className="text-xs font-medium">Key rules</h3>
+              <ul className="list-disc space-y-1 pl-4 text-xs text-muted-foreground">
+                {scenario.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
+              </ul>
+              {scenario.rules.length > 3 && <p className="text-[10px] text-muted-foreground">Plus {scenario.rules.length - 3} more rules</p>}
+            </section>
+            <section className="rounded-2xl border p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div><h3 className="text-xs font-medium">Generation estimate</h3><p className="mt-1 text-[10px] text-muted-foreground">{estimate ? `${estimate.provider} · ${estimate.model}` : "Checking configured provider…"}</p></div>
+                <p className="text-sm font-semibold tabular-nums">{estimateLoading ? "…" : estimate?.estimatedCostUsd === 0 ? "No model cost" : estimate?.estimatedCostUsd == null ? "Unavailable" : `~$${estimate.estimatedCostUsd.toFixed(4)}`}</p>
+              </div>
+              {(estimate?.note || estimateError) && <p className="mt-2 text-[10px] leading-4 text-muted-foreground">{estimateError ?? estimate?.note}</p>}
+            </section>
+            {generationError && <Alert variant="destructive"><AlertTitle>Could not start generation</AlertTitle><AlertDescription>{generationError}</AlertDescription></Alert>}
           </div>
-          <DialogFooter>
-            <Button onClick={() => setConfigurationOpen(false)} type="button" variant="outline">Cancel</Button>
-            <Button onClick={saveConfiguration} type="button">Save configuration</Button>
+          <DialogFooter className="sm:justify-between">
+            <Button disabled={saving} onClick={() => void openEditor()} type="button" variant="outline">Edit full scenario</Button>
+            <Button disabled={saving} onClick={() => void startGeneration()} type="button">
+              {saving ? <Spinner data-icon="inline-start" /> : null}{saving ? "Starting dataset…" : "Generate dataset"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      {isRunning && (
-        <Card size="sm">
-          <CardContent>
-            <Progress value={progress ?? 10}>
-              <ProgressLabel>{currentStage ?? "Preparing generation…"}</ProgressLabel>
-              <ProgressValue>{(formattedValue) => formattedValue}</ProgressValue>
-            </Progress>
-          </CardContent>
-        </Card>
-      )}
-
-      {status === "failed" && (
-        <Alert variant="destructive">
-          <AlertTitle>Generation failed</AlertTitle>
-          <AlertDescription>
-            {error ?? "The generation service could not complete this dataset. Review the configuration and retry."}
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {status === "complete" && (
-        <>
-          <Alert>
-            <AlertTitle>{(stats?.recordsGenerated ?? draft.recordCount).toLocaleString()} records generated</AlertTitle>
-            <AlertDescription>
-              {stats?.pathCounts && Object.keys(stats.pathCounts).length
-                ? `${Object.values(stats.pathCounts).reduce((total, count) => total + count, 0).toLocaleString()} scenario instances completed. `
-                : ""}
-              Preview and download the generated tables or inspect the quality-gate report.
-            </AlertDescription>
-          </Alert>
-          <Tabs defaultValue="data">
-            <TabsList variant="line">
-              <TabsTrigger value="data">Data preview</TabsTrigger>
-              <TabsTrigger value="evaluation">Evaluation</TabsTrigger>
-            </TabsList>
-            <TabsContent className="pt-2" value="data">
-              <DataPreview complete jobId={jobId} />
-            </TabsContent>
-            <TabsContent className="pt-2" value="evaluation">
-              <EvaluationReport jobId={jobId} stats={stats} />
-            </TabsContent>
-          </Tabs>
-        </>
-      )}
     </div>
   );
 }
 
+function GenerationRunCard({ run }: { run: ChatRun }) {
+  const [job, setJob] = useState<GenerationJob>();
+  const [error, setError] = useState<string>();
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    const refresh = async () => {
+      try {
+        const response = await fetch(`/api/jobs/${run.jobId}`);
+        if (!response.ok) throw new Error(`Could not load run status (${response.status}).`);
+        const nextJob = await response.json() as GenerationJob;
+        if (cancelled) return;
+        setJob(nextJob);
+        setError(undefined);
+        if (!(["complete", "failed"].includes(nextJob.status))) {
+          timer = window.setTimeout(() => void refresh(), 3000);
+        }
+      } catch (fetchError) {
+        if (!cancelled) {
+          setError(fetchError instanceof Error ? fetchError.message : "Run status is unavailable.");
+          timer = window.setTimeout(() => void refresh(), 5000);
+        }
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [run.jobId]);
+
+  const status = job?.status ?? "generating";
+  const complete = status === "complete";
+  const failed = status === "failed";
+
+  return (
+    <Card className="border-primary/20">
+      <CardHeader className="flex flex-row items-start justify-between gap-3">
+        <div><CardTitle>{complete ? "Dataset ready" : failed ? "Generation failed" : "Generating dataset"}</CardTitle><CardDescription>{run.scenario.title}</CardDescription></div>
+        <Badge variant={failed ? "destructive" : complete ? "secondary" : "outline"}>{status}</Badge>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {!complete && !failed && <Progress value={job?.progress ?? 10}><ProgressLabel>{job?.currentStage ?? "Starting generation worker…"}</ProgressLabel><ProgressValue>{(value) => value}</ProgressValue></Progress>}
+        {(error || (failed && job?.currentStage)) && <p className="text-xs text-destructive">{error ?? job?.currentStage}</p>}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-[10px] text-muted-foreground">Run {run.jobId}</p>
+          <div className="flex gap-2">
+            {complete && (job?.downloadUrl || job?.filesAvailable) && <a className={buttonVariants({ size: "sm" })} href={job?.downloadUrl ?? `/api/download/${run.jobId}`}>Download dataset</a>}
+            <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data`}>Browse full dataset</Link>
+          </div>
+        </div>
+        {complete && job?.filesAvailable && <DataPreview compact complete jobId={run.jobId} showDownloads={false} />}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Home() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { conversationId } = useParams();
+  const conversationIdRef = useRef<string | undefined>(conversationId);
+  conversationIdRef.current = conversationId;
   const [prompt, setPrompt] = useState("");
-  const [generationByMessage, setGenerationByMessage] = useState<Record<string, ScenarioGeneration>>({});
-  const generationTimers = useRef<number[]>([]);
+  const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);
+  const [conversationTitle, setConversationTitle] = useState("");
+  const [loadedConversationId, setLoadedConversationId] = useState<string>();
+  const [conversationLoading, setConversationLoading] = useState(false);
+  const [conversationError, setConversationError] = useState<string>();
+  const skipConversationLoadRef = useRef<string | undefined>(undefined);
+  const editorReturnRef = useRef<{
+    editedScenario?: ScenarioConfiguration;
+    messageId: string;
+    generatedRun?: ChatRun;
+  } | undefined>(undefined);
+  const persistedSnapshotRef = useRef("");
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const chatTransport = useMemo(() => new DefaultChatTransport<SydaMessage>({
+    api: "/api/agent/chat",
+    prepareSendMessagesRequest: ({ body, id, messages, trigger, messageId }) => ({
+      body: {
+        ...body,
+        id,
+        messages,
+        trigger,
+        messageId,
+        conversationId: conversationIdRef.current,
+      },
+    }),
+  }), []);
   const { clearError, error, messages, sendMessage, setMessages, status, stop } = useChat<SydaMessage>({
     transport: chatTransport,
   });
   const isThinking = status === "submitted" || status === "streaming";
+
+  useEffect(() => {
+    const returnState = location.state as {
+      editedScenario?: ScenarioConfiguration;
+      messageId?: string;
+      generatedRun?: ChatRun;
+    } | null;
+    if (!returnState?.messageId || (!returnState.editedScenario && !returnState.generatedRun)) return;
+    editorReturnRef.current = { ...returnState, messageId: returnState.messageId };
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [location.key, location.pathname, location.search, location.state, navigate]);
+
+  useEffect(() => {
+    const returnState = editorReturnRef.current;
+    if (!returnState || (conversationId && loadedConversationId !== conversationId)) return;
+    if (returnState.editedScenario) {
+      setMessages((currentMessages) => currentMessages.map((message) => message.id === returnState.messageId
+        ? {
+            ...message,
+            parts: message.parts.map((part) => part.type === "data-scenario"
+              ? { ...part, data: returnState.editedScenario! }
+              : part),
+          }
+        : message));
+    }
+    if (returnState.generatedRun) {
+      setChatRuns((runs) => runs.some((run) => run.jobId === returnState.generatedRun!.jobId)
+        ? runs
+        : [...runs, returnState.generatedRun!]);
+    }
+    editorReturnRef.current = undefined;
+  }, [conversationId, loadedConversationId, setMessages]);
+
   const latestScenario = messages
     .flatMap((message) => message.parts)
     .filter((part) => part.type === "data-scenario")
     .at(-1)?.data;
 
-  const clearGenerationTimers = () => {
-    generationTimers.current.forEach((timer) => {
-      window.clearTimeout(timer);
-      window.clearInterval(timer);
-    });
-    generationTimers.current = [];
-  };
+  useEffect(() => {
+    let active = true;
+    if (conversationId && skipConversationLoadRef.current === conversationId) {
+      skipConversationLoadRef.current = undefined;
+      return () => { active = false; };
+    }
+
+    stop();
+    setConversationError(undefined);
+    if (!conversationId) {
+      setConversationLoading(false);
+      setConversationTitle("");
+      setLoadedConversationId(undefined);
+      conversationIdRef.current = undefined;
+      persistedSnapshotRef.current = "";
+
+      // Bring forward the last tab-local transcript once so the new durable
+      // history feature does not discard an in-progress pre-history chat.
+      let legacyMessages: SydaMessage[] = [];
+      let legacyRuns: ChatRun[] = [];
+      try {
+        const parsedMessages = JSON.parse(sessionStorage.getItem("syda:chat-messages") ?? "[]");
+        const parsedRuns = JSON.parse(sessionStorage.getItem("syda:chat-runs") ?? "[]");
+        if (Array.isArray(parsedMessages)) legacyMessages = parsedMessages as SydaMessage[];
+        if (Array.isArray(parsedRuns)) legacyRuns = parsedRuns as ChatRun[];
+      } catch {
+        sessionStorage.removeItem("syda:chat-messages");
+        sessionStorage.removeItem("syda:chat-runs");
+      }
+
+      if (legacyMessages.length && !sessionStorage.getItem("syda:legacy-chat-migrated")) {
+        const title = titleForPrompt(firstUserPrompt(legacyMessages));
+        void createMigratedConversation(title).then((conversation) => {
+          if (!active) return;
+          skipConversationLoadRef.current = conversation.id;
+          setConversationTitle(conversation.title);
+          setChatRuns(legacyRuns);
+          setMessages(legacyMessages);
+          setLoadedConversationId(conversation.id);
+          conversationIdRef.current = conversation.id;
+          persistedSnapshotRef.current = JSON.stringify({ title: conversation.title, messages: [], runs: [], scenarioDraft: undefined });
+          sessionStorage.setItem("syda:legacy-chat-migrated", "true");
+          sessionStorage.removeItem("syda:chat-messages");
+          sessionStorage.removeItem("syda:chat-runs");
+          window.dispatchEvent(new Event("syda:conversations-changed"));
+          navigate(`/app/${conversation.id}`, { replace: true });
+        }).catch((migrationError) => {
+          if (active) setConversationError(migrationError instanceof Error ? migrationError.message : "Could not migrate the previous chat.");
+        });
+      } else {
+        setMessages([]);
+        setChatRuns([]);
+      }
+      return () => { active = false; };
+    }
+
+    setConversationLoading(true);
+    setLoadedConversationId(undefined);
+    void fetch(`/api/conversations/${conversationId}`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(response.status === 404 ? "Chat not found." : `Could not load chat (${response.status}).`);
+        return await response.json() as SavedConversation;
+      })
+      .then((conversation) => {
+        if (!active) return;
+        const restoredMessages = [...conversation.messages] as SydaMessage[];
+        if (conversation.scenarioDraft) {
+          let assistantIndex = -1;
+          for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
+            if (restoredMessages[index].role === "assistant") {
+              assistantIndex = index;
+              break;
+            }
+          }
+          const assistantMessage = assistantIndex >= 0
+            ? restoredMessages[assistantIndex]
+            : { id: crypto.randomUUID(), role: "assistant" as const, parts: [] };
+          const scenarioPart = { type: "data-scenario" as const, id: "scenario", data: conversation.scenarioDraft };
+          const parts = assistantMessage.parts.filter((part) => part.type !== "data-scenario") as SydaMessage["parts"];
+          parts.push(scenarioPart as SydaMessage["parts"][number]);
+          const restoredAssistant = { ...assistantMessage, parts } as SydaMessage;
+          if (assistantIndex >= 0) restoredMessages[assistantIndex] = restoredAssistant;
+          else restoredMessages.push(restoredAssistant);
+        }
+        const restoredRuns = conversation.runs ?? [];
+        setConversationTitle(conversation.title);
+        setMessages(restoredMessages);
+        setChatRuns(restoredRuns);
+        setLoadedConversationId(conversation.id);
+        conversationIdRef.current = conversation.id;
+        persistedSnapshotRef.current = JSON.stringify({
+          title: conversation.title,
+          messages: restoredMessages,
+          runs: restoredRuns,
+          scenarioDraft: conversation.scenarioDraft ?? undefined,
+        });
+      })
+      .catch((loadError) => {
+        if (active) setConversationError(loadError instanceof Error ? loadError.message : "Could not load chat history.");
+      })
+      .finally(() => { if (active) setConversationLoading(false); });
+    return () => { active = false; };
+  }, [conversationId, navigate, setMessages, stop]);
+
+  useEffect(() => {
+    if (!conversationId || loadedConversationId !== conversationId || status === "streaming") return;
+    const payload = { title: conversationTitle, messages, runs: chatRuns, scenarioDraft: latestScenario };
+    const snapshot = JSON.stringify(payload);
+    if (snapshot === persistedSnapshotRef.current) return;
+    saveQueueRef.current = saveQueueRef.current
+      .catch(() => {})
+      .then(async () => {
+        const response = await fetch(`/api/conversations/${conversationId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: snapshot,
+        });
+        if (!response.ok) throw new Error(`Could not save chat history (${response.status}).`);
+        persistedSnapshotRef.current = snapshot;
+        setConversationError(undefined);
+        window.dispatchEvent(new Event("syda:conversations-changed"));
+      })
+      .catch((saveError) => {
+        setConversationError(saveError instanceof Error ? saveError.message : "Could not save chat history.");
+      });
+  }, [chatRuns, conversationId, conversationTitle, latestScenario, loadedConversationId, messages, status]);
 
   useEffect(() => () => {
-    clearGenerationTimers();
     stop();
   }, [stop]);
 
   const submitPrompt = async (promptOverride?: string) => {
     const text = (typeof promptOverride === "string" ? promptOverride : prompt).trim();
-    if (!text || isThinking) return;
+    if (!text || isThinking || conversationLoading || (conversationId && loadedConversationId !== conversationId)) return;
 
-    clearGenerationTimers();
+    setConversationError(undefined);
+    if (!conversationId) {
+      try {
+        const response = await fetch("/api/conversations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: titleForPrompt(text) }),
+        });
+        if (!response.ok) throw new Error(`Could not save this chat (${response.status}).`);
+        const conversation = await response.json() as SavedConversation;
+        skipConversationLoadRef.current = conversation.id;
+        conversationIdRef.current = conversation.id;
+        setConversationTitle(conversation.title);
+        setChatRuns([]);
+        setLoadedConversationId(conversation.id);
+        persistedSnapshotRef.current = JSON.stringify({ title: conversation.title, messages: [], runs: [], scenarioDraft: undefined });
+        window.dispatchEvent(new Event("syda:conversations-changed"));
+        navigate(`/app/${conversation.id}`, { replace: true });
+      } catch (createError) {
+        setConversationError(createError instanceof Error ? createError.message : "Could not save this chat.");
+        return;
+      }
+    }
+
+    if (conversationId && isUntitledConversation(conversationTitle) && !isUntitledConversation(text)) {
+      setConversationTitle(titleForPrompt(text));
+    }
+
     setPrompt("");
     clearError();
     await sendMessage({ text });
   };
 
   const startNewScenario = () => {
-    clearGenerationTimers();
     stop();
     setPrompt("");
     setMessages([]);
-    setGenerationByMessage({});
+    setChatRuns([]);
+    setConversationTitle("");
+    setLoadedConversationId(undefined);
+    setConversationError(undefined);
+    conversationIdRef.current = undefined;
+    persistedSnapshotRef.current = "";
+    navigate("/app");
   };
 
-  const failGeneration = (messageId: string, error: string, jobId?: string) => {
-    setGenerationByMessage((current) => ({
-      ...current,
-      [messageId]: {
-        ...current[messageId],
-        status: "failed",
-        error,
-        jobId,
-        currentStage: "Generation failed",
-      },
-    }));
+  const openEditor = async (scenario: ScenarioConfiguration, messageId: string) => {
+    const response = await fetch("/api/scenarios", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenario),
+    });
+    if (!response.ok) throw new Error(`Could not save scenario (${response.status}).`);
+    const saved = await response.json() as { id: string };
+    window.dispatchEvent(new Event("syda:scenarios-changed"));
+    const returnTo = conversationId ? `/app/${conversationId}` : "/app";
+    navigate(`/scenarios/${saved.id}?returnTo=${encodeURIComponent(returnTo)}&messageId=${encodeURIComponent(messageId)}`);
   };
 
-  const generate = async (messageId: string, scenario: ScenarioConfiguration) => {
-    clearGenerationTimers();
-    setGenerationByMessage((current) => ({
-      ...current,
-      [messageId]: {
-        status: "generating",
-        progress: 5,
-        currentStage: "Submitting generation job",
-      },
-    }));
+  const startGeneration = async (scenario: ScenarioConfiguration, messageId: string) => {
+    const validationResponse = await fetch("/api/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scenario }),
+    });
+    if (!validationResponse.ok) throw new Error(`Could not validate this scenario (${validationResponse.status}).`);
+    const validation = await validationResponse.json() as { valid: boolean; schema_errors?: string[] };
+    if (!validation.valid) throw new Error(validation.schema_errors?.join(" ") || "Fix the scenario before generating.");
+
+    const saveResponse = await fetch("/api/scenarios", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(scenario),
+    });
+    if (!saveResponse.ok) throw new Error(`Could not save this scenario (${saveResponse.status}).`);
+    const saved = await saveResponse.json() as { id: string };
+    window.dispatchEvent(new Event("syda:scenarios-changed"));
 
     try {
-      const res = await fetch("/api/generate", {
+      const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scenario }),
+        body: JSON.stringify({ scenario, scenarioId: saved.id }),
       });
-
-      if (!res.ok) {
-        const payload = await res.json().catch(() => undefined) as { detail?: string } | undefined;
-        throw new Error(payload?.detail ?? `Generation request failed (${res.status}).`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => undefined) as { detail?: string } | undefined;
+        throw new Error(body?.detail ?? `Could not start generation (${response.status}).`);
       }
-
-      const jobData = await res.json();
-      const jobId = jobData.jobId;
-      setGenerationByMessage((current) => ({
-        ...current,
-        [messageId]: {
-          status: jobData.status as GenerationStatus,
-          jobId,
-          progress: jobData.progress,
-          currentStage: jobData.currentStage,
-        },
-      }));
-
-      const interval = window.setInterval(async () => {
-        try {
-          const pollRes = await fetch(`/api/status/${jobId}`);
-          if (!pollRes.ok) {
-            failGeneration(messageId, `Status check failed (${pollRes.status}).`, jobId);
-            window.clearInterval(interval);
-            return;
-          }
-          const statusData = await pollRes.json();
-
-          if (statusData.status === "failed") {
-            failGeneration(messageId, statusData.currentStage || "Generation failed.", jobId);
-            window.clearInterval(interval);
-            return;
-          }
-
-          setGenerationByMessage((current) => ({
-            ...current,
-            [messageId]: {
-              status: statusData.status as GenerationStatus,
-              jobId: statusData.jobId,
-              downloadUrl: statusData.downloadUrl,
-              stats: statusData.stats,
-              progress: statusData.progress,
-              currentStage: statusData.currentStage,
-            },
-          }));
-
-          if (statusData.status === "complete") {
-            window.clearInterval(interval);
-          }
-        } catch (e) {
-          failGeneration(messageId, e instanceof Error ? e.message : "Status check failed.", jobId);
-          window.clearInterval(interval);
-        }
-      }, 400);
-
-      generationTimers.current.push(interval);
-    } catch (err) {
-      failGeneration(
-        messageId,
-        err instanceof Error ? err.message : "The generation service is unavailable.",
-      );
+      const job = await response.json() as { jobId: string };
+      setChatRuns((runs) => [...runs, { messageId, jobId: job.jobId, scenarioId: saved.id, scenario }]);
+    } catch (error) {
+      throw new Error(`The scenario was saved, but generation could not start. ${error instanceof Error ? error.message : "Try again from the scenario editor."}`);
     }
   };
 
-  const openExample = (name: string) => {
-    clearGenerationTimers();
-    const example = promptSuggestions.find((item) =>
-      name.toLowerCase().startsWith(item.label.split(" ")[0].toLowerCase()),
-    );
-    submitPrompt(example?.prompt ?? promptSuggestions[0].prompt);
-  };
-
   return (
-    <SidebarProvider>
-      <Sidebar collapsible="icon">
-        <SidebarHeader className="gap-3 p-3">
-          <div className="flex h-8 items-center gap-2 px-1">
-            <div className="flex size-6 items-center justify-center bg-primary text-primary-foreground">
-              <HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} />
-            </div>
-            <span className="text-sm font-semibold tracking-[-0.02em] group-data-[collapsible=icon]:hidden">Syda</span>
-          </div>
-          <Button className="w-full group-data-[collapsible=icon]:px-0" onClick={startNewScenario} variant="outline">
-            <HugeiconsIcon data-icon="inline-start" icon={Add01Icon} strokeWidth={2} />
-            <span className="group-data-[collapsible=icon]:hidden">New scenario</span>
-          </Button>
-        </SidebarHeader>
+    <AppShell title={conversationTitle || latestScenario?.title || "New scenario"} subtitle={messages.length ? "Scenario design chat" : "Describe what you want to generate"} onNewScenario={startNewScenario}>
 
-        <SidebarContent>
-          <SidebarGroup>
-            <SidebarGroupLabel>Recent scenarios</SidebarGroupLabel>
-            <SidebarGroupContent>
-              <SidebarMenu>
-                {recentScenarios.map((scenario) => (
-                  <SidebarMenuItem key={scenario.name}>
-                    <SidebarMenuButton isActive={latestScenario?.title.toLowerCase().startsWith(scenario.name.toLowerCase().split(" ")[0])} onClick={() => openExample(scenario.name)} tooltip={scenario.name}>
-                      <HugeiconsIcon icon={Analytics01Icon} strokeWidth={2} />
-                      <span className="flex min-w-0 flex-col group-data-[collapsible=icon]:hidden">
-                        <span className="truncate">{scenario.name}</span>
-                        <span className="truncate text-[10px] font-normal text-muted-foreground">{scenario.subtitle}</span>
-                      </span>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                ))}
-              </SidebarMenu>
-            </SidebarGroupContent>
-          </SidebarGroup>
+        {conversationError && <div className="mx-auto mt-4 w-full max-w-3xl px-5"><Alert variant="destructive"><AlertTitle>Chat history issue</AlertTitle><AlertDescription>{conversationError}</AlertDescription></Alert></div>}
 
-        </SidebarContent>
-
-        <SidebarFooter className="text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
-          Configure → generate → evaluate
-        </SidebarFooter>
-        <SidebarRail />
-      </Sidebar>
-
-      <SidebarInset className="h-svh overflow-hidden">
-        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b px-4">
-          <div className="flex items-center gap-2">
-            <SidebarTrigger />
-            <Separator className="h-4" orientation="vertical" />
-            <div>
-              <p className="text-xs font-medium">{latestScenario?.title ?? "New scenario"}</p>
-              <p className="hidden text-[10px] text-muted-foreground sm:block">
-                {messages.length ? "Draft configuration" : "Describe what you want to generate"}
-              </p>
-            </div>
-          </div>
-          <Badge variant="outline">MVP studio</Badge>
-        </header>
-
-        {!messages.length ? (
+        {conversationLoading ? (
+          <main className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"><Spinner /> Loading chat history…</main>
+        ) : !messages.length ? (
           <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-12">
             <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_38%,oklch(0.96_0.025_265),transparent_38%)]" />
             <div className="relative flex w-full max-w-2xl flex-col items-center">
@@ -593,7 +751,7 @@ export default function Home() {
               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">
                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.
               </p>
-              <PromptComposer disabled={isThinking} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
+              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {promptSuggestions.map((suggestion) => (
                   <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">
@@ -614,8 +772,14 @@ export default function Home() {
                         .filter((part) => part.type === "text")
                         .map((part) => part.text)
                         .join("");
-                      const scenario = message.parts.find((part) => part.type === "data-scenario")?.data;
-                      const generation = generationByMessage[message.id] ?? { status: "idle" as const };
+                      const scenarioPart = message.parts.find((part) => part.type === "data-scenario");
+                      const candidateScenario = scenarioPart?.data;
+                      const scenario = candidateScenario
+                        && candidateScenario.workflow?.length >= 2
+                        && candidateScenario.rules?.length > 0
+                        && Object.keys(candidateScenario.schemas ?? {}).length > 0
+                        ? candidateScenario
+                        : undefined;
                       const isStreamingThis = status === "streaming" && index === messages.length - 1 && message.role === "assistant";
 
                       return (
@@ -643,16 +807,13 @@ export default function Home() {
                                   )}
                                   {scenario && (
                                     <ScenarioCard
-                                      currentStage={generation.currentStage}
-                                      error={generation.error}
-                                      jobId={generation.jobId}
-                                      onGenerate={(draft) => generate(message.id, draft)}
-                                      progress={generation.progress}
+                                      messageId={message.id}
+                                      onEdit={openEditor}
+                                      onGenerate={(nextScenario) => startGeneration(nextScenario, message.id)}
                                       scenario={scenario}
-                                      stats={generation.stats}
-                                      status={generation.status}
                                     />
                                   )}
+                                  {chatRuns.filter((run) => run.messageId === message.id).map((run) => <GenerationRunCard key={run.jobId} run={run} />)}
                                 </BubbleContent>
                               </Bubble>
                             </MessageContent>
@@ -687,7 +848,7 @@ export default function Home() {
             <div className="shrink-0 border-t bg-background px-5 py-4">
               <div className="mx-auto w-full max-w-3xl">
                 <div className="flex items-end gap-2">
-                  <PromptComposer compact disabled={isThinking} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
+                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
                   {isThinking && (
                     <Button onClick={() => stop()} type="button" variant="outline">
                       Stop
@@ -699,7 +860,6 @@ export default function Home() {
             </div>
           </main>
         )}
-      </SidebarInset>
-    </SidebarProvider>
+    </AppShell>
   );
 }

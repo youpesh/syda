@@ -5,7 +5,7 @@ load_dotenv(override=True)
 load_dotenv("backend/.env", override=True)
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
@@ -32,14 +32,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.api import agent_router, generation_router
+from app.api import agent_router, auth_router, conversations_router, generation_router, scenarios_router, settings_router
+from app.api.auth import require_authenticated
 
-app.include_router(agent_router, prefix="/api")
-app.include_router(generation_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
+app.include_router(auth_router)
+
+app.include_router(conversations_router, prefix="/api", dependencies=[Depends(require_authenticated)])
+app.include_router(agent_router, prefix="/api", dependencies=[Depends(require_authenticated)])
+app.include_router(generation_router, prefix="/api", dependencies=[Depends(require_authenticated)])
+app.include_router(scenarios_router, prefix="/api", dependencies=[Depends(require_authenticated)])
+app.include_router(settings_router, prefix="/api", dependencies=[Depends(require_authenticated)])
 
 # Also include directly for direct REST API callers without /api prefix
-app.include_router(agent_router)
-app.include_router(generation_router)
+app.include_router(conversations_router, dependencies=[Depends(require_authenticated)])
+app.include_router(agent_router, dependencies=[Depends(require_authenticated)])
+app.include_router(generation_router, dependencies=[Depends(require_authenticated)])
+app.include_router(scenarios_router, dependencies=[Depends(require_authenticated)])
+app.include_router(settings_router, dependencies=[Depends(require_authenticated)])
 
 @app.get("/health")
 @app.get("/api/health")

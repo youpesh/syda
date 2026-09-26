@@ -21,10 +21,18 @@ async function proxyRequest(request: Request) {
 
   const response = await fetch(targetUrl, init);
 
+  const responseHeaders = new Headers(response.headers);
+  const contentType = responseHeaders.get("content-type") || "";
+  if (contentType.includes("text/event-stream")) {
+    responseHeaders.set("Cache-Control", "no-cache, no-transform");
+    responseHeaders.set("Content-Encoding", "identity");
+    responseHeaders.set("x-no-compression", "1");
+  }
+
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
-    headers: response.headers,
+    headers: responseHeaders,
   });
 }
 

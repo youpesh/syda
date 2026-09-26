@@ -78,5 +78,8 @@ platform/**/.vite/
 platform/**/.venv/
 platform/**/.env
 platform/**/.env.*.local
+platform/backend/data/
 platform/backend/*.db
 platform/frontend/.agents/
+.rama-frontend/
+uv.lock

@@ -1,4 +1,3 @@
-import os
 import io
 import json
 import html
@@ -23,8 +22,11 @@ from syda.generate import SyntheticDataGenerator
 from syda.output import save_dataframes
 from syda.scenarios import ScenarioDefinition, ScenarioEngine, ScenarioPath, ScenarioStep
 
+from app.api.auth import require_authenticated
 from app.database import get_db, SessionLocal
 from app.models.entities import JobRecord, ScenarioRecord
+from app.provider_settings import resolve_provider
+from app.models.user import User
 from app.models.scenario import (
     GenerateRequest,
     JobStatusResponse,
@@ -48,6 +50,8 @@ def _update_job_in_db(job_id: str, updates: Dict[str, Any]):
         job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
         if job:
             for key, val in updates.items():
+                if key == "current_stage" and isinstance(val, str):
+                    val = val[:255]
                 setattr(job, key, val)
             db.commit()
     except Exception as e:
@@ -81,12 +85,17 @@ def _synthesize_relational_tables(
             for col_name, col_info in fields.items():
                 col_type = col_info if isinstance(col_info, str) else col_info.get("type", "text")
                 constraints = col_info.get("constraints", {}) if isinstance(col_info, dict) else {}
+                enum_values = constraints.get("enum")
 
-                # 1. Primary keys
-                if constraints.get("primary_key") or col_name.endswith("_id") and col_name == f"{table_name.lower()}_id":
+                # 1. Preserve constrained values, including scenario-ledger row keys.
+                if enum_values:
+                    row[col_name] = enum_values[(i - 1) % len(enum_values)]
+
+                # 2. Primary keys
+                elif constraints.get("primary_key") or col_name.endswith("_id") and col_name == f"{table_name.lower()}_id":
                     row[col_name] = i
 
-                # 2. Foreign keys referencing previously generated parent tables
+                # 3. Foreign keys referencing previously generated parent tables
                 elif col_name in fks or col_type == "foreign_key":
                     fk_target = fks.get(col_name)
                     parent_table = None
@@ -109,7 +118,7 @@ def _synthesize_relational_tables(
                     else:
                         row[col_name] = max(1, (i % 20) + 1)
 
-                # 3. Numeric types
+                # 4. Numeric types
                 elif col_type in ("integer", "int"):
                     min_val = constraints.get("min", 1)
                     max_val = constraints.get("max", 1000)
@@ -120,7 +129,7 @@ def _synthesize_relational_tables(
                     max_val = constraints.get("max", 500.0)
                     row[col_name] = round(random.uniform(float(min_val), float(max_val)), 2)
 
-                # 4. Email / date / datetime / text
+                # 5. Email / date / datetime / text
                 elif col_type == "email" or "email" in col_name:
                     row[col_name] = f"user_{i}@example.com"
 
@@ -224,6 +233,9 @@ def _scenario_definition(
     return ScenarioDefinition(
         name=scenario.title,
         description=scenario.description,
+        secondaryMetric=scenario.secondary_metric.model_dump(),
+        rules=scenario.rules,
+        checks=scenario.checks,
         schemas=schemas,
         steps=steps,
         paths=[
@@ -356,6 +368,11 @@ def _evaluation_metrics(
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
     causal_value, causal_violations, causal_checked = _temporal_consistency(dfs, schemas)
+    executable_checks = ScenarioEngine.evaluate_checks(
+        _scenario_definition(scenario, schemas), dfs
+    )
+    check_violations = sum(item["violations"] for item in executable_checks)
+    checked_rules = len(executable_checks)
     missing_steps = [step for step in scenario.workflow if step not in dfs or dfs[step].empty]
     coverage_value = f"{100 * (len(scenario.workflow) - len(missing_steps)) / max(1, len(scenario.workflow)):.1f}%"
 
@@ -411,6 +428,23 @@ def _evaluation_metrics(
             detail="Checks every declared foreign key against generated parent keys.",
             violations=referential_violations,
         ),
+        EvaluationMetric(
+            key="declared_rules",
+            label="Declared rule checks",
+            status=(
+                "not_evaluated" if checked_rules == 0
+                else "pass" if check_violations == 0
+                else "fail"
+            ),
+            value=(
+                "No executable checks" if checked_rules == 0
+                else f"{checked_rules - sum(bool(item['violations']) for item in executable_checks)}/{checked_rules} checks passed"
+            ),
+            detail=(
+                "Checks machine-readable rules. Free-text rules are provided to the model but need a structured check to be verified."
+            ),
+            violations=check_violations,
+        ),
     ]
     evaluated = [metric for metric in metrics if metric.status != "not_evaluated"]
     result = "fail" if any(metric.status == "fail" for metric in evaluated) else (
@@ -419,7 +453,7 @@ def _evaluation_metrics(
     return metrics, result, sum(metric.violations for metric in metrics)
 
 
-async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration):
+async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration, provider: dict[str, Any]):
     """
     Asynchronous generation pipeline using syda.generate.SyntheticDataGenerator
     and saving datasets to disk while persisting job metadata in the database.
@@ -449,28 +483,36 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration)
         dfs: Dict[str, pd.DataFrame] = {}
         path_counts: Dict[str, int] = {}
         definition = _scenario_definition(scenario, schemas)
+        last_reported_progress = [55]
 
-        # Attempt to use syda.generate.SyntheticDataGenerator if LLM key is configured
-        openai_key = os.getenv("OPENAI_API_KEY")
-        gemini_key = os.getenv("GEMINI_API_KEY")
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        def report_generation_progress(
+            completed_rows: int,
+            total_rows: int,
+            table_name: str,
+        ) -> None:
+            if total_rows < 1:
+                return
+            progress = 55 + min(29, int(29 * completed_rows / total_rows))
+            if progress > last_reported_progress[0]:
+                last_reported_progress[0] = progress
+                _update_job_in_db(job_id, {
+                    "progress": progress,
+                    "current_stage": (
+                        f"Generating {table_name} records "
+                        f"({completed_rows:,}/{total_rows:,} rows)"
+                    ),
+                })
 
-        if openai_key or anthropic_key or gemini_key:
+        # The provider is fixed when the run is submitted, even if settings change.
+        if provider["id"] != "offline":
             try:
-                model_cfg = (
-                    ModelConfig(provider="openai", model_name="gpt-4o-mini", batch_size=10)
-                    if openai_key
-                    else (
-                        ModelConfig(provider="anthropic", model_name="claude-3-5-haiku-20241022", batch_size=10)
-                        if anthropic_key
-                        else ModelConfig(provider="gemini", model_name="gemini-3.6-flash", batch_size=10)
-                    )
-                )
+                model_cfg = ModelConfig(provider=provider["id"], model_name=provider["model"], batch_size=10, extra_kwargs={"api_key": provider["key"], **({"base_url": provider["base_url"]} if provider.get("base_url") else {})})
                 generator = SyntheticDataGenerator(model_config=model_cfg)
                 result = await asyncio.to_thread(
                     ScenarioEngine(generator).generate,
                     definition,
                     scenario.record_count,
+                    progress_callback=report_generation_progress,
                 )
                 dfs = result.tables
                 path_counts = result.path_counts
@@ -482,6 +524,7 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration)
                 ScenarioEngine(_LocalTableGenerator()).generate,
                 definition,
                 scenario.record_count,
+                progress_callback=report_generation_progress,
             )
             dfs = result.tables
             path_counts = result.path_counts
@@ -536,19 +579,24 @@ async def start_generation(
     req: GenerateRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
 ):
     """
     Accepts scenario configuration with validated syda schemas,
     persists the initial job, and dispatches generation.
     """
-    job_id = str(uuid.uuid4())[:8]
+    job_id = str(uuid.uuid4())
+    if req.scenario_id and not db.query(ScenarioRecord).filter(ScenarioRecord.id == req.scenario_id, ScenarioRecord.user_id == user.id).first():
+        raise HTTPException(status_code=404, detail="Scenario not found")
 
     new_job = JobRecord(
         id=job_id,
+        user_id=user.id,
         status="generating",
         progress=10,
         current_stage="Initializing Syda generation worker",
         scenario=req.scenario.model_dump(by_alias=True),
+        scenario_id=req.scenario_id,
     )
     try:
         db.add(new_job)
@@ -561,7 +609,7 @@ async def start_generation(
             detail="The generation database is unavailable. Restart the backend or check DATABASE_URL.",
         ) from error
 
-    background_tasks.add_task(_run_generation_pipeline, job_id, req.scenario)
+    background_tasks.add_task(_run_generation_pipeline, job_id, req.scenario, resolve_provider(db, user.id))
 
     return JobStatusResponse(
         job_id=job_id,
@@ -572,7 +620,7 @@ async def start_generation(
 
 
 @router.post("/estimate", response_model=CostEstimate)
-async def estimate_generation(req: GenerateRequest):
+async def estimate_generation(req: GenerateRequest, db: Session = Depends(get_db), user: User = Depends(require_authenticated)):
     """Estimate model usage before generation using schema size and generation mode."""
     schemas = _scenario_schemas(req.scenario)
     definition = _scenario_definition(req.scenario, schemas)
@@ -598,21 +646,17 @@ async def estimate_generation(req: GenerateRequest):
         else sum(field_counts.values()) * 180
     )
 
-    if os.getenv("OPENAI_API_KEY"):
-        provider, model = "OpenAI", "gpt-4o-mini"
-    elif os.getenv("ANTHROPIC_API_KEY"):
-        provider, model = "Anthropic", "claude-3-5-haiku-20241022"
-    elif os.getenv("GEMINI_API_KEY"):
-        provider, model = "Google", "gemini-3.6-flash"
-    else:
+    selection = resolve_provider(db, user.id)
+    if selection["id"] == "offline":
         return CostEstimate(
             provider="Offline",
             model="Local schema synthesizer",
             estimatedInputTokens=0,
             estimatedOutputTokens=0,
             estimatedCostUsd=0.0,
-            note="No LLM provider key is configured; generation will use the local fallback.",
+            note="Local generation selected; no model API calls are estimated.",
         )
+    provider, model = selection["name"], selection["model"]
 
     try:
         from syda.run_report import _estimate_cost
@@ -632,9 +676,9 @@ async def estimate_generation(req: GenerateRequest):
 
 
 @router.get("/status/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str, db: Session = Depends(get_db)):
+async def get_job_status(job_id: str, db: Session = Depends(get_db), user: User = Depends(require_authenticated)):
     """Poll status and measured metrics for an active or completed generation job."""
-    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -651,20 +695,38 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/jobs")
-async def list_jobs(db: Session = Depends(get_db), limit: int = 50):
+async def list_jobs(db: Session = Depends(get_db), user: User = Depends(require_authenticated), limit: int = 50):
     """Return the persisted history of synthetic generation jobs."""
-    jobs = db.query(JobRecord).order_by(JobRecord.created_at.desc()).limit(limit).all()
-    return [job.to_dict() for job in jobs]
+    jobs = db.query(JobRecord).filter(JobRecord.user_id == user.id).order_by(JobRecord.created_at.desc()).limit(limit).all()
+    return [_job_payload(job) for job in jobs]
+
+
+def _job_payload(job: JobRecord) -> Dict[str, Any]:
+    payload = job.to_dict()
+    job_dir = DATA_DIR / job.id
+    payload["filesAvailable"] = job.status == "complete" and job_dir.exists() and any(job_dir.glob("*.csv"))
+    return payload
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(require_authenticated)):
+    """Return one persisted run with its scenario snapshot and results."""
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_payload(job)
 
 
 @router.get("/preview/{job_id}")
 async def preview_generated_dataset(
     job_id: str,
-    limit: int = Query(10, ge=1, le=50),
+    limit: int = Query(25, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
 ):
-    """Return a small, browser-safe preview of every generated table."""
-    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    """Return one page of every generated table for browsing in the UI."""
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "complete":
@@ -681,7 +743,7 @@ async def preview_generated_dataset(
     }
     tables = {}
     for path in csv_files:
-        raw_frame = pd.read_csv(path, nrows=limit)
+        raw_frame = pd.read_csv(path, skiprows=range(1, offset + 1), nrows=limit)
         frame = raw_frame.astype(object).where(pd.notna(raw_frame), None)
         tables[path.stem] = {
             "columns": frame.columns.tolist(),
@@ -696,9 +758,10 @@ async def download_evaluation_report(
     job_id: str,
     format: str = Query("json", pattern="^(json|html)$"),
     db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
 ):
     """Download the structured evaluation report as JSON or HTML."""
-    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "complete" or not job.stats:
@@ -743,12 +806,13 @@ async def download_generated_dataset(
     table: Optional[str] = Query(None, description="Optional specific table name to download"),
     format: str = Query("csv", pattern="^(csv|json)$"),
     db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
 ):
     """
     Streams generated dataset(s). If multiple relational tables were generated,
     returns a zip archive containing all tables, or single table CSV if specified.
     """
-    job = db.query(JobRecord).filter(JobRecord.id == job_id).first()
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.status != "complete":
@@ -859,7 +923,8 @@ async def validate_scenario(req: GenerateRequest):
 
     return {
         "valid": len(schema_errors) == 0,
-        "evaluated_rules_count": len(scenario.rules),
+        "executable_checks_count": len(scenario.checks),
+        "guidance_rules_count": len(scenario.rules),
         "workflow_steps_count": len(scenario.workflow),
         "evaluated_tables_count": evaluated_tables,
         "warnings": warnings,
