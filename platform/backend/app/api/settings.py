@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_authenticated
-from app.database import get_db
-from app.models.entities import UserPreference
-from app.models.user import User
-from app.provider_settings import (
+from .auth import require_authenticated
+from ..database import get_db
+from ..models.entities import UserPreference
+from ..models.user import User
+from ..provider_settings import (
     PROVIDERS,
     credential_source,
     provider_key,

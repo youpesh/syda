@@ -10,8 +10,8 @@ from uuid import UUID
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy.orm import Session
 
-from app.database import SessionLocal
-from app.models.entities import (
+from .database import SessionLocal
+from .models.entities import (
     JobRecord,
     ScenarioRecord,
     UserPreference,

@@ -1,7 +1,13 @@
 import uuid
-from datetime import datetime
-from sqlalchemy import Column, String, Integer, Text, JSON, DateTime, ForeignKey, Uuid
-from app.database import Base
+from typing import Any
+from datetime import datetime, timezone
+from sqlalchemy import String, Integer, Text, JSON, DateTime, ForeignKey, Uuid
+from sqlalchemy.orm import Mapped, mapped_column
+from ..database import Base
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class JobRecord(Base):
@@ -9,17 +15,17 @@ class JobRecord(Base):
 
     __tablename__ = "generation_jobs"
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
-    user_id = Column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=True, index=True)
-    status = Column(String(32), default="generating", index=True)
-    scenario_id = Column(String(36), nullable=True, index=True)
-    progress = Column(Integer, default=0)
-    current_stage = Column(String(255), default="Initializing")
-    scenario = Column(JSON, nullable=False)
-    stats = Column(JSON, nullable=True)
-    download_url = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="generating", index=True)
+    scenario_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    current_stage: Mapped[str] = mapped_column(String(255), default="Initializing")
+    scenario: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    stats: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    download_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
     def to_dict(self):
         return {
@@ -41,17 +47,17 @@ class ScenarioRecord(Base):
 
     __tablename__ = "scenarios"
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
-    user_id = Column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=True, index=True)
-    title = Column(String(255), nullable=False, index=True)
-    description = Column(Text, nullable=False)
-    record_count = Column(Integer, default=10000)
-    secondary_metric = Column(JSON, nullable=True)
-    workflow = Column(JSON, nullable=False)
-    rules = Column(JSON, nullable=False)
-    configuration = Column(JSON, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=True, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    record_count: Mapped[int] = mapped_column(Integer, default=10000)
+    secondary_metric: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    workflow: Mapped[Any] = mapped_column(JSON, nullable=False)
+    rules: Mapped[Any] = mapped_column(JSON, nullable=False)
+    configuration: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
     def to_dict(self):
         configuration = self.configuration or {
@@ -81,8 +87,8 @@ class WorkspacePreference(Base):
 
     __tablename__ = "workspace_preferences"
 
-    key = Column(String(64), primary_key=True)
-    value = Column(String(255), nullable=False)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
 class UserPreference(Base):
@@ -90,9 +96,9 @@ class UserPreference(Base):
 
     __tablename__ = "user_preferences"
 
-    user_id = Column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), primary_key=True)
-    key = Column(String(64), primary_key=True)
-    value = Column(String(255), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), primary_key=True)
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
 class UserProviderCredential(Base):
@@ -100,9 +106,9 @@ class UserProviderCredential(Base):
 
     __tablename__ = "user_provider_credentials"
 
-    user_id = Column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), primary_key=True)
-    provider = Column(String(40), primary_key=True)
-    encrypted_key = Column(Text, nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(40), primary_key=True)
+    encrypted_key: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class ChatConversation(Base):
@@ -110,23 +116,23 @@ class ChatConversation(Base):
 
     __tablename__ = "chat_conversations"
 
-    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
-    user_id = Column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
-    title = Column(String(160), nullable=False, default="New conversation")
-    messages = Column(JSON, nullable=False, default=list)
-    runs = Column(JSON, nullable=False, default=list)
-    scenario_draft = Column(JSON, nullable=True)
-    draft_version = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()), index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(160), nullable=False, default="New conversation")
+    messages: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    runs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
+    scenario_draft: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    draft_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     def to_dict(self, include_content: bool = True):
-        payload = {
+        payload: dict[str, Any] = {
             "id": self.id,
             "title": self.title,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
             "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
-            "messageCount": len(self.messages or []),
+            "messageCount": len(self.messages) if isinstance(self.messages, (list, tuple)) else 0,
         }
         if include_content:
             payload["messages"] = self.messages or []

@@ -1,18 +1,18 @@
 """Per-user conversation history for AI-assisted scenario design."""
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_authenticated
-from app.database import get_db
-from app.models.entities import ChatConversation
-from app.models.scenario import ScenarioConfiguration
-from app.models.user import User
+from .auth import require_authenticated
+from ..database import get_db
+from ..models.entities import ChatConversation
+from ..models.scenario import ScenarioConfiguration
+from ..models.user import User
 
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
@@ -105,7 +105,7 @@ def update_conversation(
         if conversation.scenario_draft != draft:
             conversation.scenario_draft = draft
             conversation.draft_version = (conversation.draft_version or 0) + 1
-    conversation.updated_at = datetime.utcnow()
+    conversation.updated_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(conversation)
     return conversation.to_dict(include_content=False)

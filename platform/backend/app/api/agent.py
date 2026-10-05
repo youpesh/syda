@@ -2,21 +2,21 @@ import asyncio
 import json
 import logging
 import re
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, TypeGuard
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_authenticated
-from app.database import get_db
-from app.models.entities import ChatConversation
-from app.models.scenario import ChatRequest, ChatResponse, ScenarioConfiguration
-from app.models.user import User
-from app.agents.scenario_agent import compile_scenario_agent
-from app.provider_settings import resolve_provider
+from .auth import require_authenticated
+from ..database import get_db
+from ..models.entities import ChatConversation
+from ..models.scenario import ChatRequest, ChatResponse, ScenarioConfiguration
+from ..models.user import User
+from ..agents.scenario_agent import compile_scenario_agent
+from ..provider_settings import resolve_provider
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ def _message_text(message: dict[str, Any]) -> str:
             if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
         )
         if parts_text.strip():
-            return parts_text.strip()
+            return str(parts_text.strip())
 
     # 2. Check content (string or list of dicts)
     content = message.get("content")
@@ -55,7 +55,7 @@ def _message_text(message: dict[str, Any]) -> str:
             if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
         )
         if list_text.strip():
-            return list_text.strip()
+            return str(list_text.strip())
 
     # 3. Check direct text field
     text = message.get("text")
@@ -106,7 +106,7 @@ def _latest_scenario(messages: list[dict[str, Any]]) -> ScenarioConfiguration | 
     return None
 
 
-def _scenario_is_valid_draft(scenario: ScenarioConfiguration | None) -> bool:
+def _scenario_is_valid_draft(scenario: ScenarioConfiguration | None) -> TypeGuard[ScenarioConfiguration]:
     return bool(
         scenario
         and len(scenario.workflow) >= 2
@@ -185,7 +185,7 @@ async def chat_with_agent(
         if conversation and current_scenario:
             conversation.scenario_draft = current_scenario.model_dump(by_alias=True)
             conversation.draft_version = (conversation.draft_version or 0) + 1
-            conversation.updated_at = datetime.utcnow()
+            conversation.updated_at = datetime.now(timezone.utc)
             db.commit()
 
     async def stream():
@@ -196,12 +196,12 @@ async def chat_with_agent(
                 history=history,
                 provider_selection=provider_selection,
             )
-            if conversation and _scenario_is_valid_draft(response.scenario):
+            if conversation and response.scenario and _scenario_is_valid_draft(response.scenario):
                 serialized_draft = response.scenario.model_dump(by_alias=True)
                 if conversation.scenario_draft != serialized_draft:
                     conversation.scenario_draft = serialized_draft
                     conversation.draft_version = (conversation.draft_version or 0) + 1
-                    conversation.updated_at = datetime.utcnow()
+                    conversation.updated_at = datetime.now(timezone.utc)
                     db.commit()
             text_id = "scenario-response"
             yield _sse({"type": "start"})
