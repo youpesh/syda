@@ -13,9 +13,9 @@ from fastapi_users_db_sqlalchemy import SQLAlchemyUserDatabase
 from pydantic import Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import SessionLocal, get_async_db
-from app.models.entities import JobRecord, ScenarioRecord
-from app.models.user import User
+from ..database import SessionLocal, get_async_db
+from ..models.entities import JobRecord, ScenarioRecord
+from ..models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
     async def on_after_register(self, user: User, request: Request | None = None) -> None:
         # If an account is added to an installation that still has pre-auth data,
         # adopt that legacy shared data for the first account only.
-        from app.provider_settings import adopt_legacy_shared_data
+        from ..provider_settings import adopt_legacy_shared_data
 
         with SessionLocal() as session:
             account_count = session.query(User.id).count()

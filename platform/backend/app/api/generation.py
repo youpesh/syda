@@ -22,12 +22,12 @@ from syda.generate import SyntheticDataGenerator
 from syda.output import save_dataframes
 from syda.scenarios import ScenarioDefinition, ScenarioEngine, ScenarioPath, ScenarioStep
 
-from app.api.auth import require_authenticated
-from app.database import get_db, SessionLocal
-from app.models.entities import JobRecord, ScenarioRecord
-from app.provider_settings import resolve_provider
-from app.models.user import User
-from app.models.scenario import (
+from .auth import require_authenticated
+from ..database import get_db, SessionLocal
+from ..models.entities import JobRecord, ScenarioRecord
+from ..provider_settings import resolve_provider
+from ..models.user import User
+from ..models.scenario import (
     GenerateRequest,
     JobStatusResponse,
     JobStats,

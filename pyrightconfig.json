@@ -1,0 +1,17 @@
+{
+  "extraPaths": [
+    "platform/backend"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "platform/backend",
+      "extraPaths": [
+        "platform/backend",
+        "."
+      ]
+    },
+    {
+      "root": "."
+    }
+  ]
+}

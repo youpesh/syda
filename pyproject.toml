@@ -12,11 +12,11 @@ authors = [
     {name = "Rama Krishna Kumar Lingamgunta", email = "ramkumar2606@gmail.com"}
 ]
 keywords = [
-    "synthetic data", 
-    "AI", 
-    "machine learning", 
-    "data generation", 
-    "testing", 
+    "synthetic data",
+    "AI",
+    "machine learning",
+    "data generation",
+    "testing",
     "privacy",
     "SQLAlchemy",
     "OpenAI",
@@ -242,4 +242,8 @@ module = [
     "boto3.*",
     "azure.*",
 ]
-ignore_missing_imports = true 
+ignore_missing_imports = true
+
+# Pyright configuration
+[tool.pyright]
+extraPaths = ["platform/backend"]

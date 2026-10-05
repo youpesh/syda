@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import init_db
+from .database import init_db
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,8 +32,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from app.api import agent_router, auth_router, conversations_router, generation_router, scenarios_router, settings_router
-from app.api.auth import require_authenticated
+from .api import agent_router, auth_router, conversations_router, generation_router, scenarios_router, settings_router
+from .api.auth import require_authenticated
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(auth_router)

@@ -1,4 +1,4 @@
-from app.models.scenario import (
+from .scenario import (
     SecondaryMetric,
     ScenarioConfiguration,
     ChatRequest,
@@ -9,7 +9,7 @@ from app.models.scenario import (
     EvaluationMetric,
     CostEstimate,
 )
-from app.models.entities import ChatConversation, JobRecord, ScenarioRecord, UserPreference, UserProviderCredential
+from .entities import ChatConversation, JobRecord, ScenarioRecord, UserPreference, UserProviderCredential
 
 __all__ = [
     "SecondaryMetric",

@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
 from syda.schemas import validate_schema
-from app.models.scenario import ScenarioConfiguration, ScenarioPathConfiguration, ScenarioCheck, SecondaryMetric, ChatResponse
-from app.provider_settings import resolve_provider
+from ..models.scenario import ScenarioConfiguration, ScenarioPathConfiguration, ScenarioCheck, SecondaryMetric, ChatResponse
+from ..provider_settings import resolve_provider
 
 load_dotenv(override=True)
 load_dotenv("backend/.env", override=True)

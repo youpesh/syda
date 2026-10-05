@@ -3,11 +3,11 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.api.auth import require_authenticated
-from app.database import get_db
-from app.models.entities import ScenarioRecord
-from app.models.scenario import ScenarioConfiguration
-from app.models.user import User
+from .auth import require_authenticated
+from ..database import get_db
+from ..models.entities import ScenarioRecord
+from ..models.scenario import ScenarioConfiguration
+from ..models.user import User
 
 router = APIRouter(prefix="/scenarios", tags=["Scenarios"])
 
