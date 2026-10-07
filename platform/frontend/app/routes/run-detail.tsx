@@ -1,3 +1,4 @@
+import { RunQualitySummary } from "~/components/studio/run-quality-summary";
 import { useCallback, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
@@ -84,7 +85,7 @@ export default function RunDetail() {
             <Card className="lg:col-span-2"><CardHeader><CardTitle>Rules</CardTitle><CardDescription>Constraints included in this run.</CardDescription></CardHeader><CardContent><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{job.scenario?.rules?.map((rule, index) => <li key={index}>{rule}</li>)}</ul></CardContent></Card>
           </div></TabsContent>
           <TabsContent className="pt-3" value="data"><DataPreview complete={complete} jobId={job.jobId} /></TabsContent>
-          <TabsContent className="pt-3" value="evaluation"><EvaluationReport jobId={job.jobId} stats={job.stats} /></TabsContent>
+          <TabsContent className="space-y-4 pt-3" value="evaluation">{job.scenario && <RunQualitySummary stats={job.stats} scenario={job.scenario} />}<EvaluationReport jobId={job.jobId} stats={job.stats} /></TabsContent>
         </Tabs>
       </>}
     </div></main>

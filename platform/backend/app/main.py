@@ -34,6 +34,9 @@ app.add_middleware(
 
 from .api import agent_router, auth_router, conversations_router, generation_router, scenarios_router, settings_router
 from .api.auth import require_authenticated
+from .api.connections import router as connections_router
+
+app.include_router(connections_router, prefix="/api")
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(auth_router)

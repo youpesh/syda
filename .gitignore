@@ -83,3 +83,7 @@ platform/backend/*.db
 platform/frontend/.agents/
 .rama-frontend/
 uv.lock
+
+# Frontend source types are not Python build output.
+!platform/frontend/app/lib/
+!platform/frontend/app/lib/**/*.ts

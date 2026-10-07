@@ -1,3 +1,6 @@
+import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
+import { SchemaExplorer } from "~/components/studio/schema-explorer";
+import { RunQualitySummary } from "~/components/studio/run-quality-summary";
 import {
   useEffect,
   useMemo,
@@ -131,6 +134,7 @@ function PromptComposer({
   compact = false,
   disabled = false,
   isLoading = false,
+  source, onSource, connections,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -138,7 +142,11 @@ function PromptComposer({
   compact?: boolean;
   disabled?: boolean;
   isLoading?: boolean;
+  connections: ReturnType<typeof useLiveProfiles>;
+  source: SchemaSource | null;
+  onSource: (source: SchemaSource | null) => void;
 }) {
+  const [attachmentError, setAttachmentError] = useState("");
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !disabled && !isLoading) {
       event.preventDefault();
@@ -160,21 +168,28 @@ function PromptComposer({
         <Textarea
           aria-label="Describe your synthetic data scenario"
           autoFocus={!compact}
-          className={compact ? "min-h-20 resize-none rounded-none border-0 pb-14 pr-16" : "min-h-28 resize-none rounded-none border-0 pb-14 pr-16"}
+          className={compact ? "min-h-20 resize-none rounded-none border-0 shadow-none focus-visible:ring-0" : "min-h-28 resize-none rounded-none border-0 shadow-none focus-visible:ring-0"}
           disabled={disabled || isLoading}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={isLoading ? "Syda Agent is analyzing and compiling your scenario…" : "Describe the data you want to generate…"}
           value={value}
         />
-        <Button aria-label="Send prompt" className="absolute right-3 bottom-3" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">
+        <div className="flex flex-wrap items-center gap-2 border-t px-3 py-3">
+          <label className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center rounded-full border px-3 text-sm font-medium focus-within:ring-2 focus-within:ring-ring">
+            Attach<input className="sr-only" aria-label="Attach schema or sample" disabled={disabled || isLoading} type="file" accept=".csv,.json,.txt" onChange={async e => { const file = e.target.files?.[0]; e.target.value = ""; if (!file) return; setAttachmentError(""); if (file.size > 100000 || !/\.(csv|json|txt)$/i.test(file.name)) { setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB."); return; } try { onChange(value + `\n\nAttached context (${file.name}):\n${await file.text()}`); } catch { setAttachmentError("Could not read this file. Please retry."); } }} />
+          </label>
+          <LiveConnections connections={connections} source={source} onSource={onSource} disabled={disabled || isLoading} />
+          <Button aria-label="Send prompt" className="ml-auto shrink-0" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">
           {isLoading ? (
             <Spinner />
           ) : (
             <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />
           )}
         </Button>
+        </div>
       </div>
+      {attachmentError && <p role="alert" className="mt-2 text-xs text-destructive">{attachmentError}</p>}
       {!compact && (
         <p className="mt-3 text-center text-xs text-muted-foreground">
           Syda can make mistakes. Review rules and evaluations before using generated data.
@@ -189,11 +204,13 @@ function ScenarioCard({
   onEdit,
   onGenerate,
   messageId,
+  sourceName,
 }: {
   scenario: ScenarioConfiguration;
   onEdit: (scenario: ScenarioConfiguration, messageId: string) => Promise<void>;
   onGenerate: (scenario: ScenarioConfiguration) => Promise<void>;
   messageId: string;
+  sourceName: string;
 }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string>();
@@ -291,23 +308,17 @@ function ScenarioCard({
           )}
           {!!tableEntries.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-schema">
             <h3 className="text-xs font-medium" id="scenario-schema">Schema preview</h3>
-            <div className="flex flex-wrap gap-1.5">
-              {tableEntries.map(([tableName, table]) => (
-                <Badge key={tableName} variant="outline">
-                  {tableName} · {Object.keys(table).filter((field) => !field.startsWith("__")).length} fields
-                </Badge>
-              ))}
-            </div>
+            <details><summary className="cursor-pointer text-xs">Browse {tableEntries.length} tables and columns</summary><div className="mt-3"><SchemaExplorer schemas={scenario.schemas ?? {}} /></div></details>
           </section>}
           {!!scenario.rules.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-rules">
             <h3 className="text-xs font-medium" id="scenario-rules">Rules</h3>
             <ul className="list-disc pl-4 text-xs text-muted-foreground">
-              {scenario.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
+              {scenario.rules.map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
             </ul>
-            {scenario.rules.length > 3 && <p className="text-xs text-muted-foreground">+{scenario.rules.length - 3} more rules</p>}
+
           </section>}
         </CardContent>
-        <CardFooter className="justify-between gap-2">
+        <CardFooter className="flex-wrap justify-between gap-2">
           <Button disabled={saving} onClick={() => void openEditor()} type="button" variant="outline">
             {saving ? <Spinner data-icon="inline-start" /> : null}{saving ? "Opening editor…" : "Edit full scenario"}
           </Button>
@@ -341,12 +352,13 @@ function ScenarioCard({
               <p className="text-xs leading-5 text-muted-foreground">{scenario.workflow.join(" → ")}</p>
             </section>
             <section className="space-y-2">
-              <h3 className="text-xs font-medium">Key rules</h3>
+              <h3 className="text-xs font-medium">Generation rules</h3>
               <ul className="list-disc space-y-1 pl-4 text-xs text-muted-foreground">
-                {scenario.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
+                {scenario.rules.map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
               </ul>
-              {scenario.rules.length > 3 && <p className="text-[10px] text-muted-foreground">Plus {scenario.rules.length - 3} more rules</p>}
+
             </section>
+            <section className="rounded-2xl border p-4 text-xs space-y-2"><h3 className="font-medium">Source and destination</h3><p>Source: {sourceName}. Review the {tableEntries.length} table definitions below before generating.</p><p>Destination: downloadable CSV files. No database write-back.</p><details><summary className="cursor-pointer">Review table definitions</summary><div className="mt-3"><SchemaExplorer schemas={scenario.schemas ?? {}} /></div></details></section>
             <section className="rounded-2xl border p-4">
               <div className="flex items-start justify-between gap-3">
                 <div><h3 className="text-xs font-medium">Generation estimate</h3><p className="mt-1 text-[10px] text-muted-foreground">{estimate ? `${estimate.provider} · ${estimate.model}` : "Checking configured provider…"}</p></div>
@@ -416,11 +428,13 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
         {(error || (failed && job?.currentStage)) && <p className="text-xs text-destructive">{error ?? job?.currentStage}</p>}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="text-[10px] text-muted-foreground">Run {run.jobId}</p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             {complete && (job?.downloadUrl || job?.filesAvailable) && <a className={buttonVariants({ size: "sm" })} href={job?.downloadUrl ?? `/api/download/${run.jobId}`}>Download dataset</a>}
             <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data`}>Browse full dataset</Link>
           </div>
         </div>
+        {complete && <RunQualitySummary stats={job?.stats} scenario={run.scenario} />}
+        {failed && <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${run.scenarioId}`}>Review scenario and retry</Link>}
         {complete && job?.filesAvailable && <DataPreview compact complete jobId={run.jobId} showDownloads={false} />}
       </CardContent>
     </Card>
@@ -434,6 +448,8 @@ export default function Home() {
   const conversationIdRef = useRef<string | undefined>(conversationId);
   conversationIdRef.current = conversationId;
   const [prompt, setPrompt] = useState("");
+  const [source, setSource] = useState<SchemaSource | null>(null);
+  const connections = useLiveProfiles();
   const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);
   const [conversationTitle, setConversationTitle] = useState("");
   const [loadedConversationId, setLoadedConversationId] = useState<string>();
@@ -667,10 +683,11 @@ export default function Home() {
 
     setPrompt("");
     clearError();
-    await sendMessage({ text });
+    await sendMessage({ text: source ? `${text}\n\nDatabase schema context (${source.name}; structure only, output CSV):\n${JSON.stringify(source.schemas)}` : text });
   };
 
   const startNewScenario = () => {
+    setSource(null);
     stop();
     setPrompt("");
     setMessages([]);
@@ -751,7 +768,7 @@ export default function Home() {
               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">
                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.
               </p>
-              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
+              <PromptComposer connections={connections} source={source} onSource={setSource} disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {promptSuggestions.map((suggestion) => (
                   <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">
@@ -799,7 +816,8 @@ export default function Home() {
                                 <BubbleContent className={scenario ? "w-full" : undefined}>
                                   {text && (
                                     <p className={scenario ? "mb-3 text-xs leading-5" : undefined}>
-                                      {text}
+                                      {text.split("\n\nDatabase schema context (")[0]}
+                                      {text.includes("\n\nDatabase schema context (") && <span className="mt-2 block text-xs text-muted-foreground">Database schema included with this prompt.</span>}
                                       {isStreamingThis && (
                                         <span className="ml-1 inline-block h-3.5 w-1.5 animate-pulse rounded-xs bg-primary align-middle" />
                                       )}
@@ -807,6 +825,7 @@ export default function Home() {
                                   )}
                                   {scenario && (
                                     <ScenarioCard
+                                      sourceName={messages.slice(0, index).reverse().find(item => item.role === "user")?.parts.filter(part => part.type === "text").map(part => part.text).join(" ").match(/Database schema context \((.*); structure only, output CSV\):/)?.[1] ?? "Chat instructions"}
                                       messageId={message.id}
                                       onEdit={openEditor}
                                       onGenerate={(nextScenario) => startGeneration(nextScenario, message.id)}
@@ -848,7 +867,7 @@ export default function Home() {
             <div className="shrink-0 border-t bg-background px-5 py-4">
               <div className="mx-auto w-full max-w-3xl">
                 <div className="flex items-end gap-2">
-                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
+                  <PromptComposer connections={connections} source={source} onSource={setSource} compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
                   {isThinking && (
                     <Button onClick={() => stop()} type="button" variant="outline">
                       Stop

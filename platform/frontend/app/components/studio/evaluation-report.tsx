@@ -81,7 +81,7 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
           </TableBody>
         </Table>
       </CardContent>
-      <CardFooter className="justify-end gap-2">
+      <CardFooter className="flex-wrap justify-end gap-2">
         <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=json`, "_blank")} type="button" variant="outline">
           <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Report JSON
         </Button>
