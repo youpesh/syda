@@ -23,6 +23,7 @@ Conversation behavior:
 - Create or update a scenario only when the conversation contains enough detail to make a useful draft. A useful draft has at least two ordered workflow steps, meaningful rules, and relational schemas.
 - Treat the conversation history and the existing scenario as context. For a follow-up, preserve existing requirements unless the user asks to change them, and explain what changed.
 - Treat the existing scenario supplied in context as canonical; do not fetch it again.
+- The domain starter is a template, not a created or saved scenario. Even when it already matches the request, call create_scenario_draft (an empty patch is allowed) before claiming the new scenario is configured.
 - For a new scenario, call create_scenario_draft with only the fields that need to differ from its domain starter. The tool starts from the closest validated domain template and keeps its table schemas; do not try to emit or rewrite schemas during initial creation. For an existing scenario, call update_scenario_draft with only the fields that should change; the tool merges the patch into the saved draft and validates the complete result.
 - If a draft tool returns validation errors, correct the listed fields and call the tool again. Do not treat draft validation errors as a provider failure.
 - Never infer a specific value from vague language such as “smaller” or “faster.” Ask a concise question when the requested change is ambiguous. Only confirm a change after the draft tool succeeds, and use its returned title, table count, and instance count.
@@ -518,7 +519,7 @@ async def compile_scenario_agent(
         try:
             from syda.llm import LLMClient
             from syda.schemas import ModelConfig
-            from pydantic_ai import UsageLimits
+            from pydantic_ai import ModelRetry, UsageLimits
 
             agent = LLMClient(ModelConfig(
                 provider=provider["id"],
@@ -595,6 +596,16 @@ async def compile_scenario_agent(
                     "record_count": validated.record_count,
                 }
 
+            @agent.output_validator
+            def require_created_draft(reply: ScenarioAgentReply) -> ScenarioAgentReply:
+                if should_attach_scenario and current_scenario is None and staged_candidate["scenario"] is None:
+                    raise ModelRetry(
+                        "No scenario has been created. Call create_scenario_draft and correct any "
+                        "validation errors before confirming the scenario. If the starter already "
+                        "matches, call create_scenario_draft with an empty patch."
+                    )
+                return reply
+
             result = await asyncio.wait_for(
                 agent.run(context_str, usage_limits=UsageLimits(request_limit=4, tool_calls_limit=3)),
                 timeout=30.0,
@@ -619,7 +630,7 @@ async def compile_scenario_agent(
                         message=(
                             "I haven’t changed the saved draft yet. What specific value or scenario change should I apply?"
                             if current_scenario
-                            else reply.message
+                            else "I couldn’t create a scenario draft yet. Please retry your request."
                         ),
                         scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
                     )

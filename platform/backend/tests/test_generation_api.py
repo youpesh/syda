@@ -365,3 +365,23 @@ def test_deleting_saved_scenario_preserves_generated_dataset(monkeypatch, tmp_pa
         assert all(item["id"] != scenario_id for item in client.get("/api/scenarios").json())
         assert client.get(f"/api/status/{job_id}").json()["status"] == "complete"
         assert client.get(f"/api/download/{job_id}").status_code == 200
+
+
+def test_deleting_chat_removes_its_draft_and_preserves_saved_scenario(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        saved = client.post("/api/scenarios", json=_scenario())
+        scenario_id = saved.json()["id"]
+        conversation = client.post("/api/conversations", json={"title": "Insurance claims chat"})
+        assert conversation.status_code == 201
+        conversation_id = conversation.json()["id"]
+        updated = client.put(f"/api/conversations/{conversation_id}", json={
+            "messages": [{"id": "reply", "role": "assistant", "parts": [{"type": "text", "text": "A draft"}]}],
+            "scenarioDraft": _scenario(),
+        })
+        assert updated.status_code == 200
+
+        deleted = client.delete(f"/api/conversations/{conversation_id}")
+        assert deleted.status_code == 204
+        assert client.get(f"/api/conversations/{conversation_id}").status_code == 404
+        assert all(item["id"] != conversation_id for item in client.get("/api/conversations").json())
+        assert client.get(f"/api/scenarios/{scenario_id}").status_code == 200

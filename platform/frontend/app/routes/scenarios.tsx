@@ -45,7 +45,7 @@ function DeleteScenarioButton({ scenario, onDeleted }: { scenario: SavedScenario
     <DialogContent showCloseButton={!deleting}>
       <DialogHeader>
         <DialogTitle>Delete scenario?</DialogTitle>
-        <DialogDescription>Delete “{scenario.title}” from your saved scenarios? This cannot be undone. Existing generated datasets will remain available.</DialogDescription>
+        <DialogDescription>Delete “{scenario.title}” from your saved scenarios? This cannot be undone. The chat and generated datasets will remain available. To remove the chat, use its Delete action under Recent chats.</DialogDescription>
       </DialogHeader>
       {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
       <DialogFooter>
