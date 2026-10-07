@@ -1,0 +1,12 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        files: '^platform/backend/'
+      - id: end-of-file-fixer
+        files: '^platform/backend/'
+      - id: check-yaml
+        files: '^platform/backend/'
+      - id: check-added-large-files
+        args: ['--maxkb=2000']

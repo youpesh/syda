@@ -83,9 +83,8 @@ mcp = FastMCP(
         "Supported providers: anthropic (Claude), openai (GPT), gemini, grok, azureopenai, "
         "openai_compatible (Ollama, Groq, etc.). Provider is auto-detected from env vars if "
         "not specified.\n\n"
-        "For large tables (>500 rows), Syda automatically switches to code-gen mode: the LLM "
-        "writes Python generator functions for simple columns and only calls the LLM at "
-        "runtime for semantic/narrative columns — dramatically fewer API calls at scale."
+        "The MCP boundary defaults to direct generation so prompts cannot cause generated "
+        "Python to execute in the server process."
     ),
 )
 
@@ -142,6 +141,17 @@ def _build_generator(provider: Optional[str], model: Optional[str],
                      extra_kwargs: Optional[Dict[str, Any]] = None):
     """Build a SyntheticDataGenerator from MCP tool parameters."""
     from syda import SyntheticDataGenerator, ModelConfig
+
+    if generation_mode == "auto":
+        generation_mode = "direct"
+    elif generation_mode == "codegen" and os.getenv(
+        "SYDA_ALLOW_UNSAFE_CODEGEN", ""
+    ).lower() not in {"1", "true", "yes"}:
+        raise ValueError(
+            "Codegen is disabled at the MCP boundary because it executes "
+            "LLM-generated Python. Use generation_mode='direct', or explicitly "
+            "set SYDA_ALLOW_UNSAFE_CODEGEN=true only inside an isolated sandbox."
+        )
 
     if not provider:
         # Auto-detect from env — same keys as syda/llm.py
@@ -249,7 +259,7 @@ def generate_from_schema(
     extra_kwargs: Optional[Dict[str, Any]] = None,
     temperature: float = 0.8,
     max_tokens: int = 8192,
-    generation_mode: str = "auto",
+    generation_mode: str = "direct",
     batch_size: Optional[int] = None,
     max_workers: int = 1,
     preview_rows: int = 3,
@@ -300,8 +310,10 @@ def generate_from_schema(
                                 any provider:      {"response_mode": "tools"}  (custom response parsing)
         temperature:          Sampling temperature 0.0–1.0 (default 0.8).
         max_tokens:           Max tokens per LLM call (default 8192).
-        generation_mode:      "auto" (default), "direct", or "codegen".
-                              auto = direct for ≤500 rows, codegen for >500.
+        generation_mode:      "direct" (default), "auto", or "codegen".
+                              The MCP boundary resolves auto to direct. Codegen is
+                              blocked unless the server explicitly opts in from an
+                              isolated sandbox.
         batch_size:           Max rows per LLM call in direct mode. Auto-selected if omitted.
         max_workers:          Tables to generate concurrently (default 1 = sequential).
         preview_rows:         Rows to include in the preview response (default 3).
@@ -439,11 +451,9 @@ def validate_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
         tables_summary = {}
         all_fks = {}
 
-        supported_types = {
-            "integer", "int", "float", "double", "decimal", "string", "text",
-            "varchar", "email", "date", "datetime", "boolean", "bool",
-            "foreign_key", "fk", "number",
-        }
+        from .schemas import Schema
+
+        supported_types = Schema.VALID_TYPES
 
         for table_name, columns in schema.items():
             if not isinstance(columns, dict):
@@ -463,8 +473,8 @@ def validate_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
 
                 col_type = col_def.get("type", "string").lower()
                 if col_type not in supported_types:
-                    warnings_list.append(
-                        f"{table_name}.{col_name}: unknown type '{col_type}' — will be treated as text"
+                    errors.append(
+                        f"{table_name}.{col_name}: unsupported type '{col_type}'"
                     )
 
                 if col_def.get("primary_key"):
@@ -518,6 +528,14 @@ def validate_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
                 if parent_table not in schema:
                     errors.append(
                         f"{child_table}.{col}: references unknown table '{parent_table}'"
+                    )
+                elif parent_col not in {
+                    name for name in schema[parent_table]
+                    if not name.startswith("_")
+                }:
+                    errors.append(
+                        f"{child_table}.{col}: references unknown column "
+                        f"'{parent_table}.{parent_col}'"
                     )
                 else:
                     relationships.append({

@@ -1,0 +1,1794 @@
+[1mdiff --git a/.gitignore b/.gitignore[m
+[1mindex 60b70bb..d5d6000 100644[m
+[1m--- a/.gitignore[m
+[1m+++ b/.gitignore[m
+[36m@@ -83,3 +83,7 @@[m [mplatform/backend/*.db[m
+ platform/frontend/.agents/[m
+ .rama-frontend/[m
+ uv.lock[m
+[32m+[m
+[32m+[m[32m# Frontend source types are not Python build output.[m
+[32m+[m[32m!platform/frontend/app/lib/[m
+[32m+[m[32m!platform/frontend/app/lib/**/*.ts[m
+[1mdiff --git a/platform/backend/app/api/connections.py b/platform/backend/app/api/connections.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..345ea1b[m
+[1m--- /dev/null[m
+[1m+++ b/platform/backend/app/api/connections.py[m
+[36m@@ -0,0 +1,49 @@[m
+[32m+[m[32m"""Authenticated, schema-only database inspection. Credentials are never persisted."""[m
+[32m+[m[32mfrom typing import Literal[m
+[32m+[m[32mfrom fastapi import APIRouter, Depends, HTTPException[m
+[32m+[m[32mfrom pydantic import BaseModel, Field, SecretStr[m
+[32m+[m[32mfrom sqlalchemy import create_engine, inspect[m
+[32m+[m[32mfrom sqlalchemy.engine import URL[m
+[32m+[m[32mfrom sqlalchemy.exc import SQLAlchemyError[m
+[32m+[m[32mfrom sqlalchemy.pool import NullPool[m
+[32m+[m[32mfrom syda.db_schema_loader import DatabaseSchemaLoader[m
+[32m+[m[32mfrom .auth import require_authenticated[m
+[32m+[m
+[32m+[m[32mrouter = APIRouter(prefix="/connections", tags=["Connections"], dependencies=[Depends(require_authenticated)])[m
+[32m+[m
+[32m+[m[32mclass ConnectionRequest(BaseModel):[m
+[32m+[m[32m    dialect: Literal["PostgreSQL", "MySQL", "Oracle"][m
+[32m+[m[32m    host: str = Field(min_length=1, max_length=255, pattern=r"^[a-zA-Z0-9._:\-]+$")[m
+[32m+[m[32m    port: int = Field(ge=1, le=65535)[m
+[32m+[m[32m    database: str = Field(min_length=1, max_length=128)[m
+[32m+[m[32m    username: str = Field(min_length=1, max_length=128)[m
+[32m+[m[32m    password: SecretStr[m
+[32m+[m
+[32m+[m[32mdef connection_engine(request: ConnectionRequest):[m
+[32m+[m[32m    driver = {"PostgreSQL": "postgresql+psycopg2", "MySQL": "mysql+pymysql", "Oracle": "oracle+oracledb"}[request.dialect][m
+[32m+[m[32m    options = {"connect_timeout": 10} if request.dialect != "Oracle" else {"tcp_connect_timeout": 10}[m
+[32m+[m[32m    if request.dialect == "PostgreSQL":[m
+[32m+[m[32m        options["options"] = "-c statement_timeout=15000 -c default_transaction_read_only=on"[m
+[32m+[m[32m    if request.dialect == "MySQL":[m
+[32m+[m[32m        options.update(read_timeout=15, write_timeout=15)[m
+[32m+[m[32m    url = URL.create(driver, username=request.username, password=request.password.get_secret_value(), host=request.host, port=request.port, database=request.database if request.dialect != "Oracle" else None, query={"service_name": request.database} if request.dialect == "Oracle" else {})[m
+[32m+[m[32m    return create_engine(url, connect_args=options, poolclass=NullPool)[m
+[32m+[m
+[32m+[m[32m@router.post("/inspect")[m
+[32m+[m[32mdef inspect_connection(request: ConnectionRequest):[m
+[32m+[m[32m    engine = None[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        engine = connection_engine(request)[m
+[32m+[m[32m        names = inspect(engine).get_table_names()[m
+[32m+[m[32m        if len(names) > 200:[m
+[32m+[m[32m            raise HTTPException(422, "This database has more than 200 tables. Use a database account scoped to the tables needed for this scenario.")[m
+[32m+[m[32m        schemas = DatabaseSchemaLoader(engine).load_schemas(names)[m
+[32m+[m[32m        return {"schemas": schemas, "tableCount": len(schemas)}[m
+[32m+[m[32m    except (ImportError, ModuleNotFoundError):[m
+[32m+[m[32m        raise HTTPException(503, f"The {request.dialect} driver is not installed on the server. Ask the administrator to install the matching database driver, then retry.") from None[m
+[32m+[m[32m    except SQLAlchemyError:[m
+[32m+[m[32m        # Driver exceptions can contain connection strings and credentials.[m
+[32m+[m[32m        raise HTTPException(400, "Could not read the database schema. Check the host, port, database, credentials, network access, and schema permissions, then retry.") from None[m
+[32m+[m[32m    finally:[m
+[32m+[m[32m        if engine is not None:[m
+[32m+[m[32m            engine.dispose()[m
+[1mdiff --git a/platform/backend/app/main.py b/platform/backend/app/main.py[m
+[1mindex f330a92..1b232ea 100644[m
+[1m--- a/platform/backend/app/main.py[m
+[1m+++ b/platform/backend/app/main.py[m
+[36m@@ -34,6 +34,9 @@[m [mapp.add_middleware([m
+ [m
+ from .api import agent_router, auth_router, conversations_router, generation_router, scenarios_router, settings_router[m
+ from .api.auth import require_authenticated[m
+[32m+[m[32mfrom .api.connections import router as connections_router[m
+[32m+[m
+[32m+[m[32mapp.include_router(connections_router, prefix="/api")[m
+ [m
+ app.include_router(auth_router, prefix="/api")[m
+ app.include_router(auth_router)[m
+[1mdiff --git a/platform/backend/tests/test_connections_api.py b/platform/backend/tests/test_connections_api.py[m
+[1mnew file mode 100644[m
+[1mindex 0000000..259cd44[m
+[1m--- /dev/null[m
+[1m+++ b/platform/backend/tests/test_connections_api.py[m
+[36m@@ -0,0 +1,42 @@[m
+[32m+[m[32mimport unittest[m
+[32m+[m[32mfrom unittest.mock import patch[m
+[32m+[m[32mfrom sqlalchemy import create_engine, event[m
+[32m+[m[32mfrom sqlalchemy.exc import OperationalError[m
+[32m+[m[32mfrom fastapi import HTTPException[m
+[32m+[m[32mfrom app.api import connections as c[m
+[32m+[m
+[32m+[m[32mclass ConnectionTests(unittest.TestCase):[m
+[32m+[m[32m def request(self):[m
+[32m+[m[32m  return c.ConnectionRequest(dialect='PostgreSQL',host='localhost',port=5432,database='sample',username='user',password='secret-value')[m
+[32m+[m[32m def test_schema_only_preserves_keys(self):[m
+[32m+[m[32m  engine=create_engine('sqlite://')[m
+[32m+[m[32m  with engine.begin() as db:[m
+[32m+[m[32m   db.exec_driver_sql('CREATE TABLE patients (id INTEGER PRIMARY KEY, name TEXT NOT NULL)')[m
+[32m+[m[32m   db.exec_driver_sql('CREATE TABLE diagnoses (id INTEGER PRIMARY KEY, patient_id INTEGER REFERENCES patients(id))')[m
+[32m+[m[32m   db.exec_driver_sql("INSERT INTO patients VALUES (1, 'private-patient-name')")[m
+[32m+[m[32m  statements=[][m
+[32m+[m[32m  event.listen(engine,'before_cursor_execute',lambda conn,cursor,statement,params,ctx,many:statements.append(statement))[m
+[32m+[m[32m  with patch.object(c,'connection_engine',return_value=engine): result=c.inspect_connection(self.request())[m
+[32m+[m[32m  self.assertEqual(result['tableCount'],2)[m
+[32m+[m[32m  self.assertTrue(result['schemas']['patients']['id']['primary_key'])[m
+[32m+[m[32m  self.assertEqual(result['schemas']['diagnoses']['patient_id']['references']['schema'],'patients')[m
+[32m+[m[32m  self.assertNotIn('private-patient-name',str(result))[m
+[32m+[m[32m  self.assertFalse(any('SELECT * FROM patients' in s for s in statements))[m
+[32m+[m[32m def test_driver_error_is_actionable(self):[m
+[32m+[m[32m  with patch.object(c,'connection_engine',side_effect=ModuleNotFoundError('driver')):[m
+[32m+[m[32m   with self.assertRaises(HTTPException) as caught:c.inspect_connection(self.request())[m
+[32m+[m[32m  self.assertEqual(caught.exception.status_code,503)[m
+[32m+[m[32m def test_credentials_redacted_on_failure_and_engine_disposed(self):[m
+[32m+[m[32m  engine=create_engine('sqlite://')[m
+[32m+[m[32m  with patch.object(c,'connection_engine',return_value=engine),patch.object(c,'inspect',side_effect=OperationalError('secret-value',{},Exception('private'))),patch.object(engine,'dispose') as dispose:[m
+[32m+[m[32m   with self.assertRaises(HTTPException) as caught:c.inspect_connection(self.request())[m
+[32m+[m[32m   dispose.assert_called_once()[m
+[32m+[m[32m  self.assertNotIn('secret-value',str(caught.exception.detail))[m
+[32m+[m[32m def test_url_escapes_password_and_has_timeout(self):[m
+[32m+[m[32m  with patch.object(c,'create_engine') as create:[m
+[32m+[m[32m   c.connection_engine(self.request())[m
+[32m+[m[32m  self.assertEqual(create.call_args.args[0].password,'secret-value')[m
+[32m+[m[32m  self.assertEqual(create.call_args.kwargs['connect_args']['connect_timeout'],10)[m
+[32m+[m
+[32m+[m[32mif __name__ == "__main__":[m
+[32m+[m[32m unittest.main()[m
+[1mdiff --git a/platform/docs/client-review/ui-prototype-handoff.md b/platform/docs/client-review/ui-prototype-handoff.md[m
+[1mnew file mode 100644[m
+[1mindex 0000000..038f361[m
+[1m--- /dev/null[m
+[1m+++ b/platform/docs/client-review/ui-prototype-handoff.md[m
+[36m@@ -0,0 +1,52 @@[m
+[32m+[m[32m# UI prototype transfer[m
+[32m+[m
+[32m+[m[32mThe previous UI work is available at `/ui-preview`, linked as **UI prototype** from the live studio sidebar. The prototype has a **Back to live studio** link.[m
+[32m+[m
+[32m+[m[32mThe new repository already has backend-connected chat, account login, persisted conversations, generation, and dataset previews. Its `routes/home.tsx`, backend, authentication, and package manifests were preserved. The old homepage was adapted as `routes/ui-preview.tsx` instead of overwriting the live homepage.[m
+[32m+[m
+[32m+[m[32m## Included[m
+[32m+[m
+[32m+[m[32m- Optional source connector and CSV-only preview flow.[m
+[32m+[m[32m- PostgreSQL, MySQL, and Oracle connection profiles.[m
+[32m+[m[32m- Attachment input alongside the connector.[m
+[32m+[m[32m- Healthcare requirements and saved run snapshots.[m
+[32m+[m[32m- Schema preview including 50 tables with 200 columns each.[m
+[32m+[m[32m- CSV preview/download, independent export destination, run search and filters.[m
+[32m+[m[32m- Sign-in navigation uses the existing real `/login` page; simulated account screens have been removed.[m
+[32m+[m
+[32m+[m[32mThe prototype's database operations, generation, and export operations remain simulated. Its local storage keys use the `syda-ui-preview-` prefix and do not share the live studio's conversations or authentication. No dependency or backend change was needed for the transfer.[m
+[32m+[m
+[32m+[m[32m## Files to review[m
+[32m+[m
+[32m+[m[32m- `platform/frontend/app/routes/ui-preview.tsx` — transferred prototype homepage.[m
+[32m+[m[32m- `platform/frontend/app/components/database-workspace.tsx`[m
+[32m+[m[32m- `platform/frontend/app/components/review-workspace.tsx`[m
+[32m+[m[32m- `platform/frontend/app/components/scenario-preview.tsx`[m
+[32m+[m[32m- `platform/frontend/app/routes.ts` — registers the preview route.[m
+[32m+[m[32m- `platform/frontend/app/components/studio/app-shell.tsx` — links to the prototype.[m
+[32m+[m
+[32m+[m[32m## Next integration work[m
+[32m+[m
+[32m+[m[32mUse the prototype to agree on interactions, then adapt selected components to the live API contracts. Keep the existing real authentication, job state, conversation persistence, schema editor, and downloadable results. Do not replace live functionality with the mock services from this prototype.[m
+[32m+[m
+[32m+[m[32m## Local verification[m
+[32m+[m
+[32m+[m[32mFrom `platform/frontend`, install the locked dependencies with `npm ci`, then run `npm run typecheck` and `npm run build`. Start with `npm run dev` and open `/ui-preview`. The prototype can be reviewed without a backend; `/app` still uses the normal authentication and backend flow.[m
+[32m+[m
+[32m+[m[32m## Repository compatibility fixes[m
+[32m+[m
+[32m+[m[32mThe new checkout was missing `app/lib/studio-types.ts`, although its live screens import it. DTOs were restored from the backend response models and frontend call sites. `.gitignore` now permits this frontend source folder so the types are included in commits. The two imported UI helpers use the new repo's existing `cn` package.[m
+[32m+[m
+[32m+[m[32mAdditional files: `platform/frontend/app/lib/studio-types.ts`, `platform/frontend/app/components/ui/avatar.tsx`, and `platform/frontend/app/components/ui/dropdown-menu.tsx`.[m
+[32m+[m
+[32m+[m[32mUse Node 22.22 or newer; the installed React Router 8.3.1 packages require it. Verification used the bundled Node 24 runtime. The system Node 22.17 is older than the package requirement.[m
+[32m+[m
+[32m+[m[32m## Live studio integration update[m
+[32m+[m
+[32m+[m[32mThe live chat now supports schema-only database inspection through authenticated `POST /api/connections/inspect`, using Syda's `DatabaseSchemaLoader`. Users can keep multiple connection profiles during a chat-page session, test/retry connections, search tables and columns, and send imported structure with their prompt. Credentials are not persisted or included in AI prompts. Database drivers must be available on the backend (PostgreSQL: psycopg2; MySQL: pymysql; Oracle: oracledb). Imported schema is sent to the configured AI provider; generation still requires reviewing its scenario plan. CSV output is supported; live database write-back is not implemented.[m
+[32m+[m
+[32m+[m[32mReview dialogs show the complete rule list, table definitions, and CSV destination. Chat results and run evaluation show actual table counts and reported validation failures. Requested scenario instances are distinguished from total generated rows because workflow paths can create different counts per table.[m
+[32m+[m
+[32m+[m[32mComposer controls use matching 36px heights and wrap at narrow widths. Existing authentication is retained. The separate UI preview remains available for features still awaiting integration.[m
+[32m+[m
+[32m+[m[32mValidation: production build and TypeScript checks; browser checks with controlled API responses; isolated schema-endpoint tests with a real SQLite schema and foreign keys. Actual PostgreSQL/MySQL/Oracle connections and AI-provider generation require the team's running backend and credentials.[m
+[1mdiff --git a/platform/frontend/app/components/database-workspace.tsx b/platform/frontend/app/components/database-workspace.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..76d026d[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/database-workspace.tsx[m
+[36m@@ -0,0 +1,46 @@[m
+[32m+[m[32mimport { useEffect, useMemo, useState } from "react";[m
+[32m+[m[32mimport { Button } from "~/components/ui/button";[m
+[32m+[m[32mimport { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "~/components/ui/card";[m
+[32m+[m[32mimport { Input } from "~/components/ui/input";[m
+[32m+[m
+[32m+[m[32mexport type Connection = { id: string; name: string; host: string; port: string; database: string; username: string; dialect: "PostgreSQL" | "MySQL" | "Oracle" };[m
+[32m+[m[32mconst initial: Connection[] = [{id:"commerce",name:"Commerce demo",host:"localhost",port:"5432",database:"syda_demo",username:"demo_user",dialect:"PostgreSQL"}];[m
+[32m+[m[32mexport function useConnections() {[m
+[32m+[m[32m  const [connections,setConnections] = useState(initial);[m
+[32m+[m[32m  const [enabled,setEnabled] = useState(false);[m
+[32m+[m[32m  const [active,setActive] = useState("commerce");[m
+[32m+[m[32m  const [ready,setReady] = useState(false);[m
+[32m+[m[32m  useEffect(()=>{try {const saved=JSON.parse(localStorage.getItem("syda-ui-preview-connections-v1")??"null"); if(Array.isArray(saved)&&saved.length&&saved.every(c=>c&&["id","name","host","port","database","username"].every(k=>typeof c[k]==="string"))){setConnections(saved.map(c=>({...c,dialect:["PostgreSQL","MySQL","Oracle"].includes(c.dialect)?c.dialect:"PostgreSQL"})));setActive(saved[0].id);}}catch{}setReady(true);},[]);[m
+[32m+[m[32m  useEffect(()=>{if(ready)try{localStorage.setItem("syda-ui-preview-connections-v1",JSON.stringify(connections));}catch{}},[connections,ready]);[m
+[32m+[m[32m  const connection=connections.find(c=>c.id===active)??connections[0];[m
+[32m+[m[32m  const setConnection=(next:Connection)=>setConnections(cs=>cs.map(c=>c.id===connection.id?next:c));[m
+[32m+[m[32m  const add=()=>{const c={id:crypto.randomUUID(),name:"New connection",host:"localhost",port:"5432",database:"",username:"",dialect:"PostgreSQL" as const};setConnections(cs=>[...cs,c]);setActive(c.id);};[m
+[32m+[m[32m  const remove=()=>{if(connections.length<2)return;const remaining=connections.filter(c=>c.id!==connection.id);setConnections(remaining);setActive(remaining[0].id);};[m
+[32m+[m[32m  return {connections,connection,setConnection,enabled,setEnabled,select:(id:string)=>{setActive(id);setEnabled(true);},add,remove};[m
+[32m+[m[32m}[m
+[32m+[m[32mtype Connections=ReturnType<typeof useConnections>;[m
+[32m+[m[32mexport function ConnectionPicker({db,onChange,optional=false}:{db:Connections;onChange:()=>void;optional?:boolean}) {[m
+[32m+[m[32m  return <label className={`flex min-w-0 max-w-full flex-col gap-1 text-xs ${optional ? "order-last sm:order-none" : ""}`}><span className="sr-only">Source connection</span><select aria-label="Source connection" className="h-9 w-52 max-w-full rounded-full border bg-background px-3 text-sm" value={optional&&!db.enabled?"":db.connection.id} onChange={e=>{if(e.target.value)db.select(e.target.value);else db.setEnabled(false);onChange();}}>{optional&&<option value="">No database — CSV only</option>}{db.connections.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></label>;[m
+[32m+[m[32m}[m
+[32m+[m[32mexport function ConnectionsPanel({db,connected,error,invalidate,test,review}:{db:Connections;connected:boolean;error:string;invalidate:()=>void;test:()=>void;review:()=>void}) {[m
+[32m+[m[32m  return <Card><CardHeader><CardTitle>Database connections</CardTitle><CardDescription>Manage PostgreSQL, MySQL, and Oracle connection profiles. Details are saved in this browser; no passwords are collected. Connection tests and schema loading are simulated.</CardDescription></CardHeader><CardContent className="flex flex-col gap-4"><div className="flex flex-wrap items-end gap-3"><ConnectionPicker db={db} onChange={invalidate}/><Button variant="outline" onClick={()=>{db.add();invalidate();}}>Add connection</Button><Button variant="outline" disabled={db.connections.length<2} onClick={()=>{db.remove();invalidate();}}>Remove selected</Button></div><div className="grid gap-4 sm:grid-cols-2">{([['name','Connection name'],['host','Host'],['port','Port'],['database','Database'],['username','Username']] as const).map(([key,label])=><label key={key} className="flex flex-col gap-2 text-xs">{label}<Input value={db.connection[key]} onChange={e=>{db.setConnection({...db.connection,[key]:e.target.value});invalidate();}}/></label>)}<label className="flex flex-col gap-2 text-xs">Database type<select className="h-8 border bg-background px-2" aria-label="Database type" value={db.connection.dialect} onChange={e=>{const dialect=e.target.value as Connection["dialect"];db.setConnection({...db.connection,dialect,port:dialect==="MySQL"?"3306":dialect==="Oracle"?"1521":"5432"});invalidate();}}><option>PostgreSQL</option><option>MySQL</option><option>Oracle</option></select></label></div>{error&&<p role="alert" className="text-xs text-destructive">{error}</p>}{connected&&<p role="status" className="text-xs">Sample connection checked. Load the schema to review its structure.</p>}</CardContent><CardFooter className="flex-wrap gap-2"><Button variant="outline" onClick={test}>Test sample connection</Button><Button disabled={!connected} onClick={review}>Load sample schema</Button></CardFooter></Card>;[m
+[32m+[m[32m}[m
+[32m+[m[32mexport type Column={name:string;type:string;constraint:string};[m
+[32m+[m[32mexport function schemaFixture(size:number):{name:string;columns:Column[]}[] {[m
+[32m+[m[32m  if(size===2)return [{name:"customers",columns:[{name:"customer_id",type:"integer",constraint:"Primary key"},{name:"name",type:"text",constraint:"Required"}]},{name:"orders",columns:[{name:"order_id",type:"integer",constraint:"Primary key"},{name:"customer_id",type:"integer",constraint:"Foreign key → customers.customer_id"},{name:"amount",type:"numeric",constraint:"Required"}]}];[m
+[32m+[m[32m  if(size===4)return [[m
+[32m+[m[32m    {name:"patients",columns:[{name:"patient_id",type:"integer",constraint:"Primary key"},{name:"age",type:"integer",constraint:"Required"},{name:"gender",type:"text",constraint:"Required"}]},[m
+[32m+[m[32m    {name:"diagnoses",columns:[{name:"diagnosis_id",type:"integer",constraint:"Primary key"},{name:"patient_id",type:"integer",constraint:"Foreign key → patients.patient_id"},{name:"cancer_type",type:"text",constraint:"Required"},{name:"diagnosis_date",type:"date",constraint:"Required"}]},[m
+[32m+[m[32m    {name:"claims",columns:[{name:"claim_id",type:"integer",constraint:"Primary key"},{name:"patient_id",type:"integer",constraint:"Foreign key → patients.patient_id"},{name:"diagnosis_id",type:"integer",constraint:"Foreign key → diagnoses.diagnosis_id"},{name:"claim_date",type:"date",constraint:"Required"},{name:"status",type:"text",constraint:"Required"}]},[m
+[32m+[m[32m    {name:"payments",columns:[{name:"payment_id",type:"integer",constraint:"Primary key"},{name:"claim_id",type:"integer",constraint:"Foreign key → claims.claim_id"},{name:"amount",type:"numeric",constraint:"Required"},{name:"payment_date",type:"date",constraint:"Required"}]},[m
+[32m+[m[32m  ];[m
+[32m+[m[32m  return Array.from({length:size},(_,i)=>({name:`table_${String(i+1).padStart(2,"0")}`,columns:Array.from({length:size===50?200:100},(_,j)=>({name:j===0?"id":j===1&&i>0?"parent_id":`column_${String(j+1).padStart(3,"0")}`,type:j<2?"integer":"text",constraint:j===0?"Primary key":j===1&&i>0?`Foreign key → table_${String(i).padStart(2,"0")}.id`:"Nullable"}))}));[m
+[32m+[m[32m}[m
+[32m+[m[32mexport function SchemaBrowser({connected,source,approve,back}:{connected:boolean;source:string;approve:(dataset:"commerce"|"healthcare")=>void;back:()=>void}) {[m
+[32m+[m[32m  const [size,setSize]=useState(2),[query,setQuery]=useState(""),[selected,setSelected]=useState(0),[columnQuery,setColumnQuery]=useState(""),[page,setPage]=useState(0);[m
+[32m+[m[32m  const tables=useMemo(()=>schemaFixture(size),[size]), table=tables[selected];[m
+[32m+[m[32m  const columns=table.columns.filter(c=>`${c.name} ${c.type} ${c.constraint}`.toLowerCase().includes(columnQuery.toLowerCase()));[m
+[32m+[m[32m  const pages=Math.max(1,Math.ceil(columns.length/20));[m
+[32m+[m[32m  if(!connected)return <Card><CardContent><p className="mb-4">Select and test a source connection before loading its sample schema.</p><Button onClick={back}>Open connections</Button></CardContent></Card>;[m
+[32m+[m[32m  return <Card><CardHeader><CardTitle>{source} schema</CardTitle><CardDescription>Structure only: table names, columns, and relationships. No database records are read. Large schemas below are rendering fixtures, not discovered database schemas.</CardDescription></CardHeader><CardContent className="flex flex-col gap-4"><label className="flex flex-col gap-2 text-xs">Preview dataset<select className="h-8 border bg-background px-2" value={size} onChange={e=>{setSize(Number(e.target.value));setSelected(0);setPage(0);setQuery("");setColumnQuery("");}}><option value={2}>Commerce — 2 tables</option><option value={4}>Healthcare — 4 related tables</option><option value={50}>Enterprise test — 50 tables × 200 columns</option><option value={10}>Scale test — 10 tables × 100 columns</option><option value={20}>Scale test — 20 tables × 100 columns</option></select></label><p className="text-xs">{size} tables · {tables.reduce((sum,t)=>sum+t.columns.length,0)} columns · {tables.reduce((sum,t)=>sum+t.columns.filter(c=>c.constraint.startsWith("Foreign key")).length,0)} relationships</p><div className="grid min-w-0 gap-4 sm:grid-cols-[160px_minmax(0,1fr)]"><div><Input aria-label="Search tables" placeholder="Search tables" value={query} onChange={e=>setQuery(e.target.value)}/><div className="mt-2 flex max-h-80 flex-col gap-1 overflow-y-auto">{tables.map((t,i)=>t.name.toLowerCase().includes(query.toLowerCase())&&<Button key={t.name} variant={selected===i?"secondary":"ghost"} aria-pressed={selected===i} onClick={()=>{setSelected(i);setColumnQuery("");setPage(0);}}>{t.name} ({t.columns.length})</Button>)}{!tables.some(t=>t.name.toLowerCase().includes(query.toLowerCase()))&&<p className="py-3 text-xs">No matching tables.</p>}</div></div><div className="min-w-0"><h2 className="mb-2 font-medium">{table.name}</h2><Input aria-label="Search columns" placeholder="Search columns, types, or keys" value={columnQuery} onChange={e=>{setColumnQuery(e.target.value);setPage(0);}}/><div className="mt-2 max-h-80 overflow-auto"><table className="w-full text-left text-xs [&_th]:p-2 [&_td]:border-t [&_td]:p-2"><thead className="sticky top-0 bg-card"><tr><th>Column</th><th>Type</th><th>Constraint</th></tr></thead><tbody>{columns.slice(page*20,(page+1)*20).map(c=><tr key={c.name}><td>{c.name}</td><td>{c.type}</td><td>{c.constraint}</td></tr>)}</tbody></table>{!columns.length&&<p className="p-3 text-xs">No matching columns.</p>}</div><div className="mt-3 flex flex-wrap items-center gap-2"><Button variant="outline" disabled={page===0} onClick={()=>setPage(p=>p-1)}>Previous</Button><span className="text-xs">Page {page+1} of {pages} · {columns.length} columns</span><Button variant="outline" disabled={page+1>=pages} onClick={()=>setPage(p=>p+1)}>Next</Button></div></div></div></CardContent><CardFooter className="flex-wrap gap-2"><Button variant="outline" onClick={back}>Connections</Button><Button disabled={size!==2&&size!==4} onClick={()=>approve(size===4?"healthcare":"commerce")}>Approve sample schema</Button>{size!==2&&size!==4&&<p className="text-xs text-muted-foreground">Scale fixtures are for UI testing. Select Commerce or Healthcare to run a sample.</p>}</CardFooter></Card>;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/review-workspace.tsx b/platform/frontend/app/components/review-workspace.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..859b3c5[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/review-workspace.tsx[m
+[36m@@ -0,0 +1,45 @@[m
+[32m+[m[32mimport { ScenarioFields, defaultDraft, sampleFiles, type ScenarioDraft } from "~/components/scenario-preview";[m
+[32m+[m[32mimport { useEffect, useState } from "react";[m
+[32m+[m[32mimport { useConnections, ConnectionsPanel, SchemaBrowser } from "~/components/database-workspace";[m
+[32m+[m[32mimport { Button } from "~/components/ui/button";[m
+[32m+[m[32mimport { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "~/components/ui/card";[m
+[32m+[m[32mimport { Input } from "~/components/ui/input";[m
+[32m+[m[32mimport { Textarea } from "~/components/ui/textarea";[m
+[32m+[m[32mexport type WorkspaceView="chat"|"connections"|"schema"|"configure"|"runs"|"results";[m
+[32m+[m[32mtype Status="queued"|"running"|"succeeded"|"failed";[m
+[32m+[m[32mtype Run={id:string;name:string;rows:number;instructions:string;source:string;created:number;status:Status;exported?:boolean;exportDestination?:string; draft?:ScenarioDraft; mode?:"csv"|"database"};[m
+[32m+[m[32mexport const viewTitles:Record<WorkspaceView,string>={chat:"New scenario",connections:"Connections",schema:"Schema review",configure:"Generation configuration",runs:"Run history",results:"Run details"};[m
+[32m+[m[32mexport function useReviewWorkspace(){[m
+[32m+[m[32m const db=useConnections();[m
+[32m+[m[32m const [draft,setDraft]=useState<ScenarioDraft>(defaultDraft);[m
+[32m+[m[32m const [runQuery,setRunQuery]=useState("");[m
+[32m+[m[32m const [statusFilter,setStatusFilter]=useState("all");[m
+[32m+[m[32m const [previewTable,setPreviewTable]=useState<string|null>(null);[m
+[32m+[m[32m const [view,setView]=useState<WorkspaceView>("chat"),[connected,setConnected]=useState(false),[reviewed,setReviewed]=useState(false),[connectionError,setConnectionError]=useState("");[m
+[32m+[m[32m const [name,setName]=useState("E-commerce orders"),[rows,setRows]=useState("100"),[instructions,setInstructions]=useState("Generate customers and related orders.");[m
+[32m+[m[32m const [runs,setRuns]=useState<Run[]>([]),[selectedId,setSelectedId]=useState(""),[notice,setNotice]=useState(""),[error,setError]=useState(""),[ready,setReady]=useState(false);[m
+[32m+[m[32m const [destinationId,setDestinationId]=useState(""),[exportConfirmed,setExportConfirmed]=useState(false),[failNext,setFailNext]=useState(false);[m
+[32m+[m[32m useEffect(()=>{try{const saved=JSON.parse(localStorage.getItem("syda-ui-preview-runs-v1")??"[]");if(Array.isArray(saved))setRuns(saved.filter(r=>r&&typeof r.id==="string"&&typeof r.name==="string"&&typeof r.instructions==="string"&&Number.isInteger(r.rows)&&r.rows>0&&Number.isFinite(r.created)&&["queued","running","succeeded","failed"].includes(r.status)).map(r=>({...r,draft:r.draft&&["commerce","healthcare"].includes(r.draft.dataset)&&["cancerTypes","demographics","workflow","rules"].every(k=>typeof r.draft[k]==="string")?r.draft:undefined,mode:r.mode==="csv"?"csv":"database",source:typeof r.source==="string"?r.source:"Commerce demo",status:["queued","running"].includes(r.status)?"failed":r.status})));}catch{}setReady(true);},[]);[m
+[32m+[m[32m useEffect(()=>{if(ready)try{localStorage.setItem("syda-ui-preview-runs-v1",JSON.stringify(runs));}catch{}},[runs,ready]);[m
+[32m+[m[32m useEffect(()=>{const timer=setInterval(()=>setRuns(rs=>rs.map(r=>["queued","running"].includes(r.status)?{...r,status:Date.now()-r.created>=9000?"succeeded":Date.now()-r.created>=2000?"running":"queued"}:r)),1000);return()=>clearInterval(timer);},[]);[m
+[32m+[m[32m const selected=runs.find(r=>r.id===selectedId);[m
+[32m+[m[32m useEffect(()=>{if(selected?.status==="succeeded")setNotice(`${selected.name}: sample files are ready.`);},[selected?.id,selected?.status]);[m
+[32m+[m[32m const openRun=(id:string)=>{setPreviewTable(null);setSelectedId(id);setDestinationId("");setExportConfirmed(false);setError("");setView("results");};[m
+[32m+[m[32m const configure=(title:string,count:number,prompt:string)=>{setDraft(d=>({...d,dataset:/health|patient|claim|oncolog|cancer/i.test(title+prompt)?"healthcare":"commerce"}));setReviewed(false);setName(title);setRows(String(count));setInstructions(prompt);setError("");setView("configure");};[m
+[32m+[m[32m const start=()=>{if(db.enabled&&(!reviewed||!connected)){setError("Test a connection and approve a sample schema first.");return;}if(!name.trim()||!Number.isInteger(Number(rows))||Number(rows)<1||Number(rows)>100000){setError("Enter a name and a whole row count from 1 to 100,000.");return;}const id=crypto.randomUUID();setRuns(rs=>[{id,name:name.trim(),rows:Number(rows),instructions,source:db.enabled?`${db.connection.name} / ${db.connection.database}`:"CSV only",draft:{...draft},mode:db.enabled?"database":"csv",created:Date.now(),status:failNext?"failed":"queued"},...rs]);setFailNext(false);openRun(id);};[m
+[32m+[m[32m const download=(table:string)=>{const csv=sampleFiles[selected?.draft?.dataset??"commerce"][table];if(!csv)return;const url=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));const a=document.createElement("a");a.href=url;a.download=`${table}-sample.csv`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};[m
+[32m+[m
+[32m+[m[32m return {draft,setDraft,runQuery,setRunQuery,statusFilter,setStatusFilter,previewTable,setPreviewTable,db,view,setView,connected,setConnected,reviewed,setReviewed,connectionError,setConnectionError,name,setName,rows,setRows,instructions,setInstructions,runs,setRuns,selected,notice,setNotice,error,setError,destinationId,setDestinationId,exportConfirmed,setExportConfirmed,failNext,setFailNext,openRun,configure,start,download};[m
+[32m+[m[32m}[m
+[32m+[m[32mexport function ReviewWorkspace({review:r}:{review:ReturnType<typeof useReviewWorkspace>}){[m
+[32m+[m[32m const visibleRuns=r.runs.filter(run=>(r.statusFilter==="all"||run.status===r.statusFilter)&&`${run.name} ${run.source}`.toLowerCase().includes(r.runQuery.toLowerCase()));[m
+[32m+[m[32m const invalidate=()=>{r.setConnected(false);r.setReviewed(false);r.setConnectionError("");};[m
+[32m+[m[32m return <main className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8"><div className="mx-auto flex max-w-3xl flex-col gap-5"><h1 className="text-2xl font-semibold tracking-[-0.035em]">{viewTitles[r.view]}</h1>[m
+[32m+[m[32m {r.view==="connections"&&<ConnectionsPanel db={r.db} connected={r.connected} error={r.connectionError} invalidate={invalidate} test={()=>{const c=r.db.connection;if(Object.values(c).some(v=>!v.trim())||!/^\d+$/.test(c.port)||Number(c.port)<1||Number(c.port)>65535){r.setConnectionError("Complete all fields and enter a port between 1 and 65535.");return;}r.setConnected(true);r.db.setEnabled(true);r.setConnectionError("");}} review={()=>r.setView("schema")}/>}[m
+[32m+[m[32m {r.view==="schema"&&<SchemaBrowser key={r.db.connection.id} source={r.db.connection.name} connected={r.connected} back={()=>r.setView("connections")} approve={dataset=>{r.setDraft(d=>({...d,dataset}));r.setReviewed(true);r.setView("configure");}}/>}[m
+[32m+[m[32m {r.view==="configure"&&<Card><CardHeader><CardTitle>Generation configuration</CardTitle><CardDescription>Choose your scenario and requirements. Fixed sample files demonstrate the flow; generation is not connected yet.</CardDescription></CardHeader><CardContent className="flex flex-col gap-4"><label>Scenario name<Input value={r.name} onChange={e=>r.setName(e.target.value)}/></label><label>Rows per table<Input type="number" min={1} max={100000} value={r.rows} onChange={e=>r.setRows(e.target.value)}/></label><ScenarioFields value={r.draft} onChange={next=>{if(next.dataset!==r.draft.dataset)r.setReviewed(false);r.setDraft(next);}}/><label>Instructions<Textarea value={r.instructions} onChange={e=>r.setInstructions(e.target.value)}/></label><p className="text-xs">{r.db.enabled?`Source: ${r.db.connection.name} · ${r.reviewed?"Sample schema approved":"Schema approval required"}`:"CSV only — no connection required"}</p><Button variant="outline" onClick={()=>r.setView(r.connected?"schema":"connections")}>Review source schema</Button><Button variant="ghost" onClick={()=>{r.db.setEnabled(!r.db.enabled);r.setReviewed(false);}}>{r.db.enabled?"Use CSV only":"Use a database"}</Button><details><summary>Failure preview</summary><label><input type="checkbox" checked={r.failNext} onChange={e=>r.setFailNext(e.target.checked)}/> Simulate a failed run</label></details></CardContent><CardFooter><Button disabled={r.db.enabled&&(!r.reviewed||!r.connected)} onClick={r.start}>Start sample run</Button></CardFooter></Card>}[m
+[32m+[m[32m {r.view==="runs"&&<Card><CardHeader><CardTitle>All runs</CardTitle><CardDescription>Saved in this browser. Reloading marks interrupted sample runs as failed.</CardDescription></CardHeader><CardContent><div className="mb-4 flex flex-wrap gap-3"><Input aria-label="Search runs" placeholder="Search scenario or source" value={r.runQuery} onChange={e=>r.setRunQuery(e.target.value)}/><select aria-label="Filter run status" className="h-8 border bg-background px-2" value={r.statusFilter} onChange={e=>r.setStatusFilter(e.target.value)}>{["all","queued","running","succeeded","failed"].map(status=><option key={status} value={status}>{status}</option>)}</select></div>{!r.runs.length&&<><p>No runs yet.</p><Button onClick={()=>r.setView("configure")}>Create sample run</Button></>}{r.runs.length>0&&!visibleRuns.length&&<p className="py-4 text-xs text-muted-foreground">No runs match these filters.</p>}{visibleRuns.map(run=><div key={run.id} className="flex flex-wrap items-center justify-between gap-3 border-b py-3"><div><p>{run.name}</p><p className="text-xs text-muted-foreground">{run.source} · {run.rows.toLocaleString()} rows · {new Date(run.created).toLocaleString()}</p></div><span>{run.status}</span><Button variant="outline" onClick={()=>r.openRun(run.id)}>Open run</Button></div>)}</CardContent></Card>}[m
+[32m+[m[32m {r.view==="results"&&(r.selected?<><Card><CardHeader><CardTitle>{r.selected.name}</CardTitle><CardDescription>{r.selected.source} · {r.selected.draft?.dataset??"commerce"} sample · {r.selected.rows.toLocaleString()} requested rows per table</CardDescription></CardHeader><CardContent><p role="status">{r.selected.status}</p><p className="mt-3 text-xs">{r.selected.status==="failed"?"The sample failed or was interrupted. Review the current source before retrying.":r.selected.status==="succeeded"?"Sample files are ready.":"You may browse other screens while this sample runs."}</p><details className="mt-4"><summary>Saved instructions</summary><p className="whitespace-pre-wrap">{r.selected.instructions}</p>{r.selected.draft?.dataset==="healthcare"&&<dl className="mt-3 space-y-2 text-xs"><dt>Cancer types</dt><dd>{r.selected.draft.cancerTypes}</dd><dt>Demographics</dt><dd>{r.selected.draft.demographics}</dd><dt>Workflow</dt><dd>{r.selected.draft.workflow}</dd><dt>Rules</dt><dd>{r.selected.draft.rules}</dd></dl>}</details></CardContent><CardFooter className="gap-2"><Button variant="outline" onClick={()=>r.setView("runs")}>All runs</Button>{r.selected.status==="failed"&&<Button onClick={()=>{const run=r.selected!;r.configure(run.name,run.rows,run.instructions);r.setDraft(run.draft??defaultDraft);r.db.setEnabled(run.mode!=="csv");}}>Review and retry</Button>}</CardFooter></Card>{r.selected.status==="succeeded"&&<><Card><CardHeader><CardTitle>Download CSV files</CardTitle><CardDescription>Fixed illustrative records, not the requested volume. Preview a file before downloading; clinical rules and your custom constraints are not evaluated.</CardDescription></CardHeader><CardContent className="flex flex-wrap gap-3">{Object.keys(sampleFiles[r.selected.draft?.dataset??"commerce"]).map(t=><div key={t} className="flex flex-wrap gap-2"><Button variant="outline" onClick={()=>r.setPreviewTable(r.previewTable===t?null:t)}>Preview {t}</Button><Button variant="outline" onClick={()=>r.download(t)}>Download {t}.csv</Button></div>)}{r.previewTable&&<pre className="w-full overflow-auto border p-3 text-xs" aria-label="CSV preview">{sampleFiles[r.selected.draft?.dataset??"commerce"][r.previewTable]}</pre>}</CardContent></Card>{r.selected.mode!=="csv"&&<Card><CardHeader><CardTitle>Write back to database</CardTitle><CardDescription>Select a destination independently of the source. This preview does not write to a database.</CardDescription></CardHeader><CardContent className="flex flex-col gap-4"><label className="flex flex-col gap-2">Export destination<select className="h-8 border bg-background px-2" value={r.destinationId} onChange={e=>{r.setDestinationId(e.target.value);r.setExportConfirmed(false);}}><option value="">Choose a connection</option>{r.db.connections.map(c=><option key={c.id} value={c.id}>{c.name} / {c.database}</option>)}</select></label><p className="text-xs">Append mode · {Object.keys(sampleFiles[r.selected.draft?.dataset??"commerce"]).join(" → ")}. Duplicate handling is not implemented in this preview.</p><label><input type="checkbox" checked={r.exportConfirmed} onChange={e=>r.setExportConfirmed(e.target.checked)}/> I reviewed the destination and append behavior.</label>{r.selected.exported&&<p role="status">Sample export completed to {r.selected.exportDestination??"the selected destination"}. No database was changed.</p>}</CardContent><CardFooter><Button disabled={!r.exportConfirmed||!r.db.connections.some(c=>c.id===r.destinationId)||r.selected.exported} onClick={()=>{const destination=r.db.connections.find(c=>c.id===r.destinationId)!;r.setRuns(rs=>rs.map(run=>run.id===r.selected?.id?{...run,exported:true,exportDestination:`${destination.name} / ${destination.database}`} :run));r.setNotice("Sample export complete. No database was changed.");}}>Simulate database export</Button></CardFooter></Card>}</>}</>:<Button onClick={()=>r.setView("runs")}>Open run history</Button>)}[m
+[32m+[m[32m {r.error&&<p role="alert" className="text-xs text-destructive">{r.error}</p>}[m
+[32m+[m[32m </div></main>;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/scenario-preview.tsx b/platform/frontend/app/components/scenario-preview.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..492d1db[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/scenario-preview.tsx[m
+[36m@@ -0,0 +1,23 @@[m
+[32m+[m[32mimport { Input } from "~/components/ui/input";[m
+[32m+[m[32mimport { Textarea } from "~/components/ui/textarea";[m
+[32m+[m
+[32m+[m[32mexport type ScenarioDraft = { dataset: "commerce" | "healthcare"; cancerTypes: string; demographics: string; workflow: string; rules: string };[m
+[32m+[m[32mexport const defaultDraft: ScenarioDraft = { dataset: "commerce", cancerTypes: "Lung, colorectal", demographics: "Adults aged 40–80; specify the desired demographic distribution", workflow: "Patient → Diagnosis → Claim → Payment", rules: "Diagnosis precedes claim; denied claims have no payment." };[m
+[32m+[m[32mexport const sampleFiles: Record<ScenarioDraft["dataset"], Record<string, string>> = {[m
+[32m+[m[32m  commerce: {[m
+[32m+[m[32m    customers: "customer_id,name\n1,Sample Customer A\n2,Sample Customer B\n",[m
+[32m+[m[32m    orders: "order_id,customer_id,amount\n101,1,24.50\n102,2,18.00\n",[m
+[32m+[m[32m  },[m
+[32m+[m[32m  healthcare: {[m
+[32m+[m[32m    patients: "patient_id,age,gender\n1,58,female\n2,64,male\n",[m
+[32m+[m[32m    diagnoses: "diagnosis_id,patient_id,cancer_type,diagnosis_date\n11,1,lung,2026-01-02\n12,2,colorectal,2026-01-03\n",[m
+[32m+[m[32m    claims: "claim_id,patient_id,diagnosis_id,claim_date,status\n21,1,11,2026-01-05,approved\n22,2,12,2026-01-06,denied\n",[m
+[32m+[m[32m    payments: "payment_id,claim_id,amount,payment_date\n31,21,120.00,2026-01-10\n",[m
+[32m+[m[32m  },[m
+[32m+[m[32m};[m
+[32m+[m[32mexport function ScenarioFields({value,onChange}:{value:ScenarioDraft;onChange:(next:ScenarioDraft)=>void}) {[m
+[32m+[m[32m  return <section className="flex flex-col gap-4 border-y py-4" aria-label="Scenario details">[m
+[32m+[m[32m    <label className="flex flex-col gap-2 text-xs">Scenario dataset<select className="h-8 border bg-background px-2" value={value.dataset} onChange={e=>onChange({...value,dataset:e.target.value as ScenarioDraft["dataset"]})}><option value="commerce">Commerce</option><option value="healthcare">Healthcare</option></select></label>[m
+[32m+[m[32m    {value.dataset === "healthcare" && <><label className="flex flex-col gap-2 text-xs">Cancer types<Input value={value.cancerTypes} onChange={e=>onChange({...value,cancerTypes:e.target.value})}/></label><label className="flex flex-col gap-2 text-xs">Demographic requirements<Textarea value={value.demographics} onChange={e=>onChange({...value,demographics:e.target.value})}/></label><label className="flex flex-col gap-2 text-xs">Workflow steps<Input value={value.workflow} onChange={e=>onChange({...value,workflow:e.target.value})}/></label><label className="flex flex-col gap-2 text-xs">Custom rules<Textarea value={value.rules} onChange={e=>onChange({...value,rules:e.target.value})}/></label><p className="text-xs text-muted-foreground">These requirements are saved with the run. Preview files are fixed illustrative samples; they do not adapt to these fields or validate clinical rules.</p></>}[m
+[32m+[m[32m  </section>;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/studio/app-shell.tsx b/platform/frontend/app/components/studio/app-shell.tsx[m
+[1mindex d41ac9d..b652bc5 100644[m
+[1m--- a/platform/frontend/app/components/studio/app-shell.tsx[m
+[1m+++ b/platform/frontend/app/components/studio/app-shell.tsx[m
+[36m@@ -114,6 +114,7 @@[m [mexport function AppShell({[m
+             <SidebarGroupContent><SidebarMenu>[m
+               <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/scenarios"} render={<Link to="/scenarios" />} tooltip="Scenarios"><HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} /><span>Scenarios</span></SidebarMenuButton></SidebarMenuItem>[m
+               <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/history") || pathname.startsWith("/runs/")} render={<Link to="/history" />} tooltip="Generation history"><HugeiconsIcon icon={Analytics01Icon} strokeWidth={2} /><span>Generation history</span></SidebarMenuButton></SidebarMenuItem>[m
+[32m+[m[32m              <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/ui-preview"} render={<Link to="/ui-preview" />} tooltip="UI prototype"><HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} /><span>UI prototype</span></SidebarMenuButton></SidebarMenuItem>[m
+               <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/settings"} render={<Link to="/settings" />} tooltip="Settings"><HugeiconsIcon icon={Settings02Icon} strokeWidth={2} /><span>Settings</span></SidebarMenuButton></SidebarMenuItem>[m
+               <SidebarMenuItem><SidebarMenuButton onClick={async () => { await fetch("/api/auth/cookie/logout", { method: "POST" }); navigate("/", { replace: true }); }} tooltip={`Log out ${displayName}`}><HugeiconsIcon icon={Logout01Icon} strokeWidth={2} /><span>Log out</span></SidebarMenuButton></SidebarMenuItem>[m
+             </SidebarMenu></SidebarGroupContent>[m
+[1mdiff --git a/platform/frontend/app/components/studio/evaluation-report.tsx b/platform/frontend/app/components/studio/evaluation-report.tsx[m
+[1mindex f64070c..1a77093 100644[m
+[1m--- a/platform/frontend/app/components/studio/evaluation-report.tsx[m
+[1m+++ b/platform/frontend/app/components/studio/evaluation-report.tsx[m
+[36m@@ -81,7 +81,7 @@[m [mexport function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s[m
+           </TableBody>[m
+         </Table>[m
+       </CardContent>[m
+[31m-      <CardFooter className="justify-end gap-2">[m
+[32m+[m[32m      <CardFooter className="flex-wrap justify-end gap-2">[m
+         <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=json`, "_blank")} type="button" variant="outline">[m
+           <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Report JSON[m
+         </Button>[m
+[1mdiff --git a/platform/frontend/app/components/studio/live-connections.tsx b/platform/frontend/app/components/studio/live-connections.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..cef0391[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/studio/live-connections.tsx[m
+[36m@@ -0,0 +1,57 @@[m
+[32m+[m[32mimport { useRef, useState } from "react";[m
+[32m+[m[32mimport { Button } from "~/components/ui/button";[m
+[32m+[m[32mimport { Input } from "~/components/ui/input";[m
+[32m+[m[32mimport { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "~/components/ui/dialog";[m
+[32m+[m[32mimport { SchemaExplorer } from "./schema-explorer";[m
+[32m+[m[32mimport type { SchemaTable } from "~/lib/studio-types";[m
+[32m+[m
+[32m+[m[32mtype Profile = { id: string; name: string; dialect: "PostgreSQL" | "MySQL" | "Oracle"; host: string; port: string; database: string; username: string };[m
+[32m+[m[32mexport type SchemaSource = { name: string; schemas: Record<string, SchemaTable> };[m
+[32m+[m[32mconst fresh = (): Profile => ({ id: crypto.randomUUID(), name: "New connection", dialect: "PostgreSQL", host: "localhost", port: "5432", database: "", username: "" });[m
+[32m+[m
+[32m+[m[32mexport function useLiveProfiles() {[m
+[32m+[m[32m  const [profiles, setProfiles] = useState<Profile[]>([]);[m
+[32m+[m[32m  const [active, setActive] = useState("");[m
+[32m+[m[32m  return { profiles, setProfiles, active, setActive };[m
+[32m+[m[32m}[m
+[32m+[m[32mexport function LiveConnections({ source, onSource, disabled, connections }: { source: SchemaSource | null; onSource: (value: SchemaSource | null) => void; disabled: boolean; connections: ReturnType<typeof useLiveProfiles> }) {[m
+[32m+[m[32m  const [open, setOpen] = useState(false);[m
+[32m+[m[32m  const { profiles, setProfiles, active, setActive } = connections;[m
+[32m+[m[32m  const [password, setPassword] = useState("");[m
+[32m+[m[32m  const [schemas, setSchemas] = useState<Record<string, SchemaTable> | null>(null);[m
+[32m+[m[32m  const [error, setError] = useState("");[m
+[32m+[m[32m  const [busy, setBusy] = useState(false);[m
+[32m+[m[32m  const version = useRef(0);[m
+[32m+[m[32m  const profile = profiles.find(p => p.id === active);[m
+[32m+[m[32m  const reset = () => { version.current++; setBusy(false); setSchemas(null); setPassword(""); setError(""); };[m
+[32m+[m[32m  const add = () => { reset(); const p = fresh(); setProfiles(prev => [...prev, p]); setActive(p.id); };[m
+[32m+[m[32m  const update = (patch: Partial<Profile>) => { version.current++; setSchemas(null); setError(""); setProfiles(prev => prev.map(p => p.id === active ? { ...p, ...patch } : p)); };[m
+[32m+[m[32m  const inspect = async () => {[m
+[32m+[m[32m    if (!profile) return;[m
+[32m+[m[32m    const requestVersion = ++version.current;[m
+[32m+[m[32m    setBusy(true); setError(""); setSchemas(null);[m
+[32m+[m[32m    try {[m
+[32m+[m[32m      const response = await fetch("/api/connections/inspect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...profile, port: Number(profile.port), password }), signal: AbortSignal.timeout(60000) });[m
+[32m+[m[32m      const result = await response.json().catch(() => ({ detail: "The database service is unavailable. Check that the backend is running, then retry." }));[m
+[32m+[m[32m      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : response.status === 401 ? "Sign in again to connect to a database." : "Check the connection fields and try again.");[m
+[32m+[m[32m      if (requestVersion === version.current) setSchemas(result.schemas);[m
+[32m+[m[32m    } catch (cause) {[m
+[32m+[m[32m      if (requestVersion === version.current) setError(cause instanceof Error && cause.name === "TimeoutError" ? "The connection timed out. Check server access to this database and retry." : cause instanceof Error ? cause.message : "Connection failed. Please retry.");[m
+[32m+[m[32m    } finally { if (requestVersion === version.current) setBusy(false); }[m
+[32m+[m[32m  };[m
+[32m+[m[32m  return <>[m
+[32m+[m[32m    <Button type="button" size="sm" variant="outline" className="h-9 min-w-0 max-w-full" disabled={disabled} onClick={() => { setOpen(true); if (!profiles.length) add(); }}><span className="truncate">{source ? `Source: ${source.name}` : "Connect database"}</span></Button>[m
+[32m+[m[32m    {source && <Button type="button" size="sm" className="h-9" variant="ghost" disabled={disabled} onClick={() => onSource(null)}>Use CSV only</Button>}[m
+[32m+[m[32m    <Dialog open={open} onOpenChange={next => { setOpen(next); if (!next) reset(); }}><DialogContent className="w-[calc(100%-2rem)] max-w-3xl max-h-[85svh] overflow-y-auto"><DialogHeader><DialogTitle>Database connections</DialogTitle><DialogDescription>Import table structure into your prompt. No database records are read or written. Profiles last while this chat page is open; passwords are never saved.</DialogDescription></DialogHeader>[m
+[32m+[m[32m      <div className="flex flex-wrap items-end gap-2"><label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">Connection<select aria-label="Connection" className="h-9 w-full min-w-0 rounded-xl border bg-background px-3" value={active} disabled={busy} onChange={e => { reset(); setActive(e.target.value); }}>{profiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><Button type="button" variant="outline" disabled={busy} onClick={add}>Add connection</Button></div>[m
+[32m+[m[32m      {profile && <div className="grid gap-3 sm:grid-cols-2">[m
+[32m+[m[32m        {([['name', 'Connection name'], ['host', 'Host'], ['port', 'Port'], ['database', 'Database / service name'], ['username', 'Username']] as const).map(([key, label]) => <label key={key} className="flex flex-col gap-1 text-xs">{label}<Input disabled={busy} value={profile[key]} onChange={e => update({ [key]: e.target.value })} /></label>)}[m
+[32m+[m[32m        <label className="flex flex-col gap-1 text-xs">Database type<select className="h-9 rounded-xl border bg-background px-3" disabled={busy} value={profile.dialect} onChange={e => { const dialect = e.target.value as Profile['dialect']; update({ dialect, port: dialect === "MySQL" ? "3306" : dialect === "Oracle" ? "1521" : "5432" }); }}><option>PostgreSQL</option><option>MySQL</option><option>Oracle</option></select></label>[m
+[32m+[m[32m        <label className="flex flex-col gap-1 text-xs">Password<Input type="password" autoComplete="off" disabled={busy} value={password} onChange={e => { setPassword(e.target.value); setSchemas(null); }} /></label>[m
+[32m+[m[32m      </div>}[m
+[32m+[m[32m      {error && <p role="alert" className="text-sm text-destructive">{error}</p>}[m
+[32m+[m[32m      <div className="flex flex-wrap gap-2"><Button type="button" disabled={busy || !profile?.database.trim() || !profile?.username.trim() || !profile?.host.trim() || !/^\d+$/.test(profile?.port ?? "") || Number(profile?.port) < 1 || Number(profile?.port) > 65535} onClick={() => void inspect()}>{busy ? "Reading schema…" : error ? "Retry connection" : "Test & load schema"}</Button>{profile && <Button type="button" variant="outline" disabled={busy} onClick={() => { reset(); setProfiles(p => p.filter(x => x.id !== active)); setActive(profiles.find(x => x.id !== active)?.id ?? ""); }}>Remove profile</Button>}</div>[m
+[32m+[m[32m      {schemas && <><SchemaExplorer key={active} schemas={schemas} /><p className="text-xs text-muted-foreground">The imported schema will be included with your next prompt and shared with the configured AI provider. Review the generated plan before running it. Output is a CSV download.</p><Button type="button" disabled={!Object.keys(schemas).length} onClick={() => { onSource({ name: profile?.name || "Database", schemas }); setOpen(false); reset(); }}>Use this schema</Button></>}[m
+[32m+[m[32m    </DialogContent></Dialog>[m
+[32m+[m[32m  </>;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/studio/run-quality-summary.tsx b/platform/frontend/app/components/studio/run-quality-summary.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..21b8398[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/studio/run-quality-summary.tsx[m
+[36m@@ -0,0 +1,15 @@[m
+[32m+[m[32mimport type { JobStats, ScenarioConfiguration } from "~/lib/studio-types";[m
+[32m+[m[32mexport function RunQualitySummary({ stats, scenario }: { stats?: JobStats; scenario: ScenarioConfiguration }) {[m
+[32m+[m[32m  if (!stats) return <p className="text-xs text-muted-foreground">Row counts and validation results are not available yet.</p>;[m
+[32m+[m[32m  const failures = stats.evaluationMetrics.filter(m => m.status === "fail");[m
+[32m+[m[32m  const unchecked = stats.evaluationMetrics.filter(m => m.status === "not_evaluated");[m
+[32m+[m[32m  return <section className="space-y-3 rounded-xl border p-3" aria-label="Generation results summary">[m
+[32m+[m[32m    <h3 className="text-sm font-medium">Generation results</h3>[m
+[32m+[m[32m    <dl className="grid grid-cols-2 gap-3 text-xs"><div><dt className="text-muted-foreground">Requested scenario instances</dt><dd className="mt-1 font-medium">{scenario.recordCount.toLocaleString()}</dd></div><div><dt className="text-muted-foreground">Generated rows across tables</dt><dd className="mt-1 font-medium">{stats.recordsGenerated.toLocaleString()}</dd></div></dl>[m
+[32m+[m[32m    <p className="text-xs text-muted-foreground">One scenario instance can create rows in several tables; conditional workflow paths can produce different table counts.</p>[m
+[32m+[m[32m    <div className="max-h-52 overflow-auto"><table className="w-full text-left text-xs [&_th]:p-2 [&_td]:p-2 [&_td]:border-t"><thead><tr><th>Table</th><th>Generated rows</th></tr></thead><tbody>{Object.entries(stats.tableRowCounts).map(([name, count]) => <tr key={name}><td className="break-all">{name}</td><td>{count.toLocaleString()}</td></tr>)}</tbody></table></div>[m
+[32m+[m[32m    <p className="text-xs">Relationship integrity: {stats.referentialIntegrity}. Evaluation: {stats.evaluationResult}.</p>[m
+[32m+[m[32m    {failures.length > 0 && <div role="alert" className="text-xs text-destructive"><p className="font-medium">Validation failures</p><ul className="list-disc pl-4">{failures.map(m => <li key={m.key}>{m.label}: {m.detail} ({m.violations} violations)</li>)}</ul></div>}[m
+[32m+[m[32m    {unchecked.length > 0 && <p className="text-xs text-muted-foreground">Not evaluated: {unchecked.map(m => m.label).join(", ")}.</p>}[m
+[32m+[m[32m  </section>;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/studio/schema-explorer.tsx b/platform/frontend/app/components/studio/schema-explorer.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..64ee9c5[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/studio/schema-explorer.tsx[m
+[36m@@ -0,0 +1,29 @@[m
+[32m+[m[32mimport { useState } from "react";[m
+[32m+[m[32mimport { Button } from "~/components/ui/button";[m
+[32m+[m[32mimport { Input } from "~/components/ui/input";[m
+[32m+[m[32mimport type { SchemaTable } from "~/lib/studio-types";[m
+[32m+[m
+[32m+[m[32mexport function SchemaExplorer({ schemas }: { schemas: Record<string, SchemaTable> }) {[m
+[32m+[m[32m  const [query, setQuery] = useState("");[m
+[32m+[m[32m  const [selected, setSelected] = useState("");[m
+[32m+[m[32m  const [columnQuery, setColumnQuery] = useState("");[m
+[32m+[m[32m  const [page, setPage] = useState(0);[m
+[32m+[m[32m  const names = Object.keys(schemas);[m
+[32m+[m[32m  const name = names.includes(selected) ? selected : names[0];[m
+[32m+[m[32m  const fields = Object.entries(schemas[name] ?? {}).filter(([key]) => !key.startsWith("__"));[m
+[32m+[m[32m  const columns = fields.filter(([key, value]) => `${key} ${JSON.stringify(value)}`.toLowerCase().includes(columnQuery.toLowerCase()));[m
+[32m+[m[32m  const pages = Math.max(1, Math.ceil(columns.length / 20));[m
+[32m+[m[32m  const current = Math.min(page, pages - 1);[m
+[32m+[m[32m  return <div className="space-y-3 min-w-0">[m
+[32m+[m[32m    <p className="text-xs text-muted-foreground">{names.length} tables · Structure only</p>[m
+[32m+[m[32m    <div className="grid min-w-0 gap-4 sm:grid-cols-[160px_minmax(0,1fr)]">[m
+[32m+[m[32m      <div className="min-w-0"><Input aria-label="Search schema tables" placeholder="Search tables" value={query} onChange={e => setQuery(e.target.value)} />[m
+[32m+[m[32m        <div className="mt-2 flex max-h-64 flex-col gap-1 overflow-y-auto">{names.filter(n => n.toLowerCase().includes(query.toLowerCase())).map(n => <Button type="button" key={n} title={n} className="w-full min-w-0 justify-start" variant={name === n ? "secondary" : "ghost"} aria-pressed={name === n} onClick={() => { setSelected(n); setColumnQuery(""); setPage(0); }}><span className="truncate">{n}</span></Button>)}{!names.some(n => n.toLowerCase().includes(query.toLowerCase())) && <p className="text-xs p-2">No matching tables.</p>}</div>[m
+[32m+[m[32m      </div>[m
+[32m+[m[32m      <div className="min-w-0"><h4 className="mb-2 break-all text-sm font-medium">{name ?? "No tables found"}</h4><Input aria-label="Search schema columns" placeholder="Search columns or constraints" value={columnQuery} onChange={e => { setColumnQuery(e.target.value); setPage(0); }} />[m
+[32m+[m[32m        <div className="mt-2 max-h-64 overflow-auto rounded-xl border"><table className="w-full text-left text-xs [&_th]:p-2 [&_td]:p-2 [&_td]:border-t"><thead className="sticky top-0 bg-card"><tr><th>Column</th><th>Definition / constraints</th></tr></thead><tbody>{columns.slice(current * 20, (current + 1) * 20).map(([key, value]) => <tr key={key}><td className="align-top break-all">{key}</td><td className="max-w-64 whitespace-pre-wrap break-words">{typeof value === "string" ? value : JSON.stringify(value)}</td></tr>)}</tbody></table>{!columns.length && <p className="p-3 text-xs">No matching columns.</p>}</div>[m
+[32m+[m[32m        <div className="mt-3 flex flex-wrap items-center gap-2"><Button type="button" size="sm" variant="outline" disabled={!current} onClick={() => setPage(current - 1)}>Previous</Button><span className="text-xs">Page {current + 1} of {pages} · {columns.length} columns</span><Button type="button" size="sm" variant="outline" disabled={current + 1 >= pages} onClick={() => setPage(current + 1)}>Next</Button></div>[m
+[32m+[m[32m      </div>[m
+[32m+[m[32m    </div>[m
+[32m+[m[32m  </div>;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/ui/avatar.tsx b/platform/frontend/app/components/ui/avatar.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..dce2ecb[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/ui/avatar.tsx[m
+[36m@@ -0,0 +1,107 @@[m
+[32m+[m[32mimport * as React from "react"[m
+[32m+[m[32mimport { Avatar as AvatarPrimitive } from "@base-ui/react/avatar"[m
+[32m+[m
+[32m+[m[32mimport { cn } from "cn"[m
+[32m+[m
+[32m+[m[32mfunction Avatar({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  size = "default",[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: AvatarPrimitive.Root.Props & {[m
+[32m+[m[32m  size?: "default" | "sm" | "lg"[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <AvatarPrimitive.Root[m
+[32m+[m[32m      data-slot="avatar"[m
+[32m+[m[32m      data-size={size}[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "group/avatar relative flex size-8 shrink-0 rounded-full select-none after:absolute after:inset-0 after:rounded-full after:border after:border-border after:mix-blend-darken data-[size=lg]:size-10 data-[size=sm]:size-6 dark:after:mix-blend-lighten",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction AvatarImage({ className, ...props }: AvatarPrimitive.Image.Props) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <AvatarPrimitive.Image[m
+[32m+[m[32m      data-slot="avatar-image"[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "aspect-square size-full rounded-full object-cover",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction AvatarFallback({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: AvatarPrimitive.Fallback.Props) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <AvatarPrimitive.Fallback[m
+[32m+[m[32m      data-slot="avatar-fallback"[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "flex size-full items-center justify-center rounded-full bg-muted text-sm text-muted-foreground group-data-[size=sm]/avatar:text-xs",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction AvatarBadge({ className, ...props }: React.ComponentProps<"span">) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <span[m
+[32m+[m[32m      data-slot="avatar-badge"[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "absolute right-0 bottom-0 z-10 inline-flex items-center justify-center rounded-full bg-primary text-primary-foreground bg-blend-color ring-2 ring-background select-none",[m
+[32m+[m[32m        "group-data-[size=sm]/avatar:size-2 group-data-[size=sm]/avatar:[&>svg]:hidden",[m
+[32m+[m[32m        "group-data-[size=default]/avatar:size-2.5 group-data-[size=default]/avatar:[&>svg]:size-2",[m
+[32m+[m[32m        "group-data-[size=lg]/avatar:size-3 group-data-[size=lg]/avatar:[&>svg]:size-2",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction AvatarGroup({ className, ...props }: React.ComponentProps<"div">) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <div[m
+[32m+[m[32m      data-slot="avatar-group"[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "group/avatar-group flex -space-x-2 *:data-[slot=avatar]:ring-2 *:data-[slot=avatar]:ring-background",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction AvatarGroupCount({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: React.ComponentProps<"div">) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <div[m
+[32m+[m[32m      data-slot="avatar-group-count"[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "relative flex size-8 shrink-0 items-center justify-center rounded-full bg-muted text-xs text-muted-foreground ring-2 ring-background group-has-data-[size=lg]/avatar-group:size-10 group-has-data-[size=sm]/avatar-group:size-6 [&>svg]:size-4 group-has-data-[size=lg]/avatar-group:[&>svg]:size-5 group-has-data-[size=sm]/avatar-group:[&>svg]:size-3",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport {[m
+[32m+[m[32m  Avatar,[m
+[32m+[m[32m  AvatarImage,[m
+[32m+[m[32m  AvatarFallback,[m
+[32m+[m[32m  AvatarGroup,[m
+[32m+[m[32m  AvatarGroupCount,[m
+[32m+[m[32m  AvatarBadge,[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/components/ui/dropdown-menu.tsx b/platform/frontend/app/components/ui/dropdown-menu.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..3989a42[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/components/ui/dropdown-menu.tsx[m
+[36m@@ -0,0 +1,267 @@[m
+[32m+[m[32m"use client"[m
+[32m+[m
+[32m+[m[32mimport * as React from "react"[m
+[32m+[m[32mimport { Menu as MenuPrimitive } from "@base-ui/react/menu"[m
+[32m+[m
+[32m+[m[32mimport { cn } from "cn"[m
+[32m+[m[32mimport { HugeiconsIcon } from "@hugeicons/react"[m
+[32m+[m[32mimport { ArrowRight01Icon, Tick02Icon } from "@hugeicons/core-free-icons"[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenu({ ...props }: MenuPrimitive.Root.Props) {[m
+[32m+[m[32m  return <MenuPrimitive.Root data-slot="dropdown-menu" {...props} />[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuPortal({ ...props }: MenuPrimitive.Portal.Props) {[m
+[32m+[m[32m  return <MenuPrimitive.Portal data-slot="dropdown-menu-portal" {...props} />[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuTrigger({ ...props }: MenuPrimitive.Trigger.Props) {[m
+[32m+[m[32m  return <MenuPrimitive.Trigger data-slot="dropdown-menu-trigger" {...props} />[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuContent({[m
+[32m+[m[32m  align = "start",[m
+[32m+[m[32m  alignOffset = 0,[m
+[32m+[m[32m  side = "bottom",[m
+[32m+[m[32m  sideOffset = 4,[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.Popup.Props &[m
+[32m+[m[32m  Pick<[m
+[32m+[m[32m    MenuPrimitive.Positioner.Props,[m
+[32m+[m[32m    "align" | "alignOffset" | "side" | "sideOffset"[m
+[32m+[m[32m  >) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.Portal>[m
+[32m+[m[32m      <MenuPrimitive.Positioner[m
+[32m+[m[32m        className="isolate z-50 outline-none"[m
+[32m+[m[32m        align={align}[m
+[32m+[m[32m        alignOffset={alignOffset}[m
+[32m+[m[32m        side={side}[m
+[32m+[m[32m        sideOffset={sideOffset}[m
+[32m+[m[32m      >[m
+[32m+[m[32m        <MenuPrimitive.Popup[m
+[32m+[m[32m          data-slot="dropdown-menu-content"[m
+[32m+[m[32m          className={cn("z-50 max-h-(--available-height) w-(--anchor-width) min-w-32 origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-none bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10 duration-100 outline-none data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:overflow-hidden data-closed:fade-out-0 data-closed:zoom-out-95", className )}[m
+[32m+[m[32m          {...props}[m
+[32m+[m[32m        />[m
+[32m+[m[32m      </MenuPrimitive.Positioner>[m
+[32m+[m[32m    </MenuPrimitive.Portal>[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuGroup({ ...props }: MenuPrimitive.Group.Props) {[m
+[32m+[m[32m  return <MenuPrimitive.Group data-slot="dropdown-menu-group" {...props} />[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuLabel({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  inset,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.GroupLabel.Props & {[m
+[32m+[m[32m  inset?: boolean[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.GroupLabel[m
+[32m+[m[32m      data-slot="dropdown-menu-label"[m
+[32m+[m[32m      data-inset={inset}[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "px-2 py-2 text-xs text-muted-foreground data-inset:pl-7",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuItem({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  inset,[m
+[32m+[m[32m  variant = "default",[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.Item.Props & {[m
+[32m+[m[32m  inset?: boolean[m
+[32m+[m[32m  variant?: "default" | "destructive"[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.Item[m
+[32m+[m[32m      data-slot="dropdown-menu-item"[m
+[32m+[m[32m      data-inset={inset}[m
+[32m+[m[32m      data-variant={variant}[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "group/dropdown-menu-item relative flex cursor-default items-center gap-2 rounded-none px-2 py-2 text-xs outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-7 data-[variant=destructive]:text-destructive data-[variant=destructive]:focus:bg-destructive/10 data-[variant=destructive]:focus:text-destructive dark:data-[variant=destructive]:focus:bg-destructive/20 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4 data-[variant=destructive]:*:[svg]:text-destructive",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuSub({ ...props }: MenuPrimitive.SubmenuRoot.Props) {[m
+[32m+[m[32m  return <MenuPrimitive.SubmenuRoot data-slot="dropdown-menu-sub" {...props} />[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuSubTrigger({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  inset,[m
+[32m+[m[32m  children,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.SubmenuTrigger.Props & {[m
+[32m+[m[32m  inset?: boolean[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.SubmenuTrigger[m
+[32m+[m[32m      data-slot="dropdown-menu-sub-trigger"[m
+[32m+[m[32m      data-inset={inset}[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "flex cursor-default items-center gap-2 rounded-none px-2 py-2 text-xs outline-hidden select-none focus:bg-accent focus:text-accent-foreground not-data-[variant=destructive]:focus:**:text-accent-foreground data-inset:pl-7 data-popup-open:bg-accent data-popup-open:text-accent-foreground data-open:bg-accent data-open:text-accent-foreground [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    >[m
+[32m+[m[32m      {children}[m
+[32m+[m[32m      <HugeiconsIcon icon={ArrowRight01Icon} strokeWidth={2} className="ml-auto" />[m
+[32m+[m[32m    </MenuPrimitive.SubmenuTrigger>[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuSubContent({[m
+[32m+[m[32m  align = "start",[m
+[32m+[m[32m  alignOffset = -3,[m
+[32m+[m[32m  side = "right",[m
+[32m+[m[32m  sideOffset = 0,[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: React.ComponentProps<typeof DropdownMenuContent>) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <DropdownMenuContent[m
+[32m+[m[32m      data-slot="dropdown-menu-sub-content"[m
+[32m+[m[32m      className={cn("w-auto min-w-[96px] rounded-none bg-popover text-popover-foreground shadow-lg ring-1 ring-foreground/10 duration-100 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95", className )}[m
+[32m+[m[32m      align={align}[m
+[32m+[m[32m      alignOffset={alignOffset}[m
+[32m+[m[32m      side={side}[m
+[32m+[m[32m      sideOffset={sideOffset}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuCheckboxItem({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  children,[m
+[32m+[m[32m  checked,[m
+[32m+[m[32m  inset,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.CheckboxItem.Props & {[m
+[32m+[m[32m  inset?: boolean[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.CheckboxItem[m
+[32m+[m[32m      data-slot="dropdown-menu-checkbox-item"[m
+[32m+[m[32m      data-inset={inset}[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "relative flex cursor-default items-center gap-2 rounded-none py-2 pr-8 pl-2 text-xs outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      checked={checked}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    >[m
+[32m+[m[32m      <span[m
+[32m+[m[32m        className="pointer-events-none absolute right-2 flex items-center justify-center"[m
+[32m+[m[32m        data-slot="dropdown-menu-checkbox-item-indicator"[m
+[32m+[m[32m      >[m
+[32m+[m[32m        <MenuPrimitive.CheckboxItemIndicator>[m
+[32m+[m[32m          <HugeiconsIcon icon={Tick02Icon} strokeWidth={2} />[m
+[32m+[m[32m        </MenuPrimitive.CheckboxItemIndicator>[m
+[32m+[m[32m      </span>[m
+[32m+[m[32m      {children}[m
+[32m+[m[32m    </MenuPrimitive.CheckboxItem>[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuRadioGroup({ ...props }: MenuPrimitive.RadioGroup.Props) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.RadioGroup[m
+[32m+[m[32m      data-slot="dropdown-menu-radio-group"[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuRadioItem({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  children,[m
+[32m+[m[32m  inset,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.RadioItem.Props & {[m
+[32m+[m[32m  inset?: boolean[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.RadioItem[m
+[32m+[m[32m      data-slot="dropdown-menu-radio-item"[m
+[32m+[m[32m      data-inset={inset}[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "relative flex cursor-default items-center gap-2 rounded-none py-2 pr-8 pl-2 text-xs outline-hidden select-none focus:bg-accent focus:text-accent-foreground focus:**:text-accent-foreground data-inset:pl-7 data-disabled:pointer-events-none data-disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    >[m
+[32m+[m[32m      <span[m
+[32m+[m[32m        className="pointer-events-none absolute right-2 flex items-center justify-center"[m
+[32m+[m[32m        data-slot="dropdown-menu-radio-item-indicator"[m
+[32m+[m[32m      >[m
+[32m+[m[32m        <MenuPrimitive.RadioItemIndicator>[m
+[32m+[m[32m          <HugeiconsIcon icon={Tick02Icon} strokeWidth={2} />[m
+[32m+[m[32m        </MenuPrimitive.RadioItemIndicator>[m
+[32m+[m[32m      </span>[m
+[32m+[m[32m      {children}[m
+[32m+[m[32m    </MenuPrimitive.RadioItem>[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuSeparator({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: MenuPrimitive.Separator.Props) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <MenuPrimitive.Separator[m
+[32m+[m[32m      data-slot="dropdown-menu-separator"[m
+[32m+[m[32m      className={cn("-mx-1 h-px bg-border", className)}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction DropdownMenuShortcut({[m
+[32m+[m[32m  className,[m
+[32m+[m[32m  ...props[m
+[32m+[m[32m}: React.ComponentProps<"span">) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <span[m
+[32m+[m[32m      data-slot="dropdown-menu-shortcut"[m
+[32m+[m[32m      className={cn([m
+[32m+[m[32m        "ml-auto text-xs tracking-widest text-muted-foreground group-focus/dropdown-menu-item:text-accent-foreground",[m
+[32m+[m[32m        className[m
+[32m+[m[32m      )}[m
+[32m+[m[32m      {...props}[m
+[32m+[m[32m    />[m
+[32m+[m[32m  )[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport {[m
+[32m+[m[32m  DropdownMenu,[m
+[32m+[m[32m  DropdownMenuPortal,[m
+[32m+[m[32m  DropdownMenuTrigger,[m
+[32m+[m[32m  DropdownMenuContent,[m
+[32m+[m[32m  DropdownMenuGroup,[m
+[32m+[m[32m  DropdownMenuLabel,[m
+[32m+[m[32m  DropdownMenuItem,[m
+[32m+[m[32m  DropdownMenuCheckboxItem,[m
+[32m+[m[32m  DropdownMenuRadioGroup,[m
+[32m+[m[32m  DropdownMenuRadioItem,[m
+[32m+[m[32m  DropdownMenuSeparator,[m
+[32m+[m[32m  DropdownMenuShortcut,[m
+[32m+[m[32m  DropdownMenuSub,[m
+[32m+[m[32m  DropdownMenuSubTrigger,[m
+[32m+[m[32m  DropdownMenuSubContent,[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/lib/studio-types.ts b/platform/frontend/app/lib/studio-types.ts[m
+[1mnew file mode 100644[m
+[1mindex 0000000..3925163[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/lib/studio-types.ts[m
+[36m@@ -0,0 +1,93 @@[m
+[32m+[m[32mimport type { UIMessage } from "ai";[m
+[32m+[m
+[32m+[m[32m// Frontend DTOs for backend/app/models/scenario.py, entities.py, and API previews.[m
+[32m+[m[32m// Table schemas intentionally allow extensible Syda field and metadata definitions.[m
+[32m+[m[32mexport type SchemaTable = Record<string, unknown>;[m
+[32m+[m
+[32m+[m[32mexport interface ScenarioConfiguration {[m
+[32m+[m[32m  title: string;[m
+[32m+[m[32m  description: string;[m
+[32m+[m[32m  recordCount: number;[m
+[32m+[m[32m  secondaryMetric: { label: string; value: string };[m
+[32m+[m[32m  workflow: string[];[m
+[32m+[m[32m  rules: string[];[m
+[32m+[m[32m  schemas?: Record<string, SchemaTable> | null;[m
+[32m+[m[32m  paths?: { name: string; steps: string[]; weight: number; overrides: Record<string, Record<string, unknown>> }[];[m
+[32m+[m[32m  checks?: Record<string, unknown>[];[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface CostEstimate {[m
+[32m+[m[32m  provider: string;[m
+[32m+[m[32m  model: string;[m
+[32m+[m[32m  estimatedInputTokens: number;[m
+[32m+[m[32m  estimatedOutputTokens: number;[m
+[32m+[m[32m  estimatedCostUsd: number | null;[m
+[32m+[m[32m  note: string;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface JobStats {[m
+[32m+[m[32m  causalIntegrity: string;[m
+[32m+[m[32m  referentialIntegrity: string;[m
+[32m+[m[32m  compliance: string;[m
+[32m+[m[32m  recordsGenerated: number;[m
+[32m+[m[32m  flaggedRecords: number;[m
+[32m+[m[32m  durationSeconds: number;[m
+[32m+[m[32m  tableRowCounts: Record<string, number>;[m
+[32m+[m[32m  pathCounts: Record<string, number>;[m
+[32m+[m[32m  evaluationResult: "pass" | "fail" | "partial";[m
+[32m+[m[32m  evaluationMetrics: { key: string; label: string; status: "pass" | "fail" | "not_evaluated"; value: string; detail: string; violations: number }[];[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface GenerationJob {[m
+[32m+[m[32m  jobId: string;[m
+[32m+[m[32m  scenarioId?: string | null;[m
+[32m+[m[32m  status: string;[m
+[32m+[m[32m  progress: number;[m
+[32m+[m[32m  currentStage: string;[m
+[32m+[m[32m  scenario?: ScenarioConfiguration;[m
+[32m+[m[32m  stats?: JobStats;[m
+[32m+[m[32m  downloadUrl?: string | null;[m
+[32m+[m[32m  filesAvailable?: boolean;[m
+[32m+[m[32m  createdAt?: string | null;[m
+[32m+[m[32m  updatedAt?: string | null;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface DatasetPreview {[m
+[32m+[m[32m  jobId: string;[m
+[32m+[m[32m  tables: Record<string, { columns: string[]; rows: Record<string, unknown>[]; rowCount: number }>;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface SavedScenario {[m
+[32m+[m[32m  id: string;[m
+[32m+[m[32m  title: string;[m
+[32m+[m[32m  description: string;[m
+[32m+[m[32m  recordCount: number;[m
+[32m+[m[32m  secondaryMetric: ScenarioConfiguration["secondaryMetric"] | null;[m
+[32m+[m[32m  workflow: string[];[m
+[32m+[m[32m  rules: string[];[m
+[32m+[m[32m  configuration: ScenarioConfiguration;[m
+[32m+[m[32m  createdAt: string;[m
+[32m+[m[32m  updatedAt: string;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface ChatRunReference {[m
+[32m+[m[32m  messageId: string;[m
+[32m+[m[32m  jobId: string;[m
+[32m+[m[32m  scenarioId: string;[m
+[32m+[m[32m  scenario: ScenarioConfiguration;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface SavedConversationSummary {[m
+[32m+[m[32m  id: string;[m
+[32m+[m[32m  title: string;[m
+[32m+[m[32m  createdAt: string | null;[m
+[32m+[m[32m  updatedAt: string | null;[m
+[32m+[m[32m  messageCount: number;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport interface SavedConversation extends SavedConversationSummary {[m
+[32m+[m[32m  messages: UIMessage<unknown, { scenario: ScenarioConfiguration }>[];[m
+[32m+[m[32m  runs: ChatRunReference[];[m
+[32m+[m[32m  scenarioDraft?: ScenarioConfiguration | null;[m
+[32m+[m[32m  draftVersion: number;[m
+[32m+[m[32m}[m
+[1mdiff --git a/platform/frontend/app/routes.ts b/platform/frontend/app/routes.ts[m
+[1mindex 353de0a..b01c230 100644[m
+[1m--- a/platform/frontend/app/routes.ts[m
+[1m+++ b/platform/frontend/app/routes.ts[m
+[36m@@ -2,6 +2,7 @@[m [mimport { type RouteConfig, index, route } from "@react-router/dev/routes";[m
+ [m
+ export default [[m
+   index("routes/landing.tsx"),[m
+[32m+[m[32m  route("ui-preview", "routes/ui-preview.tsx"),[m
+   route("app", "routes/home.tsx"),[m
+   route("app/:conversationId", "routes/chat.tsx"),[m
+   route("login", "routes/login.tsx"),[m
+[1mdiff --git a/platform/frontend/app/routes/home.tsx b/platform/frontend/app/routes/home.tsx[m
+[1mindex 1b75531..bbd3628 100644[m
+[1m--- a/platform/frontend/app/routes/home.tsx[m
+[1m+++ b/platform/frontend/app/routes/home.tsx[m
+[36m@@ -1,3 +1,6 @@[m
+[32m+[m[32mimport { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";[m
+[32m+[m[32mimport { SchemaExplorer } from "~/components/studio/schema-explorer";[m
+[32m+[m[32mimport { RunQualitySummary } from "~/components/studio/run-quality-summary";[m
+ import {[m
+   useEffect,[m
+   useMemo,[m
+[36m@@ -131,6 +134,7 @@[m [mfunction PromptComposer({[m
+   compact = false,[m
+   disabled = false,[m
+   isLoading = false,[m
+[32m+[m[32m  source, onSource, connections,[m
+ }: {[m
+   value: string;[m
+   onChange: (value: string) => void;[m
+[36m@@ -138,7 +142,11 @@[m [mfunction PromptComposer({[m
+   compact?: boolean;[m
+   disabled?: boolean;[m
+   isLoading?: boolean;[m
+[32m+[m[32m  connections: ReturnType<typeof useLiveProfiles>;[m
+[32m+[m[32m  source: SchemaSource | null;[m
+[32m+[m[32m  onSource: (source: SchemaSource | null) => void;[m
+ }) {[m
+[32m+[m[32m  const [attachmentError, setAttachmentError] = useState("");[m
+   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {[m
+     if (event.key === "Enter" && !event.shiftKey && !disabled && !isLoading) {[m
+       event.preventDefault();[m
+[36m@@ -160,21 +168,28 @@[m [mfunction PromptComposer({[m
+         <Textarea[m
+           aria-label="Describe your synthetic data scenario"[m
+           autoFocus={!compact}[m
+[31m-          className={compact ? "min-h-20 resize-none rounded-none border-0 pb-14 pr-16" : "min-h-28 resize-none rounded-none border-0 pb-14 pr-16"}[m
+[32m+[m[32m          className={compact ? "min-h-20 resize-none rounded-none border-0 shadow-none focus-visible:ring-0" : "min-h-28 resize-none rounded-none border-0 shadow-none focus-visible:ring-0"}[m
+           disabled={disabled || isLoading}[m
+           onChange={(event) => onChange(event.target.value)}[m
+           onKeyDown={handleKeyDown}[m
+           placeholder={isLoading ? "Syda Agent is analyzing and compiling your scenario…" : "Describe the data you want to generate…"}[m
+           value={value}[m
+         />[m
+[31m-        <Button aria-label="Send prompt" className="absolute right-3 bottom-3" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">[m
+[32m+[m[32m        <div className="flex flex-wrap items-center gap-2 border-t px-3 py-3">[m
+[32m+[m[32m          <label className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center rounded-full border px-3 text-sm font-medium focus-within:ring-2 focus-within:ring-ring">[m
+[32m+[m[32m            Attach<input className="sr-only" aria-label="Attach schema or sample" disabled={disabled || isLoading} type="file" accept=".csv,.json,.txt" onChange={async e => { const file = e.target.files?.[0]; e.target.value = ""; if (!file) return; setAttachmentError(""); if (file.size > 100000 || !/\.(csv|json|txt)$/i.test(file.name)) { setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB."); return; } try { onChange(value + `\n\nAttached context (${file.name}):\n${await file.text()}`); } catch { setAttachmentError("Could not read this file. Please retry."); } }} />[m
+[32m+[m[32m          </label>[m
+[32m+[m[32m          <LiveConnections connections={connections} source={source} onSource={onSource} disabled={disabled || isLoading} />[m
+[32m+[m[32m          <Button aria-label="Send prompt" className="ml-auto shrink-0" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">[m
+           {isLoading ? ([m
+             <Spinner />[m
+           ) : ([m
+             <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />[m
+           )}[m
+         </Button>[m
+[32m+[m[32m        </div>[m
+       </div>[m
+[32m+[m[32m      {attachmentError && <p role="alert" className="mt-2 text-xs text-destructive">{attachmentError}</p>}[m
+       {!compact && ([m
+         <p className="mt-3 text-center text-xs text-muted-foreground">[m
+           Syda can make mistakes. Review rules and evaluations before using generated data.[m
+[36m@@ -189,11 +204,13 @@[m [mfunction ScenarioCard({[m
+   onEdit,[m
+   onGenerate,[m
+   messageId,[m
+[32m+[m[32m  sourceName,[m
+ }: {[m
+   scenario: ScenarioConfiguration;[m
+   onEdit: (scenario: ScenarioConfiguration, messageId: string) => Promise<void>;[m
+   onGenerate: (scenario: ScenarioConfiguration) => Promise<void>;[m
+   messageId: string;[m
+[32m+[m[32m  sourceName: string;[m
+ }) {[m
+   const [saving, setSaving] = useState(false);[m
+   const [saveError, setSaveError] = useState<string>();[m
+[36m@@ -291,23 +308,17 @@[m [mfunction ScenarioCard({[m
+           )}[m
+           {!!tableEntries.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-schema">[m
+             <h3 className="text-xs font-medium" id="scenario-schema">Schema preview</h3>[m
+[31m-            <div className="flex flex-wrap gap-1.5">[m
+[31m-              {tableEntries.map(([tableName, table]) => ([m
+[31m-                <Badge key={tableName} variant="outline">[m
+[31m-                  {tableName} · {Object.keys(table).filter((field) => !field.startsWith("__")).length} fields[m
+[31m-                </Badge>[m
+[31m-              ))}[m
+[31m-            </div>[m
+[32m+[m[32m            <details><summary className="cursor-pointer text-xs">Browse {tableEntries.length} tables and columns</summary><div className="mt-3"><SchemaExplorer schemas={scenario.schemas ?? {}} /></div></details>[m
+           </section>}[m
+           {!!scenario.rules.length && <section className="flex flex-col gap-2" aria-labelledby="scenario-rules">[m
+             <h3 className="text-xs font-medium" id="scenario-rules">Rules</h3>[m
+             <ul className="list-disc pl-4 text-xs text-muted-foreground">[m
+[31m-              {scenario.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}[m
+[32m+[m[32m              {scenario.rules.map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}[m
+             </ul>[m
+[31m-            {scenario.rules.length > 3 && <p className="text-xs text-muted-foreground">+{scenario.rules.length - 3} more rules</p>}[m
+[32m+[m
+           </section>}[m
+         </CardContent>[m
+[31m-        <CardFooter className="justify-between gap-2">[m
+[32m+[m[32m        <CardFooter className="flex-wrap justify-between gap-2">[m
+           <Button disabled={saving} onClick={() => void openEditor()} type="button" variant="outline">[m
+             {saving ? <Spinner data-icon="inline-start" /> : null}{saving ? "Opening editor…" : "Edit full scenario"}[m
+           </Button>[m
+[36m@@ -341,12 +352,13 @@[m [mfunction ScenarioCard({[m
+               <p className="text-xs leading-5 text-muted-foreground">{scenario.workflow.join(" → ")}</p>[m
+             </section>[m
+             <section className="space-y-2">[m
+[31m-              <h3 className="text-xs font-medium">Key rules</h3>[m
+[32m+[m[32m              <h3 className="text-xs font-medium">Generation rules</h3>[m
+               <ul className="list-disc space-y-1 pl-4 text-xs text-muted-foreground">[m
+[31m-                {scenario.rules.slice(0, 3).map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}[m
+[32m+[m[32m                {scenario.rules.map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}[m
+               </ul>[m
+[31m-              {scenario.rules.length > 3 && <p className="text-[10px] text-muted-foreground">Plus {scenario.rules.length - 3} more rules</p>}[m
+[32m+[m
+             </section>[m
+[32m+[m[32m            <section className="rounded-2xl border p-4 text-xs space-y-2"><h3 className="font-medium">Source and destination</h3><p>Source: {sourceName}. Review the {tableEntries.length} table definitions below before generating.</p><p>Destination: downloadable CSV files. No database write-back.</p><details><summary className="cursor-pointer">Review table definitions</summary><div className="mt-3"><SchemaExplorer schemas={scenario.schemas ?? {}} /></div></details></section>[m
+             <section className="rounded-2xl border p-4">[m
+               <div className="flex items-start justify-between gap-3">[m
+                 <div><h3 className="text-xs font-medium">Generation estimate</h3><p className="mt-1 text-[10px] text-muted-foreground">{estimate ? `${estimate.provider} · ${estimate.model}` : "Checking configured provider…"}</p></div>[m
+[36m@@ -416,11 +428,13 @@[m [mfunction GenerationRunCard({ run }: { run: ChatRun }) {[m
+         {(error || (failed && job?.currentStage)) && <p className="text-xs text-destructive">{error ?? job?.currentStage}</p>}[m
+         <div className="flex flex-wrap items-center justify-between gap-2">[m
+           <p className="text-[10px] text-muted-foreground">Run {run.jobId}</p>[m
+[31m-          <div className="flex gap-2">[m
+[32m+[m[32m          <div className="flex flex-wrap gap-2">[m
+             {complete && (job?.downloadUrl || job?.filesAvailable) && <a className={buttonVariants({ size: "sm" })} href={job?.downloadUrl ?? `/api/download/${run.jobId}`}>Download dataset</a>}[m
+             <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data`}>Browse full dataset</Link>[m
+           </div>[m
+         </div>[m
+[32m+[m[32m        {complete && <RunQualitySummary stats={job?.stats} scenario={run.scenario} />}[m
+[32m+[m[32m        {failed && <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${run.scenarioId}`}>Review scenario and retry</Link>}[m
+         {complete && job?.filesAvailable && <DataPreview compact complete jobId={run.jobId} showDownloads={false} />}[m
+       </CardContent>[m
+     </Card>[m
+[36m@@ -434,6 +448,8 @@[m [mexport default function Home() {[m
+   const conversationIdRef = useRef<string | undefined>(conversationId);[m
+   conversationIdRef.current = conversationId;[m
+   const [prompt, setPrompt] = useState("");[m
+[32m+[m[32m  const [source, setSource] = useState<SchemaSource | null>(null);[m
+[32m+[m[32m  const connections = useLiveProfiles();[m
+   const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);[m
+   const [conversationTitle, setConversationTitle] = useState("");[m
+   const [loadedConversationId, setLoadedConversationId] = useState<string>();[m
+[36m@@ -667,10 +683,11 @@[m [mexport default function Home() {[m
+ [m
+     setPrompt("");[m
+     clearError();[m
+[31m-    await sendMessage({ text });[m
+[32m+[m[32m    await sendMessage({ text: source ? `${text}\n\nDatabase schema context (${source.name}; structure only, output CSV):\n${JSON.stringify(source.schemas)}` : text });[m
+   };[m
+ [m
+   const startNewScenario = () => {[m
+[32m+[m[32m    setSource(null);[m
+     stop();[m
+     setPrompt("");[m
+     setMessages([]);[m
+[36m@@ -751,7 +768,7 @@[m [mexport default function Home() {[m
+               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">[m
+                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.[m
+               </p>[m
+[31m-              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />[m
+[32m+[m[32m              <PromptComposer connections={connections} source={source} onSource={setSource} disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />[m
+               <div className="mt-5 flex flex-wrap justify-center gap-2">[m
+                 {promptSuggestions.map((suggestion) => ([m
+                   <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">[m
+[36m@@ -799,7 +816,8 @@[m [mexport default function Home() {[m
+                                 <BubbleContent className={scenario ? "w-full" : undefined}>[m
+                                   {text && ([m
+                                     <p className={scenario ? "mb-3 text-xs leading-5" : undefined}>[m
+[31m-                                      {text}[m
+[32m+[m[32m                                      {text.split("\n\nDatabase schema context (")[0]}[m
+[32m+[m[32m                                      {text.includes("\n\nDatabase schema context (") && <span className="mt-2 block text-xs text-muted-foreground">Database schema included with this prompt.</span>}[m
+                                       {isStreamingThis && ([m
+                                         <span className="ml-1 inline-block h-3.5 w-1.5 animate-pulse rounded-xs bg-primary align-middle" />[m
+                                       )}[m
+[36m@@ -807,6 +825,7 @@[m [mexport default function Home() {[m
+                                   )}[m
+                                   {scenario && ([m
+                                     <ScenarioCard[m
+[32m+[m[32m                                      sourceName={messages.slice(0, index).reverse().find(item => item.role === "user")?.parts.filter(part => part.type === "text").map(part => part.text).join(" ").match(/Database schema context \((.*); structure only, output CSV\):/)?.[1] ?? "Chat instructions"}[m
+                                       messageId={message.id}[m
+                                       onEdit={openEditor}[m
+                                       onGenerate={(nextScenario) => startGeneration(nextScenario, message.id)}[m
+[36m@@ -848,7 +867,7 @@[m [mexport default function Home() {[m
+             <div className="shrink-0 border-t bg-background px-5 py-4">[m
+               <div className="mx-auto w-full max-w-3xl">[m
+                 <div className="flex items-end gap-2">[m
+[31m-                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />[m
+[32m+[m[32m                  <PromptComposer connections={connections} source={source} onSource={setSource} compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />[m
+                   {isThinking && ([m
+                     <Button onClick={() => stop()} type="button" variant="outline">[m
+                       Stop[m
+[1mdiff --git a/platform/frontend/app/routes/run-detail.tsx b/platform/frontend/app/routes/run-detail.tsx[m
+[1mindex 5f90bc9..5373bcf 100644[m
+[1m--- a/platform/frontend/app/routes/run-detail.tsx[m
+[1m+++ b/platform/frontend/app/routes/run-detail.tsx[m
+[36m@@ -1,3 +1,4 @@[m
+[32m+[m[32mimport { RunQualitySummary } from "~/components/studio/run-quality-summary";[m
+ import { useCallback, useEffect, useState } from "react";[m
+ import { Link, useNavigate, useParams, useSearchParams } from "react-router";[m
+ [m
+[36m@@ -84,7 +85,7 @@[m [mexport default function RunDetail() {[m
+             <Card className="lg:col-span-2"><CardHeader><CardTitle>Rules</CardTitle><CardDescription>Constraints included in this run.</CardDescription></CardHeader><CardContent><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{job.scenario?.rules?.map((rule, index) => <li key={index}>{rule}</li>)}</ul></CardContent></Card>[m
+           </div></TabsContent>[m
+           <TabsContent className="pt-3" value="data"><DataPreview complete={complete} jobId={job.jobId} /></TabsContent>[m
+[31m-          <TabsContent className="pt-3" value="evaluation"><EvaluationReport jobId={job.jobId} stats={job.stats} /></TabsContent>[m
+[32m+[m[32m          <TabsContent className="space-y-4 pt-3" value="evaluation">{job.scenario && <RunQualitySummary stats={job.stats} scenario={job.scenario} />}<EvaluationReport jobId={job.jobId} stats={job.stats} /></TabsContent>[m
+         </Tabs>[m
+       </>}[m
+     </div></main>[m
+[1mdiff --git a/platform/frontend/app/routes/ui-preview.tsx b/platform/frontend/app/routes/ui-preview.tsx[m
+[1mnew file mode 100644[m
+[1mindex 0000000..d19aff3[m
+[1m--- /dev/null[m
+[1m+++ b/platform/frontend/app/routes/ui-preview.tsx[m
+[36m@@ -0,0 +1,616 @@[m
+[32m+[m[32mimport { Link } from "react-router";[m
+[32m+[m[32mimport { ConnectionPicker } from "~/components/database-workspace";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  Fragment,[m
+[32m+[m[32m  useEffect,[m
+[32m+[m[32m  useState,[m
+[32m+[m[32m  type FormEvent,[m
+[32m+[m[32m  type KeyboardEvent,[m
+[32m+[m[32m} from "react";[m
+[32m+[m[32mimport { HugeiconsIcon } from "@hugeicons/react";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  Add01Icon,[m
+[32m+[m[32m  AiMagicIcon,[m
+[32m+[m[32m  Analytics01Icon,[m
+[32m+[m[32m  ArrowUp02Icon,[m
+[32m+[m[32m  Attachment01Icon,[m
+[32m+[m[32m  ChartEvaluationIcon,[m
+[32m+[m[32m  Database02Icon,[m
+[32m+[m[32m  MoreHorizontalIcon,[m
+[32m+[m[32m  SecurityCheckIcon,[m
+[32m+[m[32m  SparklesIcon,[m
+[32m+[m[32m  UserCircleIcon,[m
+[32m+[m[32m} from "@hugeicons/core-free-icons";[m
+[32m+[m
+[32m+[m[32mimport type { Route } from "./+types/ui-preview";[m
+[32m+[m[32mimport { Button } from "~/components/ui/button";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  Card,[m
+[32m+[m[32m  CardAction,[m
+[32m+[m[32m  CardContent,[m
+[32m+[m[32m  CardDescription,[m
+[32m+[m[32m  CardFooter,[m
+[32m+[m[32m  CardHeader,[m
+[32m+[m[32m  CardTitle,[m
+[32m+[m[32m} from "~/components/ui/card";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  Bubble,[m
+[32m+[m[32m  BubbleContent,[m
+[32m+[m[32m} from "~/components/ui/bubble";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  Message,[m
+[32m+[m[32m  MessageAvatar,[m
+[32m+[m[32m  MessageContent,[m
+[32m+[m[32m} from "~/components/ui/message";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  MessageScroller,[m
+[32m+[m[32m  MessageScrollerButton,[m
+[32m+[m[32m  MessageScrollerContent,[m
+[32m+[m[32m  MessageScrollerItem,[m
+[32m+[m[32m  MessageScrollerProvider,[m
+[32m+[m[32m  MessageScrollerViewport,[m
+[32m+[m[32m} from "~/components/ui/message-scroller";[m
+[32m+[m[32mimport { Separator } from "~/components/ui/separator";[m
+[32m+[m[32mimport {[m
+[32m+[m[32m  Sidebar,[m
+[32m+[m[32m  SidebarContent,[m
+[32m+[m[32m  SidebarFooter,[m
+[32m+[m[32m  SidebarGroup,[m
+[32m+[m[32m  SidebarGroupContent,[m
+[32m+[m[32m  SidebarGroupLabel,[m
+[32m+[m[32m  SidebarHeader,[m
+[32m+[m[32m  SidebarInset,[m
+[32m+[m[32m  SidebarMenu,[m
+[32m+[m[32m  SidebarMenuButton,[m
+[32m+[m[32m  SidebarMenuItem,[m
+[32m+[m[32m  SidebarProvider,[m
+[32m+[m[32m  SidebarRail,[m
+[32m+[m[32m  SidebarTrigger,[m
+[32m+[m[32m} from "~/components/ui/sidebar";[m
+[32m+[m[32mimport { Textarea } from "~/components/ui/textarea";[m
+[32m+[m[32mimport { ReviewWorkspace, useReviewWorkspace, viewTitles } from "~/components/review-workspace";[m
+[32m+[m
+[32m+[m[32mexport function meta({}: Route.MetaArgs) {[m
+[32m+[m[32m  return [[m
+[32m+[m[32m    { title: "Syda — UI prototype preview" },[m
+[32m+[m[32m    {[m
+[32m+[m[32m      name: "description",[m
+[32m+[m[32m      content: "Design, generate, and evaluate trustworthy synthetic data.",[m
+[32m+[m[32m    },[m
+[32m+[m[32m  ];[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mconst recentScenarios = [[m
+[32m+[m[32m  { name: "Insurance claims", subtitle: "10k records · 15% denied" },[m
+[32m+[m[32m  { name: "Patient journey", subtitle: "Last edited yesterday" },[m
+[32m+[m[32m  { name: "E-commerce orders", subtitle: "25k records · 4 tables" },[m
+[32m+[m[32m];[m
+[32m+[m
+[32m+[m[32mconst workspaceItems = [[m
+[32m+[m[32m  { name: "Scenario", icon: AiMagicIcon, view: "chat" },[m
+[32m+[m[32m  { name: "Connections", icon: Database02Icon, view: "connections" },[m
+[32m+[m[32m  { name: "Schema review", icon: SecurityCheckIcon, view: "schema" },[m
+[32m+[m[32m  { name: "Run history", icon: ChartEvaluationIcon, view: "runs" },[m
+[32m+[m[32m] as const;[m
+[32m+[m
+[32m+[m[32mconst promptSuggestions = [[m
+[32m+[m[32m  {label:"Oncology cohort",prompt:"Create an oncology cohort of 100 patients with lung and colorectal cancers, ages 40–80, with linked diagnoses, claims, and payments. Diagnosis precedes claim; denied claims have no payment."},[m
+[32m+[m[32m  {[m
+[32m+[m[32m    label: "Insurance claims",[m
+[32m+[m[32m    prompt:[m
+[32m+[m[32m      "Generate 10,000 insurance claims where 15% are denied, with realistic diagnoses, providers, and payment timelines.",[m
+[32m+[m[32m  },[m
+[32m+[m[32m  {[m
+[32m+[m[32m    label: "Patient journeys",[m
+[32m+[m[32m    prompt:[m
+[32m+[m[32m      "Create 5,000 longitudinal patient journeys with diagnoses, treatments, follow-ups, and realistic care gaps.",[m
+[32m+[m[32m  },[m
+[32m+[m[32m  {[m
+[32m+[m[32m    label: "E-commerce orders",[m
+[32m+[m[32m    prompt:[m
+[32m+[m[32m      "Build an e-commerce dataset with 25,000 orders, customers, products, refunds, and seasonal purchasing patterns.",[m
+[32m+[m[32m  },[m
+[32m+[m[32m];[m
+[32m+[m
+[32m+[m[32mtype GenerationStatus =[m
+[32m+[m[32m  | "idle"[m
+[32m+[m[32m  | "generating"[m
+[32m+[m[32m  | "validating"[m
+[32m+[m[32m  | "evaluating"[m
+[32m+[m[32m  | "complete";[m
+[32m+[m
+[32m+[m[32mtype ScenarioConfiguration = {[m
+[32m+[m[32m  title: string;[m
+[32m+[m[32m  description: string;[m
+[32m+[m[32m  recordCount: number;[m
+[32m+[m[32m  secondaryMetric: { label: string; value: string };[m
+[32m+[m[32m  workflow: string[];[m
+[32m+[m[32m  rules: string[];[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mtype ConversationTurn = {[m
+[32m+[m[32m  id: string;[m
+[32m+[m[32m  prompt: string;[m
+[32m+[m[32m  response: string;[m
+[32m+[m[32m  scenario: ScenarioConfiguration;[m
+[32m+[m[32m  status: GenerationStatus;[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mconst scenarioProfiles: Array<{[m
+[32m+[m[32m  matches: RegExp;[m
+[32m+[m[32m  scenario: ScenarioConfiguration;[m
+[32m+[m[32m}> = [[m
+[32m+[m[32m  {[m
+[32m+[m[32m    matches: /insurance|claim|denial|oncolog|cancer/i,[m
+[32m+[m[32m    scenario: {[m
+[32m+[m[32m      title: "Insurance claims",[m
+[32m+[m[32m      description: "Healthcare claims with causal and referential constraints.",[m
+[32m+[m[32m      recordCount: 10_000,[m
+[32m+[m[32m      secondaryMetric: { label: "Denial rate", value: "15%" },[m
+[32m+[m[32m      workflow: ["Patient", "Diagnosis", "Claim", "Adjudication", "Payment"],[m
+[32m+[m[32m      rules: [[m
+[32m+[m[32m        "Diagnosis occurs before a claim",[m
+[32m+[m[32m        "Adjudication occurs before payment",[m
+[32m+[m[32m        "Denied claims cannot be paid",[m
+[32m+[m[32m      ],[m
+[32m+[m[32m    },[m
+[32m+[m[32m  },[m
+[32m+[m[32m  {[m
+[32m+[m[32m    matches: /patient|journey|care gap/i,[m
+[32m+[m[32m    scenario: {[m
+[32m+[m[32m      title: "Patient journeys",[m
+[32m+[m[32m      description: "Longitudinal care journeys with clinically ordered events.",[m
+[32m+[m[32m      recordCount: 5_000,[m
+[32m+[m[32m      secondaryMetric: { label: "Care-gap rate", value: "8%" },[m
+[32m+[m[32m      workflow: ["Patient", "Visit", "Diagnosis", "Treatment", "Follow-up"],[m
+[32m+[m[32m      rules: [[m
+[32m+[m[32m        "Visits occur before diagnoses",[m
+[32m+[m[32m        "Treatments require a diagnosis",[m
+[32m+[m[32m        "Follow-ups occur after treatment",[m
+[32m+[m[32m      ],[m
+[32m+[m[32m    },[m
+[32m+[m[32m  },[m
+[32m+[m[32m  {[m
+[32m+[m[32m    matches: /e-commerce|commerce|orders?|refund|product/i,[m
+[32m+[m[32m    scenario: {[m
+[32m+[m[32m      title: "E-commerce orders",[m
+[32m+[m[32m      description: "Relational commerce data with orders, products, and refunds.",[m
+[32m+[m[32m      recordCount: 25_000,[m
+[32m+[m[32m      secondaryMetric: { label: "Tables", value: "4" },[m
+[32m+[m[32m      workflow: ["Customer", "Cart", "Order", "Payment", "Fulfillment"],[m
+[32m+[m[32m      rules: [[m
+[32m+[m[32m        "Orders contain valid products",[m
+[32m+[m[32m        "Payments occur after checkout",[m
+[32m+[m[32m        "Refunds cannot exceed payments",[m
+[32m+[m[32m      ],[m
+[32m+[m[32m    },[m
+[32m+[m[32m  },[m
+[32m+[m[32m];[m
+[32m+[m
+[32m+[m[32mconst defaultScenario: ScenarioConfiguration = {[m
+[32m+[m[32m  title: "Custom scenario",[m
+[32m+[m[32m  description: "A structured synthetic-data scenario based on your requirements.",[m
+[32m+[m[32m  recordCount: 10_000,[m
+[32m+[m[32m  secondaryMetric: { label: "Rules", value: "3" },[m
+[32m+[m[32m  workflow: ["Source", "Event", "Decision", "Outcome"],[m
+[32m+[m[32m  rules: [[m
+[32m+[m[32m    "Events preserve their declared order",[m
+[32m+[m[32m    "Relationships maintain referential integrity",[m
+[32m+[m[32m    "Generated records satisfy scenario constraints",[m
+[32m+[m[32m  ],[m
+[32m+[m[32m};[m
+[32m+[m
+[32m+[m[32mfunction cloneScenario(scenario: ScenarioConfiguration): ScenarioConfiguration {[m
+[32m+[m[32m  return {[m
+[32m+[m[32m    ...scenario,[m
+[32m+[m[32m    secondaryMetric: { ...scenario.secondaryMetric },[m
+[32m+[m[32m    workflow: [...scenario.workflow],[m
+[32m+[m[32m    rules: [...scenario.rules],[m
+[32m+[m[32m  };[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction scenarioFromPrompt([m
+[32m+[m[32m  prompt: string,[m
+[32m+[m[32m  current?: ScenarioConfiguration,[m
+[32m+[m[32m): ScenarioConfiguration {[m
+[32m+[m[32m  const selected = current[m
+[32m+[m[32m    ? cloneScenario(current)[m
+[32m+[m[32m    : cloneScenario([m
+[32m+[m[32m        scenarioProfiles.find((profile) => profile.matches.test(prompt))?.scenario ??[m
+[32m+[m[32m          defaultScenario,[m
+[32m+[m[32m      );[m
+[32m+[m
+[32m+[m[32m  const recordMatch = prompt.match([m
+[32m+[m[32m    /([\d,]+)\s+(?:records?|insurance claims?|claims?|patient journeys?|patients?|orders?)/i,[m
+[32m+[m[32m  );[m
+[32m+[m[32m  if (recordMatch) {[m
+[32m+[m[32m    selected.recordCount = Number(recordMatch[1].replaceAll(",", ""));[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  if (/oncolog|cancer/i.test(prompt)) {[m
+[32m+[m[32m    selected.title = "Oncology cohort";[m
+[32m+[m[32m    selected.description = "Preview a linked healthcare scenario before generation.";[m
+[32m+[m[32m    selected.secondaryMetric = { label: "Related tables", value: "4" };[m
+[32m+[m[32m    selected.workflow = ["Patient", "Diagnosis", "Claim", "Payment"];[m
+[32m+[m[32m    selected.rules = ["Diagnosis precedes claim", "Denied claims have no payment", "Review demographic and cancer-type requirements"];[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  const denialMatch =[m
+[32m+[m[32m    prompt.match(/([\d.]+)%\s+(?:are\s+)?denied/i) ??[m
+[32m+[m[32m    prompt.match(/denial(?:s| rate)?(?:\s+(?:to|of|at))?\s*([\d.]+)%/i);[m
+[32m+[m[32m  if (denialMatch && selected.title === "Insurance claims") {[m
+[32m+[m[32m    selected.secondaryMetric = {[m
+[32m+[m[32m      label: "Denial rate",[m
+[32m+[m[32m      value: `${denialMatch[1]}%`,[m
+[32m+[m[32m    };[m
+[32m+[m[32m  }[m
+[32m+[m
+[32m+[m[32m  return selected;[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction createTurn([m
+[32m+[m[32m  prompt: string,[m
+[32m+[m[32m  current?: ScenarioConfiguration,[m
+[32m+[m[32m): ConversationTurn {[m
+[32m+[m[32m  return {[m
+[32m+[m[32m    id: crypto.randomUUID(),[m
+[32m+[m[32m    prompt,[m
+[32m+[m[32m    response: current[m
+[32m+[m[32m      ? "I’ve updated the structured configuration. The previous version remains in the conversation for comparison."[m
+[32m+[m[32m      : "I’ve created a structured scenario from your requirements. Review the workflow and rules before generating.",[m
+[32m+[m[32m    scenario: scenarioFromPrompt(prompt, current),[m
+[32m+[m[32m    status: "idle",[m
+[32m+[m[32m  };[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction PromptComposer({[m
+[32m+[m[32m  value,[m
+[32m+[m[32m  onChange,[m
+[32m+[m[32m  onSubmit,[m
+[32m+[m[32m  compact = false,[m
+[32m+[m[32m  connector,[m
+[32m+[m[32m}: {[m
+[32m+[m[32m  value: string;[m
+[32m+[m[32m  onChange: (value: string) => void;[m
+[32m+[m[32m  onSubmit: () => void;[m
+[32m+[m[32m  compact?: boolean;[m
+[32m+[m[32m  connector: React.ReactNode;[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  const [attachment,setAttachment] = useState("");[m
+[32m+[m[32m  const [attachmentError,setAttachmentError] = useState("");[m
+[32m+[m[32m  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {[m
+[32m+[m[32m    if (event.key === "Enter" && !event.shiftKey) {[m
+[32m+[m[32m      event.preventDefault();[m
+[32m+[m[32m      onSubmit();[m
+[32m+[m[32m    }[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <form[m
+[32m+[m[32m      className="w-full"[m
+[32m+[m[32m      onSubmit={(event: FormEvent) => {[m
+[32m+[m[32m        event.preventDefault();[m
+[32m+[m[32m        onSubmit();[m
+[32m+[m[32m      }}[m
+[32m+[m[32m    >[m
+[32m+[m[32m      <div className="overflow-hidden rounded-3xl border bg-card shadow-[0_14px_44px_-28px_oklch(0.2_0.02_260/0.45)] focus-within:border-ring focus-within:ring-1 focus-within:ring-ring/30">[m
+[32m+[m[32m        <Textarea[m
+[32m+[m[32m          aria-label="Describe your synthetic data scenario"[m
+[32m+[m[32m          autoFocus={!compact}[m
+[32m+[m[32m          className={compact ? "min-h-20 resize-none rounded-none border-0 shadow-none focus-visible:ring-0" : "min-h-28 resize-none rounded-none border-0 shadow-none focus-visible:ring-0"}[m
+[32m+[m[32m          onChange={(event) => onChange(event.target.value)}[m
+[32m+[m[32m          onKeyDown={handleKeyDown}[m
+[32m+[m[32m          placeholder="Describe the data you want to generate…"[m
+[32m+[m[32m          value={value}[m
+[32m+[m[32m        />[m
+[32m+[m[32m        <div className="flex flex-wrap items-center gap-2 border-t p-3">[m
+[32m+[m[32m          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">[m
+[32m+[m[32m            <label className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-full border px-3 text-sm font-medium focus-within:ring-2 focus-within:ring-ring [&_svg]:size-4" title="Add a sample or schema"><HugeiconsIcon icon={Attachment01Icon} strokeWidth={2}/><span>Attach</span><input className="sr-only" aria-label="Attach sample or schema" type="file" accept=".csv,.json,.txt" onChange={async e=>{const file=e.target.files?.[0];e.target.value="";if(!file)return;setAttachmentError("");if(file.size>100000||! /\.(csv|json|txt)$/i.test(file.name)){setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB.");return;}try{const text=await file.text();onChange(value+`\n\nAttached context (${file.name}):\n${text}`);setAttachment(file.name);}catch{setAttachmentError("Could not read this file. Please try again.");}}}/></label>[m
+[32m+[m[32m            {connector}[m
+[32m+[m[32m          </div>[m
+[32m+[m[32m          <Button className="ml-auto shrink-0 self-end" aria-label="Send prompt" disabled={!value.trim()} size="icon" type="submit">[m
+[32m+[m[32m            <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />[m
+[32m+[m[32m          </Button>[m
+[32m+[m[32m        </div>[m
+[32m+[m[32m      </div>[m
+[32m+[m[32m      {attachment&&<p role="status" className="mt-2 text-xs text-muted-foreground">Added {attachment} to the prompt. Context is local; the preview does not parse it into a schema.</p>}[m
+[32m+[m[32m      {attachmentError&&<p role="alert" className="mt-2 text-xs text-destructive">{attachmentError}</p>}[m
+[32m+[m[32m      {!compact && ([m
+[32m+[m[32m        <p className="mt-3 text-center text-xs text-muted-foreground">[m
+[32m+[m[32m          Syda can make mistakes. Review rules and evaluations before using generated data.[m
+[32m+[m[32m        </p>[m
+[32m+[m[32m      )}[m
+[32m+[m[32m    </form>[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mfunction ScenarioCard({[m
+[32m+[m[32m  scenario,[m
+[32m+[m[32m  status,[m
+[32m+[m[32m  onGenerate,[m
+[32m+[m[32m}: {[m
+[32m+[m[32m  scenario: ScenarioConfiguration;[m
+[32m+[m[32m  status: GenerationStatus;[m
+[32m+[m[32m  onGenerate: () => void;[m
+[32m+[m[32m}) {[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <div className="flex flex-col gap-4">[m
+[32m+[m[32m      <Card>[m
+[32m+[m[32m        <CardHeader>[m
+[32m+[m[32m          <CardTitle>{scenario.title}</CardTitle>[m
+[32m+[m[32m          <CardDescription>{scenario.description}</CardDescription>[m
+[32m+[m[32m          <CardAction>[m
+[32m+[m[32m            <Button aria-label="Scenario actions" size="icon-sm" variant="ghost">[m
+[32m+[m[32m              <HugeiconsIcon icon={MoreHorizontalIcon} strokeWidth={2} />[m
+[32m+[m[32m            </Button>[m
+[32m+[m[32m          </CardAction>[m
+[32m+[m[32m        </CardHeader>[m
+[32m+[m[32m        <CardContent className="flex flex-col gap-5">[m
+[32m+[m[32m          <dl className="grid grid-cols-2 gap-x-8 gap-y-2 border-y py-4 tabular-nums">[m
+[32m+[m[32m            <div className="flex items-center justify-between gap-3">[m
+[32m+[m[32m              <dt className="text-muted-foreground">Records</dt>[m
+[32m+[m[32m              <dd className="font-medium">{scenario.recordCount.toLocaleString()}</dd>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m            <div className="flex items-center justify-between gap-3">[m
+[32m+[m[32m              <dt className="text-muted-foreground">{scenario.secondaryMetric.label}</dt>[m
+[32m+[m[32m              <dd className="font-medium">{scenario.secondaryMetric.value}</dd>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m          </dl>[m
+[32m+[m
+[32m+[m[32m          <section className="flex flex-col gap-2" aria-labelledby="workflow-title">[m
+[32m+[m[32m            <h3 id="workflow-title" className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">[m
+[32m+[m[32m              Workflow[m
+[32m+[m[32m            </h3>[m
+[32m+[m[32m            <div className="flex flex-wrap items-center gap-1.5 text-xs font-medium">[m
+[32m+[m[32m              {scenario.workflow.map((step, index) => ([m
+[32m+[m[32m                <span className="flex items-center gap-1.5" key={step}>[m
+[32m+[m[32m                  <span>{step}</span>[m
+[32m+[m[32m                  {index < scenario.workflow.length - 1 && ([m
+[32m+[m[32m                    <span className="text-muted-foreground">→</span>[m
+[32m+[m[32m                  )}[m
+[32m+[m[32m                </span>[m
+[32m+[m[32m              ))}[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m          </section>[m
+[32m+[m
+[32m+[m[32m          <section className="flex flex-col gap-2" aria-labelledby="rules-title">[m
+[32m+[m[32m            <h3 id="rules-title" className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">[m
+[32m+[m[32m              Rules[m
+[32m+[m[32m            </h3>[m
+[32m+[m[32m            <ul className="flex flex-col gap-1.5">[m
+[32m+[m[32m              {scenario.rules.map((rule) => ([m
+[32m+[m[32m                <li className="flex items-center gap-2" key={rule}>[m
+[32m+[m[32m                  <span className="flex size-4 items-center justify-center bg-primary text-[10px] text-primary-foreground">✓</span>[m
+[32m+[m[32m                  {rule}[m
+[32m+[m[32m                </li>[m
+[32m+[m[32m              ))}[m
+[32m+[m[32m            </ul>[m
+[32m+[m[32m          </section>[m
+[32m+[m[32m        </CardContent>[m
+[32m+[m[32m        <CardFooter className="flex-wrap justify-end gap-2">[m
+[32m+[m[32m          <Button onClick={onGenerate} type="button" variant="outline">Edit configuration</Button>[m
+[32m+[m[32m          <Button disabled={status !== "idle"} onClick={onGenerate} type="button">[m
+[32m+[m[32m            <HugeiconsIcon data-icon="inline-start" icon={SparklesIcon} strokeWidth={2} />[m
+[32m+[m[32m            {status === "idle"[m
+[32m+[m[32m              ? "Review & generate"[m
+[32m+[m[32m              : status === "complete"[m
+[32m+[m[32m                ? "Generated"[m
+[32m+[m[32m                : `${status[0].toUpperCase()}${status.slice(1)}`}[m
+[32m+[m[32m          </Button>[m
+[32m+[m[32m        </CardFooter>[m
+[32m+[m[32m      </Card>[m
+[32m+[m
+[32m+[m
+[32m+[m[32m    </div>[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mexport default function Home() {[m
+[32m+[m[32m  const review = useReviewWorkspace();[m
+[32m+[m[32m  const [prompt, setPrompt] = useState("");[m
+[32m+[m[32m  const [turns, setTurns] = useState<ConversationTurn[]>([]);[m
+[32m+[m[32m  const [history,setHistory] = useState<{id:string;title:string;prompts:string[]}[]>([]);[m
+[32m+[m[32m  const [conversationId,setConversationId] = useState("");[m
+[32m+[m[32m  const [historyReady,setHistoryReady] = useState(false);[m
+[32m+[m[32m  useEffect(()=>{try{const saved=JSON.parse(localStorage.getItem("syda-ui-preview-chat-history-v1")??"[]");if(Array.isArray(saved))setHistory(saved.filter(c=>c&&typeof c.id==="string"&&typeof c.title==="string"&&Array.isArray(c.prompts)&&c.prompts.every((p:unknown)=>typeof p==="string")));}catch{}setHistoryReady(true);},[]);[m
+[32m+[m[32m  useEffect(()=>{if(historyReady)try{localStorage.setItem("syda-ui-preview-chat-history-v1",JSON.stringify(history));}catch{}},[history,historyReady]);[m
+[32m+[m[32m  const connector=<div className="contents"><ConnectionPicker optional db={review.db} onChange={()=>{review.setConnected(false);review.setReviewed(false);review.setConnectionError("");}}/><Button aria-label="Manage database connections" type="button" variant="outline" className="h-9" onClick={()=>review.setView("connections")}><HugeiconsIcon icon={Database02Icon} strokeWidth={2}/>Connections</Button></div>;[m
+[32m+[m[32m  const latestScenario = turns.at(-1)?.scenario;[m
+[32m+[m
+[32m+[m[32m  const submitPrompt = () => {[m
+[32m+[m[32m    if (!prompt.trim()) return;[m
+[32m+[m[32m    const nextTurn = createTurn(prompt.trim(), latestScenario);[m
+[32m+[m[32m    setTurns((current) => [[m
+[32m+[m[32m      ...current.map((turn) =>[m
+[32m+[m[32m        turn.status !== "complete" ? { ...turn, status: "idle" as const } : turn,[m
+[32m+[m[32m      ),[m
+[32m+[m[32m      nextTurn,[m
+[32m+[m[32m    ]);[m
+[32m+[m[32m    const id=conversationId||crypto.randomUUID();[m
+[32m+[m[32m    setConversationId(id);[m
+[32m+[m[32m    const item={id,title:nextTurn.scenario.title,prompts:[...turns.map(t=>t.prompt),prompt.trim()]};[m
+[32m+[m[32m    setHistory(h=>[item,...h.filter(c=>c.id!==id)]);[m
+[32m+[m[32m    setPrompt("");[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  const startNewScenario = () => {[m
+[32m+[m[32m    review.setView("chat");[m
+[32m+[m[32m    setPrompt("");[m
+[32m+[m[32m    setTurns([]);[m
+[32m+[m[32m    setConversationId("");[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  const openExample = (name: string) => {[m
+[32m+[m[32m    setConversationId("");[m
+[32m+[m[32m    review.setView("chat");[m
+[32m+[m[32m    const example = promptSuggestions.find((item) =>[m
+[32m+[m[32m      name.toLowerCase().startsWith(item.label.split(" ")[0].toLowerCase()),[m
+[32m+[m[32m    );[m
+[32m+[m[32m    setTurns([createTurn(example?.prompt ?? promptSuggestions[0].prompt)]);[m
+[32m+[m[32m    setPrompt("");[m
+[32m+[m[32m  };[m
+[32m+[m
+[32m+[m[32m  return ([m
+[32m+[m[32m    <SidebarProvider>[m
+[32m+[m[32m      <Sidebar collapsible="icon">[m
+[32m+[m[32m        <SidebarHeader className="gap-3 p-3">[m
+[32m+[m[32m          <div className="flex h-8 items-center gap-2 px-1">[m
+[32m+[m[32m            <div className="flex size-6 items-center justify-center bg-primary text-primary-foreground">[m
+[32m+[m[32m              <HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} />[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m            <span className="text-sm font-semibold tracking-[-0.02em] group-data-[collapsible=icon]:hidden">Syda</span>[m
+[32m+[m[32m          </div>[m
+[32m+[m[32m          <Button className="w-full group-data-[collapsible=icon]:px-0" onClick={startNewScenario} variant="outline">[m
+[32m+[m[32m            <HugeiconsIcon data-icon="inline-start" icon={Add01Icon} strokeWidth={2} />[m
+[32m+[m[32m            <span className="group-data-[collapsible=icon]:hidden">New scenario</span>[m
+[32m+[m[32m          </Button>[m
+[32m+[m[32m        </SidebarHeader>[m
+[32m+[m
+[32m+[m[32m        <SidebarContent>[m
+[32m+[m[32m          <SidebarGroup><SidebarGroupLabel>Conversation history</SidebarGroupLabel><SidebarGroupContent><SidebarMenu>{history.map(c=><SidebarMenuItem key={c.id}><SidebarMenuButton isActive={conversationId===c.id} onClick={()=>{let previous:ScenarioConfiguration|undefined;const restored=c.prompts.map(p=>{const turn=createTurn(p,previous);previous=turn.scenario;return turn;});setTurns(restored);setConversationId(c.id);setPrompt("");review.setView("chat");}} tooltip={c.title}><span className="truncate">{c.title} · {c.prompts.length} messages</span></SidebarMenuButton></SidebarMenuItem>)}</SidebarMenu>{!history.length&&<p className="px-2 text-xs text-muted-foreground">Your conversations will appear here.</p>}<p className="px-2 py-2 text-[10px] text-muted-foreground">Saved in this browser. Avoid sensitive data in prompts.</p></SidebarGroupContent></SidebarGroup>[m
+[32m+[m[32m          <SidebarGroup>[m
+[32m+[m[32m            <SidebarGroupLabel>Example scenarios</SidebarGroupLabel>[m
+[32m+[m[32m            <SidebarGroupContent>[m
+[32m+[m[32m              <SidebarMenu>[m
+[32m+[m[32m                {recentScenarios.map((scenario) => ([m
+[32m+[m[32m                  <SidebarMenuItem key={scenario.name}>[m
+[32m+[m[32m                    <SidebarMenuButton isActive={latestScenario?.title.toLowerCase().startsWith(scenario.name.toLowerCase().split(" ")[0])} onClick={() => openExample(scenario.name)} tooltip={scenario.name}>[m
+[32m+[m[32m                      <HugeiconsIcon icon={Analytics01Icon} strokeWidth={2} />[m
+[32m+[m[32m                      <span className="flex min-w-0 flex-col group-data-[collapsible=icon]:hidden">[m
+[32m+[m[32m                        <span className="truncate">{scenario.name}</span>[m
+[32m+[m[32m                        <span className="truncate text-[10px] font-normal text-muted-foreground">{scenario.subtitle}</span>[m
+[32m+[m[32m                      </span>[m
+[32m+[m[32m                    </SidebarMenuButton>[m
+[32m+[m[32m                  </SidebarMenuItem>[m
+[32m+[m[32m                ))}[m
+[32m+[m[32m              </SidebarMenu>[m
+[32m+[m[32m            </SidebarGroupContent>[m
+[32m+[m[32m          </SidebarGroup>[m
+[32m+[m
+[32m+[m[32m          <SidebarGroup>[m
+[32m+[m[32m            <SidebarGroupLabel>Workspace</SidebarGroupLabel>[m
+[32m+[m[32m            <SidebarGroupContent>[m
+[32m+[m[32m              <SidebarMenu>[m
+[32m+[m[32m                {workspaceItems.map((item) => ([m
+[32m+[m[32m                  <SidebarMenuItem key={item.name}>[m
+[32m+[m[32m                    <SidebarMenuButton isActive={review.view === item.view} onClick={() => review.setView(item.view)} tooltip={item.name}>[m
+[32m+[m[32m                      <HugeiconsIcon icon={item.icon} strokeWidth={2} />[m
+[32m+[m[32m                      <span>{item.name}</span>[m
+[32m+[m[32m                    </SidebarMenuButton>[m
+[32m+[m[32m                  </SidebarMenuItem>[m
+[32m+[m[32m                ))}[m
+[32m+[m[32m              </SidebarMenu>[m
+[32m+[m[32m            </SidebarGroupContent>[m
+[32m+[m[32m          </SidebarGroup>[m
+[32m+[m[32m        </SidebarContent>[m
+[32m+[m
+[32m+[m[32m        <SidebarFooter>[m
+[32m+[m[32m          <SidebarMenu>[m
+[32m+[m[32m            <SidebarMenuItem>[m
+[32m+[m[32m              <SidebarMenuButton render={<Link to="/login" />} tooltip="Sign in">[m
+[32m+[m[32m                <HugeiconsIcon icon={UserCircleIcon} strokeWidth={2} />[m
+[32m+[m[32m                <span>Sign in</span>[m
+[32m+[m[32m              </SidebarMenuButton>[m
+[32m+[m[32m            </SidebarMenuItem>[m
+[32m+[m[32m          </SidebarMenu>[m
+[32m+[m[32m        </SidebarFooter>[m
+[32m+[m[32m        <SidebarRail />[m
+[32m+[m[32m      </Sidebar>[m
+[32m+[m
+[32m+[m[32m      <SidebarInset className="h-svh overflow-hidden">[m
+[32m+[m[32m        <header className="flex h-14 shrink-0 items-center justify-between gap-3 border-b px-4">[m
+[32m+[m[32m          <div className="flex items-center gap-2">[m
+[32m+[m[32m            <SidebarTrigger />[m
+[32m+[m[32m            <Separator className="h-4" orientation="vertical" />[m
+[32m+[m[32m            <div>[m
+[32m+[m[32m              <p className="text-xs font-medium">{review.view === "chat" ? latestScenario?.title ?? "New scenario" : viewTitles[review.view]}</p>[m
+[32m+[m[32m              <p className="hidden text-[10px] text-muted-foreground sm:block">[m
+[32m+[m[32m                {review.view === "chat" ? turns.length ? "Draft configuration" : "Describe what you want to generate" : "Capstone workspace"}[m
+[32m+[m[32m              </p>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m          </div>[m
+[32m+[m[32m          <div className="flex items-center gap-2"><Link className="text-xs underline" to="/app">Back to live studio</Link>[m
+[32m+[m[32m          </div>[m
+[32m+[m[32m        </header>[m
+[32m+[m
+[32m+[m[32m        <div className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b bg-muted/40 px-4 py-2 text-[10px] text-muted-foreground"><span>UI prototype · sample data only. This page does not use live accounts, conversations, or generation.</span><Button size="sm" variant="ghost" onClick={() => review.setView(review.view === "chat" ? "connections" : "chat")}>{review.view === "chat" ? "Connect a database" : "Back to scenario"}</Button></div>[m
+[32m+[m[32m        {review.view !== "chat" ? <ReviewWorkspace review={review} /> : !turns.length ? ([m
+[32m+[m[32m          <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-12">[m
+[32m+[m[32m            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_38%,oklch(0.96_0.025_265),transparent_38%)]" />[m
+[32m+[m[32m            <div className="relative flex w-full max-w-2xl flex-col items-center">[m
+[32m+[m[32m              <div className="mb-5 flex size-10 items-center justify-center border bg-card shadow-sm">[m
+[32m+[m[32m                <HugeiconsIcon icon={SparklesIcon} strokeWidth={1.8} />[m
+[32m+[m[32m              </div>[m
+[32m+[m[32m              <p className="mb-2 text-xs font-medium text-muted-foreground">New synthetic data scenario</p>[m
+[32m+[m[32m              <h1 className="max-w-lg text-center text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">What should we generate?</h1>[m
+[32m+[m[32m              <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">[m
+[32m+[m[32m                Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.[m
+[32m+[m[32m              </p>[m
+[32m+[m[32m              <PromptComposer connector={connector} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />[m
+[32m+[m[32m              <div className="mt-5 flex flex-wrap justify-center gap-2">[m
+[32m+[m[32m                {promptSuggestions.map((suggestion) => ([m
+[32m+[m[32m                  <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">[m
+[32m+[m[32m                    {suggestion.label}[m
+[32m+[m[32m                  </Button>[m
+[32m+[m[32m                ))}[m
+[32m+[m[32m              </div>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m          </main>[m
+[32m+[m[32m        ) : ([m
+[32m+[m[32m          <main className="flex min-h-0 flex-1 flex-col">[m
+[32m+[m[32m            <MessageScrollerProvider autoScroll>[m
+[32m+[m[32m              <MessageScroller className="flex-1">[m
+[32m+[m[32m                <MessageScrollerViewport>[m
+[32m+[m[32m                  <MessageScrollerContent className="mx-auto w-full max-w-3xl px-5 py-8 sm:px-8 sm:py-10">[m
+[32m+[m[32m                    {turns.map((turn) => ([m
+[32m+[m[32m                      <Fragment key={turn.id}>[m
+[32m+[m[32m                        <MessageScrollerItem[m
+[32m+[m[32m                          messageId={`${turn.id}-user`}[m
+[32m+[m[32m                          scrollAnchor[m
+[32m+[m[32m                        >[m
+[32m+[m[32m                          <Message align="end">[m
+[32m+[m[32m                            <MessageContent>[m
+[32m+[m[32m                              <Bubble variant="secondary">[m
+[32m+[m[32m                                <BubbleContent>{turn.prompt}</BubbleContent>[m
+[32m+[m[32m                              </Bubble>[m
+[32m+[m[32m                            </MessageContent>[m
+[32m+[m[32m                          </Message>[m
+[32m+[m[32m                        </MessageScrollerItem>[m
+[32m+[m[32m                        <MessageScrollerItem messageId={`${turn.id}-assistant`}>[m
+[32m+[m[32m                          <Message>[m
+[32m+[m[32m                            <MessageAvatar className="self-start bg-primary text-primary-foreground">[m
+[32m+[m[32m                              <HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} />[m
+[32m+[m[32m                            </MessageAvatar>[m
+[32m+[m[32m                            <MessageContent>[m
+[32m+[m[32m                              <Bubble className="w-full" variant="ghost">[m
+[32m+[m[32m                                <BubbleContent className="w-full">[m
+[32m+[m[32m                                  <p className="mb-3 text-xs leading-5">{turn.response}</p>[m
+[32m+[m[32m                                  <ScenarioCard[m
+[32m+[m[32m                                    onGenerate={() => review.configure(turn.scenario.title, turn.scenario.recordCount, turn.prompt)}[m
+[32m+[m[32m                                    scenario={turn.scenario}[m
+[32m+[m[32m                                    status={turn.status}[m
+[32m+[m[32m                                  />[m
+[32m+[m[32m                                </BubbleContent>[m
+[32m+[m[32m                              </Bubble>[m
+[32m+[m[32m                            </MessageContent>[m
+[32m+[m[32m                          </Message>[m
+[32m+[m[32m                        </MessageScrollerItem>[m
+[32m+[m[32m                      </Fragment>[m
+[32m+[m[32m                    ))}[m
+[32m+[m[32m                  </MessageScrollerContent>[m
+[32m+[m[32m                </MessageScrollerViewport>[m
+[32m+[m[32m                <MessageScrollerButton />[m
+[32m+[m[32m              </MessageScroller>[m
+[32m+[m[32m            </MessageScrollerProvider>[m
+[32m+[m[32m            <div className="shrink-0 border-t bg-background px-5 py-4">[m
+[32m+[m[32m              <div className="mx-auto w-full max-w-3xl">[m
+[32m+[m[32m                <PromptComposer connector={connector} compact onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />[m
+[32m+[m[32m              </div>[m
+[32m+[m[32m            </div>[m
+[32m+[m[32m          </main>[m
+[32m+[m[32m        )}[m
+[32m+[m[32m        {review.notice && <div role="status" className="fixed right-4 bottom-4 z-50 flex max-w-[calc(100vw-2rem)] items-center gap-3 border bg-card p-4 text-xs shadow-lg"><span>{review.notice}</span><Button size="sm" variant="ghost" onClick={() => review.setNotice("")}>Dismiss</Button></div>}[m
+[32m+[m[32m      </SidebarInset>[m
+[32m+[m[32m    </SidebarProvider>[m
+[32m+[m[32m  );[m
+[32m+[m[32m}[m

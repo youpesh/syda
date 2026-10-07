@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "stitch": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@keeponfirst/kof-stitch-mcp@latest"
+      ],
+      "env": {
+        "GOOGLE_CLOUD_PROJECT": "shippidly"
+      }
+    }
+  }
+}

@@ -371,7 +371,7 @@ class TestSyntheticDataGenerator:
         assert isinstance(result["table2"], pd.DataFrame)
         
     def test_detect_dependency_cycle(self):
-        """Test that a circular dependency in schemas is handled gracefully."""
+        """Circular dependencies fail before any data is generated."""
         # Create schemas with a circular dependency
         schemas = {
             'table1': {'id': {'type': 'number'}, 'table2_id': {'type': 'foreign_key', 'references': {'schema': 'table2', 'field': 'id'}}},
@@ -397,16 +397,13 @@ class TestSyntheticDataGenerator:
                         openai_api_key="test_key"
                     )
                     
-                    # The method should handle the cycle and not raise an exception
-                    result = generator.generate_for_schemas(schemas)
+                    with pytest.raises(ValueError, match="Circular dependencies"):
+                        generator.generate_for_schemas(schemas)
                     
                     # Verify that determine_generation_order was called
                     mock_determine.assert_called_once()
                     
-                    # Verify that we still got results for both schemas
-                    assert set(result.keys()) == set(['table1', 'table2'])
-                    assert isinstance(result['table1'], pd.DataFrame)
-                    assert isinstance(result['table2'], pd.DataFrame)
+                    mock_generate_data.assert_not_called()
             
     def test_client_error_handling(self):
         """Test handling of client errors when generating data."""
@@ -826,6 +823,74 @@ class TestStreamingOutput:
         # patients was streamed — it must NOT appear in save_dataframes call
         for call_keys in save_calls:
             assert "patients" not in call_keys
+
+
+class TestGenerationResultContract:
+    """Public generation results contain complete tables or raise."""
+
+    @pytest.fixture
+    def generator(self):
+        with patch("syda.llm._build_pydantic_ai_model", return_value=MagicMock()):
+            return SyntheticDataGenerator(
+                model_config=ModelConfig(generation_mode="direct")
+            )
+
+    @staticmethod
+    def schemas():
+        return {
+            "customers": {
+                "id": {"type": "integer", "primary_key": True},
+                "name": {"type": "text"},
+            },
+            "orders": {
+                "id": {"type": "integer", "primary_key": True},
+                "customer_id": {
+                    "type": "foreign_key",
+                    "references": {"schema": "customers", "field": "id"},
+                },
+                "amount": {"type": "number"},
+            },
+        }
+
+    @staticmethod
+    def fake_generate(*args, schema_name=None, **kwargs):
+        if schema_name == "customers":
+            return pd.DataFrame({"id": [1, 2], "name": ["Alice", "Bob"]})
+        return pd.DataFrame(
+            {"id": [10, 11], "customer_id": [1, 2], "amount": [8.5, 9.5]}
+        )
+
+    def test_in_memory_results_preserve_parent_columns(self, generator):
+        with patch.object(generator, "_generate_data", side_effect=self.fake_generate):
+            results = generator.generate_for_schemas(
+                self.schemas(), default_sample_size=2
+            )
+
+        assert list(results) == ["customers", "orders"]
+        assert list(results["customers"].columns) == ["id", "name"]
+        assert results["customers"]["name"].tolist() == ["Alice", "Bob"]
+
+    def test_persisted_results_restore_every_complete_table(
+        self, generator, tmp_path
+    ):
+        with patch.object(generator, "_generate_data", side_effect=self.fake_generate):
+            results = generator.generate_for_schemas(
+                self.schemas(), default_sample_size=2, output_dir=str(tmp_path)
+            )
+
+        assert set(results) == {"customers", "orders"}
+        assert list(results["customers"].columns) == ["id", "name"]
+        assert len(results["orders"]) == 2
+
+    def test_integrity_failure_raises(self, generator):
+        generator.fk_handler.verify_referential_integrity = MagicMock(
+            return_value=False
+        )
+        with patch.object(generator, "_generate_data", side_effect=self.fake_generate):
+            with pytest.raises(ValueError, match="Referential integrity"):
+                generator.generate_for_schemas(
+                    self.schemas(), default_sample_size=2
+                )
 
 
 class TestParallelGeneration:

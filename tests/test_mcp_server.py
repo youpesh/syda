@@ -133,7 +133,7 @@ class TestValidateSchema:
         assert result["ok"] is True   # warning not error
         assert any("primary_key" in w for w in result["warnings"])
 
-    def test_unknown_type_warns(self):
+    def test_unknown_type_is_rejected_like_core_schema_loader(self):
         schema = {
             "things": {
                 "id":   {"type": "integer", "primary_key": True},
@@ -141,8 +141,44 @@ class TestValidateSchema:
             }
         }
         result = self._call(schema)
-        assert result["ok"] is True
-        assert any("jsonb" in w for w in result["warnings"])
+        assert result["ok"] is False
+        assert any("jsonb" in error for error in result["errors"])
+
+    @pytest.mark.parametrize("field_type", ["double", "decimal", "varchar", "fk"])
+    def test_type_rejected_when_core_loader_rejects_it(self, field_type):
+        schema = {
+            "measurements": {
+                "id": {"type": "integer", "primary_key": True},
+                "value": {"type": field_type},
+            }
+        }
+
+        result = self._call(schema)
+
+        assert result["ok"] is False
+        assert any(field_type in error for error in result["errors"])
+
+    def test_invalid_fk_missing_parent_column(self):
+        schema = {
+            "customers": {
+                "id": {"type": "integer", "primary_key": True},
+            },
+            "orders": {
+                "id": {"type": "integer", "primary_key": True},
+                "customer_id": {
+                    "type": "foreign_key",
+                    "references": {
+                        "schema": "customers",
+                        "field": "does_not_exist",
+                    },
+                },
+            },
+        }
+
+        result = self._call(schema)
+
+        assert result["ok"] is False
+        assert any("customers.does_not_exist" in error for error in result["errors"])
 
     def test_enum_column_detected(self):
         schema = {
@@ -433,6 +469,31 @@ class TestGenerateFromSchema:
 
 
 class TestBuildGenerator:
+
+    def test_codegen_is_blocked_without_explicit_sandbox_opt_in(self):
+        from syda.mcp_server import _build_generator
+
+        with patch.dict("os.environ", {}, clear=True):
+            with pytest.raises(ValueError, match="Codegen is disabled"):
+                _build_generator(
+                    provider="anthropic", model="claude", api_key="key",
+                    temperature=0.8, max_tokens=4096, generation_mode="codegen",
+                    batch_size=None, max_workers=1,
+                )
+
+    def test_auto_resolves_to_direct_at_mcp_boundary(self):
+        from syda.mcp_server import _build_generator
+
+        with patch("syda.SyntheticDataGenerator") as MockGen, \
+             patch("syda.ModelConfig") as MockMC:
+            MockMC.return_value = MagicMock()
+            _build_generator(
+                provider="anthropic", model="claude", api_key="key",
+                temperature=0.8, max_tokens=4096, generation_mode="auto",
+                batch_size=None, max_workers=1,
+            )
+
+        assert MockMC.call_args[1]["generation_mode"] == "direct"
 
     def test_openai_compatible_requires_base_url(self):
         from syda.mcp_server import _build_generator
