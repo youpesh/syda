@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from syda.schemas import validate_schema
 from ..models.scenario import ScenarioConfiguration, ScenarioPathConfiguration, ScenarioCheck, SecondaryMetric, ChatResponse
 from ..provider_settings import resolve_provider
+from ..scenario_definition import scenario_definition, scenario_validation_message
 
 load_dotenv(override=True)
 load_dotenv("backend/.env", override=True)
@@ -427,7 +428,12 @@ def _validate_scenario_candidate(
             errors.append(f"{check.name}: {error}")
     if errors:
         return None, errors
-    return candidate.model_copy(update={"schemas": normalized_schemas}), []
+    candidate = candidate.model_copy(update={"schemas": normalized_schemas})
+    try:
+        scenario_definition(candidate, normalized_schemas)
+    except ValueError as error:
+        return None, [scenario_validation_message(error)]
+    return candidate, []
 
 
 def _validate_and_sanitize_schemas(schemas: Optional[Dict[str, Any]], fallback_schemas: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

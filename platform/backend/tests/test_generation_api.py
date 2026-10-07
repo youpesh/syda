@@ -334,3 +334,34 @@ def test_incomplete_job_can_be_polled_but_not_downloaded(monkeypatch, tmp_path):
 
         download = client.get("/api/download/still-running")
         assert download.status_code == 409
+
+
+def test_invalid_path_returns_actionable_estimate_and_validation_errors(monkeypatch, tmp_path):
+    scenario = _scenario(paths=[{"name": "holiday", "steps": ["Child"], "weight": 1}])
+    expected = "Scenario path 'holiday' includes 'Child' without required parent step 'Parent'."
+    with _client(monkeypatch, tmp_path) as client:
+        estimate = client.post("/api/estimate", json={"scenario": scenario})
+        assert estimate.status_code == 422
+        assert estimate.json()["detail"] == expected
+
+        validation = client.post("/api/validate", json={"scenario": scenario})
+        assert validation.status_code == 200
+        assert validation.json()["valid"] is False
+        assert validation.json()["schema_errors"] == [f"Scenario workflow: {expected}"]
+
+
+def test_deleting_saved_scenario_preserves_generated_dataset(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        saved = client.post("/api/scenarios", json=_scenario())
+        assert saved.status_code == 201
+        scenario_id = saved.json()["id"]
+        job = client.post("/api/generate", json={"scenario": _scenario(), "scenarioId": scenario_id})
+        assert job.status_code == 200
+        job_id = job.json()["jobId"]
+
+        deleted = client.delete(f"/api/scenarios/{scenario_id}")
+        assert deleted.status_code == 204
+        assert client.get(f"/api/scenarios/{scenario_id}").status_code == 404
+        assert all(item["id"] != scenario_id for item in client.get("/api/scenarios").json())
+        assert client.get(f"/api/status/{job_id}").json()["status"] == "complete"
+        assert client.get(f"/api/download/{job_id}").status_code == 200

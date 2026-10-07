@@ -244,7 +244,10 @@ function ScenarioCard({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ scenario }),
       });
-      if (!response.ok) throw new Error(`Could not estimate this run (${response.status}).`);
+      if (!response.ok) {
+        const body = await response.json().catch(() => undefined) as { detail?: string } | undefined;
+        throw new Error(typeof body?.detail === "string" ? body.detail : `Could not estimate this run (${response.status}).`);
+      }
       setEstimate(await response.json() as CostEstimate);
     } catch (error) {
       setEstimateError(error instanceof Error ? error.message : "Could not estimate this run.");
@@ -483,10 +486,16 @@ export default function Home() {
 
   useEffect(() => {
     const returnState = location.state as {
+      schemaSource?: SchemaSource;
       editedScenario?: ScenarioConfiguration;
       messageId?: string;
       generatedRun?: ChatRun;
     } | null;
+    if (returnState?.schemaSource) {
+      setSource(returnState.schemaSource);
+      navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+      return;
+    }
     if (!returnState?.messageId || (!returnState.editedScenario && !returnState.generatedRun)) return;
     editorReturnRef.current = { ...returnState, messageId: returnState.messageId };
     navigate(`${location.pathname}${location.search}`, { replace: true, state: null });

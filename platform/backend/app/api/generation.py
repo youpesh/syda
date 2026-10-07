@@ -20,12 +20,16 @@ from sqlalchemy.orm import Session
 from syda.schemas import validate_schema, ModelConfig
 from syda.generate import SyntheticDataGenerator
 from syda.output import save_dataframes
-from syda.scenarios import ScenarioDefinition, ScenarioEngine, ScenarioPath, ScenarioStep
+from syda.scenarios import ScenarioEngine
 
 from .auth import require_authenticated
 from ..database import get_db, SessionLocal
 from ..models.entities import JobRecord, ScenarioRecord
 from ..provider_settings import resolve_provider
+from ..scenario_definition import (
+    scenario_definition as _scenario_definition,
+    scenario_validation_message,
+)
 from ..models.user import User
 from ..models.scenario import (
     GenerateRequest,
@@ -193,61 +197,6 @@ def _scenario_schemas(scenario: ScenarioConfiguration) -> Dict[str, Any]:
         }
         for step in scenario.workflow or ["Entity", "Record"]
     }
-
-
-def _scenario_definition(
-    scenario: ScenarioConfiguration,
-    schemas: Dict[str, Any],
-) -> ScenarioDefinition:
-    """Translate the platform configuration into the reusable core model."""
-    ordered_tables = [table for table in scenario.workflow if table in schemas]
-    ordered_tables.extend(table for table in schemas if table not in ordered_tables)
-
-    steps = []
-    for index, table in enumerate(ordered_tables):
-        non_event_dates = {"birth_date", "date_of_birth", "dob"}
-        timestamp_field = next(
-            (
-                field
-                for field, definition in schemas[table].items()
-                if not field.startswith("__")
-                and field.lower() not in non_event_dates
-                and (
-                    definition.lower()
-                    if isinstance(definition, str)
-                    else str(definition.get("type", "")).lower()
-                )
-                in ("date", "datetime")
-            ),
-            None,
-        )
-        steps.append(
-            ScenarioStep(
-                name=table,
-                table=table,
-                timestampField=timestamp_field,
-                timeOffsetDays=index,
-            )
-        )
-
-    return ScenarioDefinition(
-        name=scenario.title,
-        description=scenario.description,
-        secondaryMetric=scenario.secondary_metric.model_dump(),
-        rules=scenario.rules,
-        checks=scenario.checks,
-        schemas=schemas,
-        steps=steps,
-        paths=[
-            ScenarioPath(
-                name=path.name,
-                steps=path.steps,
-                weight=path.weight,
-                overrides=path.overrides,
-            )
-            for path in scenario.paths
-        ],
-    )
 
 
 def _referential_integrity(
@@ -623,7 +572,10 @@ async def start_generation(
 async def estimate_generation(req: GenerateRequest, db: Session = Depends(get_db), user: User = Depends(require_authenticated)):
     """Estimate model usage before generation using schema size and generation mode."""
     schemas = _scenario_schemas(req.scenario)
-    definition = _scenario_definition(req.scenario, schemas)
+    try:
+        definition = _scenario_definition(req.scenario, schemas)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=scenario_validation_message(error)) from error
     summary = ScenarioEngine.summarize(definition, req.scenario.record_count)
     field_counts = {
         table: len(fields)
@@ -919,7 +871,7 @@ async def validate_scenario(req: GenerateRequest):
         try:
             _scenario_definition(scenario, scenario.schemas)
         except Exception as error:
-            schema_errors.append(f"Scenario workflow: {error}")
+            schema_errors.append(f"Scenario workflow: {scenario_validation_message(error)}")
 
     return {
         "valid": len(schema_errors) == 0,

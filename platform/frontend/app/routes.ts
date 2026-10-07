@@ -9,6 +9,7 @@ export default [
   route("register", "routes/register.tsx"),
   route("scenarios", "routes/scenarios.tsx"),
   route("scenarios/:scenarioId", "routes/scenario-editor.tsx"),
+  route("connections", "routes/connections.tsx"),
   route("history", "routes/history.tsx"),
   route("runs/:jobId", "routes/run-detail.tsx"),
   route("settings", "routes/settings.tsx"),
