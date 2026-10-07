@@ -2,8 +2,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Add01Icon, AiMagicIcon, Analytics01Icon, Logout01Icon, Settings02Icon } from "@hugeicons/core-free-icons";
-import { Database, MessageSquareText } from "lucide-react";
+import { Database, MessageSquareText, Trash2 } from "lucide-react";
 
+import { Alert, AlertDescription } from "~/components/ui/alert";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "~/components/ui/dialog";
+import { Spinner } from "~/components/ui/spinner";
 import { Button, buttonVariants } from "~/components/ui/button";
 import { Separator } from "~/components/ui/separator";
 import {
@@ -17,12 +20,65 @@ import {
   SidebarInset,
   SidebarMenu,
   SidebarMenuButton,
+  SidebarMenuAction,
   SidebarMenuItem,
   SidebarProvider,
   SidebarRail,
   SidebarTrigger,
 } from "~/components/ui/sidebar";
 import type { SavedConversationSummary } from "~/lib/studio-types";
+
+function RecentChat({ conversation, active, onDeleted }: {
+  conversation: SavedConversationSummary;
+  active: boolean;
+  onDeleted: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string>();
+
+  const deleteChat = async () => {
+    setDeleting(true);
+    setError(undefined);
+    try {
+      const response = await fetch(`/api/conversations/${conversation.id}`, { method: "DELETE" });
+      if (!response.ok && response.status !== 404) {
+        const body = await response.json().catch(() => undefined) as { detail?: string } | undefined;
+        throw new Error(typeof body?.detail === "string" ? body.detail : `Could not delete chat (${response.status}).`);
+      }
+      setOpen(false);
+      onDeleted(conversation.id);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Could not delete chat. Please try again.");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  return <Dialog open={open} onOpenChange={(next) => { if (!deleting) { setOpen(next); setError(undefined); } }}>
+    <SidebarMenuItem>
+      <SidebarMenuButton isActive={active} render={<Link to={`/app/${conversation.id}`} />} tooltip={conversation.title}>
+        <MessageSquareText /><span>{conversation.title}</span>
+      </SidebarMenuButton>
+      <DialogTrigger render={<SidebarMenuAction aria-label={`Delete chat: ${conversation.title}`} title="Delete chat" />}>
+        <Trash2 />
+      </DialogTrigger>
+    </SidebarMenuItem>
+    <DialogContent showCloseButton={!deleting}>
+      <DialogHeader>
+        <DialogTitle>Delete chat?</DialogTitle>
+        <DialogDescription>Delete “{conversation.title}” and its chat draft? This cannot be undone. Saved scenarios and generated datasets will remain available.</DialogDescription>
+      </DialogHeader>
+      {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
+      <DialogFooter>
+        <Button variant="outline" disabled={deleting} onClick={() => setOpen(false)}>Cancel</Button>
+        <Button variant="destructive" disabled={deleting} onClick={deleteChat}>
+          {deleting && <Spinner data-icon="inline-start" />}{deleting ? "Deleting…" : "Delete chat"}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>;
+}
 
 export function AppShell({
   title,
@@ -95,11 +151,19 @@ export function AppShell({
             <SidebarGroupContent>
               {recentConversations.length > 0 ? (
                 <SidebarMenu>
-                  {recentConversations.map((conversation) => <SidebarMenuItem key={conversation.id}>
-                    <SidebarMenuButton isActive={pathname === `/app/${conversation.id}`} render={<Link to={`/app/${conversation.id}`} />} tooltip={conversation.title}>
-                      <MessageSquareText /><span>{conversation.title}</span>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>)}
+                  {recentConversations.map((conversation) => <RecentChat
+                    key={conversation.id}
+                    conversation={conversation}
+                    active={pathname === `/app/${conversation.id}`}
+                    onDeleted={(id) => {
+                      setRecentConversations((current) => current.filter((item) => item.id !== id));
+                      if (pathname === `/app/${id}`) {
+                        if (onNewScenario) onNewScenario();
+                        else navigate("/app", { replace: true });
+                      }
+                      window.dispatchEvent(new Event("syda:conversations-changed"));
+                    }}
+                  />)}
                 </SidebarMenu>
               ) : (
                 <p className="px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">Your chats will appear here.</p>

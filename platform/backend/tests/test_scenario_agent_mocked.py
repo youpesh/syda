@@ -91,3 +91,47 @@ def test_agent_updates_only_requested_field_and_preserves_checks(monkeypatch):
     assert response.scenario.checks == current.checks
     assert response.scenario.schemas == current.schemas
     assert model.request_count == 2
+
+
+def test_agent_does_not_claim_starter_was_created_without_draft_tool(monkeypatch):
+    model = TestModel(
+        call_tools=[],
+        custom_output_args={"message": "The scenario is already configured as requested."},
+    )
+    _fake_llm(monkeypatch, model)
+
+    response = asyncio.run(compile_scenario_agent(
+        prompt="Design 10000 healthcare insurance claims with 15% denied",
+        provider_selection={"agent_model": True, "id": "gemini", "model": "mock", "key": "test"},
+    ))
+
+    assert response.scenario is None
+    assert "already configured" not in response.message
+    assert "couldn’t create a scenario" in response.message
+
+
+def test_agent_retries_text_only_confirmation_and_creates_draft(monkeypatch):
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+
+    requests = []
+
+    def respond(messages, info):
+        requests.append(messages)
+        output_name = info.output_tools[0].name
+        if len(requests) == 1:
+            return ModelResponse(parts=[ToolCallPart(output_name, {"message": "The scenario is already configured."})])
+        if len(requests) == 2:
+            return ModelResponse(parts=[ToolCallPart("create_scenario_draft", {})])
+        return ModelResponse(parts=[ToolCallPart(output_name, {"message": "I created the insurance claims draft."})])
+
+    _fake_llm(monkeypatch, FunctionModel(respond))
+    response = asyncio.run(compile_scenario_agent(
+        prompt="Design 10000 healthcare insurance claims with 15% denied",
+        provider_selection={"agent_model": True, "id": "gemini", "model": "mock", "key": "test"},
+    ))
+
+    assert len(requests) == 3
+    assert response.scenario is not None
+    assert response.scenario.record_count == 10000
+    assert response.message == "I created the insurance claims draft."
