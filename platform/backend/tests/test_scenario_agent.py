@@ -45,3 +45,29 @@ def test_agent_rejects_machine_check_with_unknown_field():
 
     assert validated is None
     assert any("unknown field 'Claim.missing_status'" in error for error in errors)
+
+
+def test_agent_rejects_path_missing_required_parent():
+    candidate = ScenarioConfiguration.model_validate({
+        **DOMAIN_TEMPLATES[1],
+        "paths": [{"name": "Holiday Season Order", "steps": ["Order", "Payment"]}],
+    })
+
+    validated, errors = _validate_scenario_candidate(candidate)
+
+    assert validated is None
+    assert errors == [
+        "Scenario path 'Holiday Season Order' includes 'Order' without required parent step 'Customer'."
+    ]
+
+
+def test_agent_accepts_path_with_required_parents():
+    candidate = ScenarioConfiguration.model_validate({
+        **DOMAIN_TEMPLATES[1],
+        "paths": [{"name": "Holiday Season Order", "steps": ["Customer", "Product", "Order", "Payment"]}],
+    })
+
+    validated, errors = _validate_scenario_candidate(candidate)
+
+    assert validated is not None
+    assert errors == []
