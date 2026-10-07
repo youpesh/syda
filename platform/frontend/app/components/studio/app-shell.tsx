@@ -60,7 +60,7 @@ function RecentChat({ conversation, active, onDeleted }: {
       <SidebarMenuButton isActive={active} render={<Link to={`/app/${conversation.id}`} />} tooltip={conversation.title}>
         <MessageSquareText /><span>{conversation.title}</span>
       </SidebarMenuButton>
-      <DialogTrigger render={<SidebarMenuAction aria-label={`Delete chat: ${conversation.title}`} title="Delete chat" />}>
+      <DialogTrigger render={<SidebarMenuAction showOnHover aria-label={`Delete chat: ${conversation.title}`} title="Delete chat" />}>
         <Trash2 />
       </DialogTrigger>
     </SidebarMenuItem>
