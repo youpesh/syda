@@ -35,6 +35,7 @@ env/
 # Database
 *.sqlite
 *.sqlite3
+*.db
 
 # Alembic
 service/alembic/versions/*

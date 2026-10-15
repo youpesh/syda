@@ -2,13 +2,15 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate } from "react-router";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Add01Icon, AiMagicIcon, Analytics01Icon, Logout01Icon, Settings02Icon } from "@hugeicons/core-free-icons";
-import { Database, MessageSquareText, Trash2 } from "lucide-react";
+import { Database, MessageSquareText, Moon, Sun, Trash2 } from "lucide-react";
 
 import { Alert, AlertDescription } from "~/components/ui/alert";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "~/components/ui/dialog";
 import { Spinner } from "~/components/ui/spinner";
 import { Button, buttonVariants } from "~/components/ui/button";
 import { Separator } from "~/components/ui/separator";
+import { ThemeToggle } from "~/components/ui/theme-toggle";
+import { useTheme } from "~/lib/theme-provider";
 import {
   Sidebar,
   SidebarContent,
@@ -98,6 +100,7 @@ export function AppShell({
   const [recentConversations, setRecentConversations] = useState<SavedConversationSummary[]>([]);
   const [authenticated, setAuthenticated] = useState(false);
   const [displayName, setDisplayName] = useState("Account");
+  const { resolvedTheme, toggleTheme } = useTheme();
 
   useEffect(() => {
     let active = true;
@@ -180,6 +183,7 @@ export function AppShell({
               <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/history") || pathname.startsWith("/runs/")} render={<Link to="/history" />} tooltip="Generation history"><HugeiconsIcon icon={Analytics01Icon} strokeWidth={2} /><span>Generation history</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/connections"} render={<Link to="/connections" />} tooltip="Connections"><Database /><span>Connections</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/settings"} render={<Link to="/settings" />} tooltip="Settings"><HugeiconsIcon icon={Settings02Icon} strokeWidth={2} /><span>Settings</span></SidebarMenuButton></SidebarMenuItem>
+              <SidebarMenuItem><SidebarMenuButton onClick={toggleTheme} tooltip={resolvedTheme === "dark" ? "Switch to light mode" : "Switch to dark mode"}>{resolvedTheme === "dark" ? <Sun /> : <Moon />}<span>{resolvedTheme === "dark" ? "Light mode" : "Dark mode"}</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton onClick={async () => { await fetch("/api/auth/cookie/logout", { method: "POST" }); navigate("/", { replace: true }); }} tooltip={`Log out ${displayName}`}><HugeiconsIcon icon={Logout01Icon} strokeWidth={2} /><span>Log out</span></SidebarMenuButton></SidebarMenuItem>
             </SidebarMenu></SidebarGroupContent>
           </SidebarGroup>
@@ -194,7 +198,10 @@ export function AppShell({
             <Separator className="h-4" orientation="vertical" />
             <div className="min-w-0"><p className="truncate text-xs font-medium">{title}</p>{subtitle && <p className="hidden truncate text-[10px] text-muted-foreground sm:block">{subtitle}</p>}</div>
           </div>
-          {headerActions}
+          <div className="flex items-center gap-2">
+            {headerActions}
+            <ThemeToggle />
+          </div>
         </header>
         {authenticated ? children : <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Checking your session…</div>}
       </SidebarInset>
