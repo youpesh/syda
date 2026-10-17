@@ -10,6 +10,7 @@ from .models import (
     ScenarioPlan,
     ScenarioPlanSummary,
     ScenarioStep,
+    ViolationReport,
 )
 
 __all__ = [
@@ -23,4 +24,5 @@ __all__ = [
     "ScenarioPlanSummary",
     "ScenarioStep",
     "TableGenerator",
+    "ViolationReport",
 ]

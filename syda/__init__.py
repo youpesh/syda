@@ -17,6 +17,7 @@ from .scenarios import (
     ScenarioPlan,
     ScenarioPlanSummary,
     ScenarioStep,
+    ViolationReport,
 )
 from .schemas import ModelConfig
 
@@ -37,6 +38,7 @@ __all__ = [
     "ScenarioPlan",
     "ScenarioPlanSummary",
     "ScenarioStep",
+    "ViolationReport",
 ]
 
 __version__ = "0.4.0"

@@ -44,11 +44,13 @@ from ._utils import (
     _values_equal,
 )
 from .models import (
+    ScenarioCheck,
     ScenarioDefinition,
     ScenarioGenerationResult,
     ScenarioPath,
     ScenarioPlan,
     ScenarioPlanSummary,
+    ViolationReport,
 )
 
 
@@ -57,7 +59,7 @@ class TableGenerator(Protocol):
 
     def generate_for_schemas(
         self,
-        schemas: Dict[str, Dict[str, Any]],
+        schemas: Any,
         prompts: Optional[Dict[str, str]] = None,
         sample_sizes: Optional[Dict[str, int]] = None,
         **kwargs: Any,
@@ -212,6 +214,7 @@ class ScenarioEngine:
 
         self._apply_bindings(definition, tables)
         self._validate_result(definition, plan, tables)
+        _, violations = self.validate_causal_workflow(definition, tables)
 
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -225,6 +228,7 @@ class ScenarioEngine:
             instanceCount=plan.instance_count,
             instanceIds=plan.instance_ids,
             pathCounts=plan.path_counts,
+            violations=violations,
         )
 
     def plan(
@@ -422,7 +426,7 @@ class ScenarioEngine:
             if ledger.empty:
                 continue
             source_schema = definition.schemas[step.table]
-            fields = {
+            fields: Dict[str, Any] = {
                 field: field_definition
                 for field, field_definition in _schema_fields(source_schema).items()
                 if field not in binding_targets.get(step.table, set())
@@ -436,67 +440,399 @@ class ScenarioEngine:
                 if key in {"__description__", "__table_description__"}
             }
             for check in definition.checks:
-                if check.kind != "allowed_values" or check.table != step.table:
+                if check.kind != "allowed_values" or check.table != step.table or not check.field:
                     continue
-                field_schema = fields.get(check.field)
+                field_name = check.field
+                field_schema = fields.get(field_name)
                 if field_schema is None:
                     continue
+                schema_dict: Dict[str, Any]
                 if isinstance(field_schema, str):
-                    field_schema = {"type": field_schema}
+                    schema_dict = {"type": field_schema}
+                elif isinstance(field_schema, Mapping):
+                    schema_dict = dict(field_schema)
                 else:
-                    field_schema = dict(field_schema)
-                constraints = dict(field_schema.get("constraints", {}))
+                    schema_dict = {"type": "text"}
+                raw_constraints = schema_dict.get("constraints")
+                constraints: Dict[str, Any] = dict(raw_constraints) if isinstance(raw_constraints, Mapping) else {}
                 constraints["enum"] = list(check.values)
-                field_schema["constraints"] = constraints
-                fields[check.field] = field_schema
+                schema_dict["constraints"] = constraints
+                fields[field_name] = schema_dict
             schemas[step.table] = {**metadata, **fields}
         return schemas
 
-    @staticmethod
+    @classmethod
+    def infer_causal_checks(
+        cls,
+        definition: ScenarioDefinition,
+    ) -> List[ScenarioCheck]:
+        """Automatically infer causal integrity rules, temporal sequences, and semantic invariants from schemas and workflow.
+
+        Enables non-technical users to get comprehensive causal workflow validation without
+        having to manually write rule syntax.
+        """
+        inferred: List[ScenarioCheck] = []
+        existing_names = {c.name for c in definition.checks}
+        existing_temporal_tables = {c.table for c in definition.checks if c.kind == "temporal_order" and c.table}
+        existing_fsm = {(c.table, c.field) for c in definition.checks if c.kind in ("state_machine", "state_transition")}
+        existing_invariants = {c.table for c in definition.checks if c.kind in ("semantic_invariant", "custom_rule") and c.table}
+        schemas = definition.schemas or {}
+
+        # 1. Automatic temporal ordering across workflow steps
+        for i in range(len(definition.steps) - 1):
+            s_current = definition.steps[i]
+            s_next = definition.steps[i + 1]
+            if s_current.timestamp_field and s_next.timestamp_field:
+                rule_name = f"auto_temporal_{s_current.table}_{s_next.table}"
+                if rule_name not in existing_names:
+                    inferred.append(
+                        ScenarioCheck(
+                            name=rule_name,
+                            kind="temporal_order",
+                            before=f"{s_current.table}.{s_current.timestamp_field}",
+                            after=f"{s_next.table}.{s_next.timestamp_field}",
+                            strict=False,
+                        )
+                    )
+
+        # 2. Automatic temporal lifecycle chain within single tables
+        phase_keywords = [
+            ("initial", ("diagnosis", "admit", "admission", "intake", "start", "order", "application", "visit", "encounter")),
+            ("service", ("service", "procedure", "treatment", "prescription", "submission", "submit", "claim", "processing")),
+            ("review", ("adjudication", "adjudicate", "review", "decision", "approval", "approve", "dispatch", "ship")),
+            ("settlement", ("payment", "paid", "settle", "discharge", "delivery", "deliver", "completion", "close")),
+        ]
+
+        # Scope single-table checks to tables present in the scenario steps (if defined)
+        step_tables = {s.table for s in definition.steps if s.table}
+        target_schemas = {
+            t: f for t, f in schemas.items()
+            if (not step_tables or t in step_tables)
+        }
+
+        for table_name, schema_fields in target_schemas.items():
+            if not isinstance(schema_fields, dict):
+                continue
+            date_cols: List[str] = []
+            non_event_dates = {"birth_date", "date_of_birth", "dob", "created_at", "updated_at"}
+            for f_name, f_def in schema_fields.items():
+                if f_name.startswith("__") or f_name.lower() in non_event_dates:
+                    continue
+                f_type = f_def if isinstance(f_def, str) else str(f_def.get("type", "")).lower() if isinstance(f_def, dict) else ""
+                if f_type in ("date", "datetime"):
+                    date_cols.append(f_name)
+
+            if len(date_cols) >= 2 and table_name not in existing_temporal_tables:
+                ranked_cols: List[Tuple[int, str]] = []
+                for col in date_cols:
+                    col_lower = col.lower()
+                    assigned_rank = None
+                    for rank, (_, keywords) in enumerate(phase_keywords):
+                        if any(kw in col_lower for kw in keywords):
+                            assigned_rank = rank
+                            break
+                    if assigned_rank is not None:
+                        ranked_cols.append((assigned_rank, col))
+
+                seen_ranks = set()
+                sorted_by_rank: List[str] = []
+                for rank, col in sorted(ranked_cols, key=lambda x: x[0]):
+                    if rank not in seen_ranks:
+                        seen_ranks.add(rank)
+                        sorted_by_rank.append(col)
+
+                if len(sorted_by_rank) >= 2:
+                    chain_name = f"auto_lifecycle_{table_name.lower()}"
+                    if chain_name not in existing_names:
+                        inferred.append(
+                            ScenarioCheck(
+                                name=chain_name,
+                                kind="temporal_order",
+                                table=table_name,
+                                chain=sorted_by_rank,
+                                strict=False,
+                            )
+                        )
+
+            # 3. Automatic sequential state machine transitions (FSM)
+            status_cols = [
+                f_name for f_name in schema_fields
+                if not f_name.startswith("__")
+                and not f_name.lower().startswith(("prev", "old_", "from_"))
+                and (
+                    f_name.lower() in ("status", "claim_status", "order_status", "state", "stage")
+                    or (f_name.lower().endswith(("_status", "_state")) and not f_name.lower().startswith(("prev", "old_", "from_")))
+                )
+            ]
+            prev_status_cols = [
+                f_name for f_name in schema_fields
+                if not f_name.startswith("__")
+                and f_name.lower().startswith(("prev", "old_", "from_"))
+                and ("status" in f_name.lower() or "state" in f_name.lower())
+            ]
+            inferred_prev_field = prev_status_cols[0] if prev_status_cols else None
+
+            for s_col in status_cols:
+                fsm_name = f"auto_fsm_{table_name.lower()}_{s_col.lower()}"
+                if fsm_name not in existing_names and (table_name, s_col) not in existing_fsm:
+                    inferred.append(
+                        ScenarioCheck(
+                            name=fsm_name,
+                            kind="state_machine",
+                            table=table_name,
+                            field=s_col,
+                            previous_field=inferred_prev_field,
+                            initial_states=["submitted", "pending", "created", "new", "received"],
+                            terminal_states=["denied", "rejected", "cancelled", "paid", "closed", "completed"],
+                            transitions={
+                                "submitted": ["under review", "in review", "pending", "approved", "denied"],
+                                "pending": ["under review", "in review", "approved", "denied", "processing", "cancelled"],
+                                "created": ["processing", "under review", "pending", "approved", "cancelled"],
+                                "under review": ["approved", "denied", "rejected"],
+                                "in review": ["approved", "denied", "rejected"],
+                                "processing": ["shipped", "approved", "cancelled", "completed"],
+                                "approved": ["paid", "shipped", "completed"],
+                                "denied": [],
+                                "rejected": [],
+                                "cancelled": [],
+                                "paid": [],
+                                "completed": [],
+                                "closed": [],
+                            },
+                        )
+                    )
+
+            # 4. Automatic semantic invariants (e.g. paid claims must have payment > 0; denied must have 0)
+            amount_cols = [
+                f_name for f_name in schema_fields
+                if not f_name.startswith("__") and (
+                    f_name.lower() in ("amount", "payment_amount", "paid_amount", "total_amount", "claim_amount")
+                    or f_name.lower().endswith(("_amount", "_total", "_paid"))
+                )
+            ]
+            for s_col in status_cols:
+                for a_col in amount_cols:
+                    pos_rule = f"auto_{table_name.lower()}_paid_positive_{a_col.lower()}"
+                    if pos_rule not in existing_names and table_name not in existing_invariants:
+                        inferred.append(
+                            ScenarioCheck(
+                                name=pos_rule,
+                                kind="semantic_invariant",
+                                table=table_name,
+                                condition=f"{s_col} == 'paid' or {s_col} == 'approved'",
+                                assertion=f"{a_col} > 0",
+                            )
+                        )
+                    if "pay" in a_col.lower() or a_col.lower() in ("amount", "paid_amount"):
+                        zero_rule = f"auto_{table_name.lower()}_denied_zero_{a_col.lower()}"
+                        if zero_rule not in existing_names and table_name not in existing_invariants:
+                            inferred.append(
+                                ScenarioCheck(
+                                    name=zero_rule,
+                                    kind="semantic_invariant",
+                                    table=table_name,
+                                    condition=f"{s_col} == 'denied' or {s_col} == 'rejected'",
+                                    assertion=f"{a_col} == 0",
+                                )
+                            )
+
+        # 5. Automatic cross-table absence for rejected/denied workflow steps
+        table_names = list(target_schemas.keys())
+        payment_tables = [t for t in table_names if "payment" in t.lower() or "settlement" in t.lower()]
+        claim_tables = [t for t in table_names if "claim" in t.lower() or "order" in t.lower() or "visit" in t.lower()]
+        for c_tbl in claim_tables:
+            c_schema = schemas.get(c_tbl, {})
+            if isinstance(c_schema, dict):
+                c_status_cols = [f for f in c_schema if f.lower() in ("status", "claim_status", "order_status")]
+                for p_tbl in payment_tables:
+                    if c_tbl != p_tbl and c_status_cols:
+                        s_col = c_status_cols[0]
+                        rule_name = f"auto_no_{p_tbl.lower()}_for_denied_{c_tbl.lower()}"
+                        if rule_name not in existing_names:
+                            inferred.append(
+                                ScenarioCheck(
+                                    name=rule_name,
+                                    kind="absence_by_value",
+                                    source=f"{c_tbl}.{s_col}",
+                                    value="denied",
+                                    absent_table=p_tbl,
+                                )
+                            )
+
+        return inferred
+
+    @classmethod
     def evaluate_checks(
+        cls,
         definition: ScenarioDefinition,
         tables: Mapping[str, pd.DataFrame],
     ) -> List[Dict[str, Any]]:
-        """Evaluate declared executable checks against generated table frames."""
+        """Evaluate declared executable checks against generated table frames.
+
+        Returns a list of check results containing check name, violation count,
+        and structured violation details: [{"table": ..., "row": ..., "rule": ..., "error": ...}].
+        """
         results: List[Dict[str, Any]] = []
         instance_field = definition.instance_id_field
-        for check in definition.checks:
-            violations = 0
+
+        checks_to_run = list(definition.checks)
+        existing_names = {c.name for c in checks_to_run}
+        for inf in cls.infer_causal_checks(definition):
+            if inf.name not in existing_names:
+                checks_to_run.append(inf)
+
+        for check in checks_to_run:
+            is_auto = check.name.startswith("auto_")
+            violations_list: List[Dict[str, Any]] = []
+
+            # 1. ALLOWED VALUES
             if check.kind == "allowed_values":
-                frame = tables.get(check.table or "")
-                if frame is not None and check.field in frame:
-                    violations = int((~frame[check.field].isin(check.values)).sum())
+                table_name = check.table or ""
+                frame = tables.get(table_name)
+                if frame is None or check.field not in frame:
+                    if not is_auto:
+                        violations_list.append({
+                            "table": table_name,
+                            "row": "N/A",
+                            "rule": check.name,
+                            "error": f"Table '{table_name}' or field '{check.field}' is missing from generated data.",
+                        })
                 else:
-                    violations = 1
+                    invalid_mask = ~frame[check.field].isin(check.values)
+                    if invalid_mask.any():
+                        for idx, row in frame[invalid_mask].iterrows():
+                            row_id = row.get(instance_field, idx)
+                            val = row.get(check.field)
+                            violations_list.append({
+                                "table": table_name,
+                                "row": row_id,
+                                "rule": check.name,
+                                "error": f"Value '{val}' in column '{check.field}' is not in allowed values: {check.values}.",
+                            })
+
+            # 2. TEMPORAL ORDER (chain or pairwise before/after)
             elif check.kind == "temporal_order":
-                before_table, before_field = _split_reference(check.before or "")
-                after_table, after_field = _split_reference(check.after or "")
-                before = tables.get(before_table)
-                after = tables.get(after_table)
-                if (
-                    before is None or after is None
-                    or instance_field not in before or instance_field not in after
-                    or before_field not in before or after_field not in after
-                ):
-                    violations = 1
+                if check.chain:
+                    resolved_chain: List[Tuple[str, str]] = []
+                    for ref in check.chain:
+                        if "." in ref:
+                            t_name, f_name = _split_reference(ref)
+                        else:
+                            t_name, f_name = check.table or "", ref
+                        resolved_chain.append((t_name, f_name))
+
+                    missing = [
+                        f"{t}.{f}" for t, f in resolved_chain
+                        if t not in tables or f not in tables[t]
+                    ]
+                    if missing:
+                        if not is_auto:
+                            violations_list.append({
+                                "table": resolved_chain[0][0],
+                                "row": "N/A",
+                                "rule": check.name,
+                                "error": f"Missing references for temporal chain: {', '.join(missing)}.",
+                            })
+                    else:
+                        unique_tables = {t for t, _ in resolved_chain}
+                        if len(unique_tables) == 1:
+                            tbl = next(iter(unique_tables))
+                            df = tables[tbl]
+                            for idx, row in df.iterrows():
+                                row_id = row.get(instance_field, idx)
+                                for i in range(len(resolved_chain) - 1):
+                                    (_, col_a), (_, col_b) = resolved_chain[i], resolved_chain[i + 1]
+                                    val_a = pd.to_datetime(row.get(col_a), errors="coerce", utc=True)
+                                    val_b = pd.to_datetime(row.get(col_b), errors="coerce", utc=True)
+                                    if pd.notna(val_a) and pd.notna(val_b):
+                                        is_violation = (val_a > val_b) if not check.strict else (val_a >= val_b)
+                                        if is_violation:
+                                            op_str = "<" if check.strict else "<="
+                                            violations_list.append({
+                                                "table": tbl,
+                                                "row": row_id,
+                                                "rule": check.name,
+                                                "error": f"Temporal violation: '{col_a}' ({row.get(col_a)}) must be {op_str} '{col_b}' ({row.get(col_b)}).",
+                                            })
+                                            break
+                        else:
+                            instance_timestamps: Dict[Any, Dict[str, pd.Timestamp]] = {}
+                            for t_name, f_name in resolved_chain:
+                                df = tables[t_name]
+                                if instance_field not in df:
+                                    continue
+                                for _, row in df.iterrows():
+                                    inst_id = row[instance_field]
+                                    ts = pd.to_datetime(row.get(f_name), errors="coerce", utc=True)
+                                    if pd.notna(ts) and isinstance(ts, pd.Timestamp):
+                                        ref_key = f"{t_name}.{f_name}"
+                                        inst_dict = instance_timestamps.setdefault(inst_id, {})
+                                        if ref_key not in inst_dict or ts < inst_dict[ref_key]:
+                                            inst_dict[ref_key] = ts
+
+                            for inst_id, ts_map in instance_timestamps.items():
+                                for i in range(len(resolved_chain) - 1):
+                                    ref_a = f"{resolved_chain[i][0]}.{resolved_chain[i][1]}"
+                                    ref_b = f"{resolved_chain[i+1][0]}.{resolved_chain[i+1][1]}"
+                                    if ref_a in ts_map and ref_b in ts_map:
+                                        val_a = ts_map[ref_a]
+                                        val_b = ts_map[ref_b]
+                                        is_violation = (val_a > val_b) if not check.strict else (val_a >= val_b)
+                                        if is_violation:
+                                            op_str = "<" if check.strict else "<="
+                                            violations_list.append({
+                                                "table": resolved_chain[i+1][0],
+                                                "row": inst_id,
+                                                "rule": check.name,
+                                                "error": f"Temporal chain violation: '{ref_a}' ({val_a.isoformat()}) must be {op_str} '{ref_b}' ({val_b.isoformat()}).",
+                                            })
+                                            break
                 else:
-                    before_values = before[[instance_field, before_field]].copy()
-                    after_values = after[[instance_field, after_field]].copy()
-                    before_values[before_field] = pd.to_datetime(
-                        before_values[before_field], errors="coerce", utc=True
-                    )
-                    after_values[after_field] = pd.to_datetime(
-                        after_values[after_field], errors="coerce", utc=True
-                    )
-                    before_groups = before_values.groupby(instance_field)[before_field]
-                    after_groups = after_values.groupby(instance_field)[after_field]
-                    shared_instances = before_groups.indices.keys() & after_groups.indices.keys()
-                    for instance_id in shared_instances:
-                        earlier = before_groups.get_group(instance_id).dropna()
-                        later = after_groups.get_group(instance_id).dropna()
-                        if earlier.empty or later.empty or earlier.max() > later.min():
-                            violations += 1
-            else:
+                    before_table, before_field = _split_reference(check.before or "")
+                    after_table, after_field = _split_reference(check.after or "")
+                    before = tables.get(before_table)
+                    after = tables.get(after_table)
+                    if (
+                        before is None or after is None
+                        or instance_field not in before or instance_field not in after
+                        or before_field not in before or after_field not in after
+                    ):
+                        if not is_auto:
+                            violations_list.append({
+                                "table": after_table or check.table or "",
+                                "row": "N/A",
+                                "rule": check.name,
+                                "error": f"Temporal check references missing table or field: {check.before} -> {check.after}.",
+                            })
+                    else:
+                        before_values = before[[instance_field, before_field]].copy()
+                        after_values = after[[instance_field, after_field]].copy()
+                        before_values[before_field] = pd.to_datetime(
+                            before_values[before_field], errors="coerce", utc=True
+                        )
+                        after_values[after_field] = pd.to_datetime(
+                            after_values[after_field], errors="coerce", utc=True
+                        )
+                        before_groups = before_values.groupby(instance_field)[before_field]
+                        after_groups = after_values.groupby(instance_field)[after_field]
+                        shared_instances = before_groups.indices.keys() & after_groups.indices.keys()
+                        for instance_id in shared_instances:
+                            earlier = before_groups.get_group(instance_id).dropna()
+                            later = after_groups.get_group(instance_id).dropna()
+                            if earlier.empty or later.empty:
+                                continue
+                            is_violation = (earlier.max() > later.min()) if not check.strict else (earlier.max() >= later.min())
+                            if is_violation:
+                                op_str = "<" if check.strict else "<="
+                                violations_list.append({
+                                    "table": after_table,
+                                    "row": instance_id,
+                                    "rule": check.name,
+                                    "error": f"Temporal violation: '{check.before}' ({earlier.max().isoformat()}) must be {op_str} '{check.after}' ({later.min().isoformat()}).",
+                                })
+
+            # 3. ABSENCE BY VALUE
+            elif check.kind == "absence_by_value":
                 source_table, source_field = _split_reference(check.source or "")
                 source = tables.get(source_table)
                 absent = tables.get(check.absent_table or "")
@@ -505,15 +841,255 @@ class ScenarioEngine:
                     or instance_field not in source or instance_field not in absent
                     or source_field not in source
                 ):
-                    violations = 1
+                    if not is_auto:
+                        violations_list.append({
+                            "table": check.absent_table or "",
+                            "row": "N/A",
+                            "rule": check.name,
+                            "error": f"Missing tables or fields for check: {check.source} absent {check.absent_table}.",
+                        })
                 else:
-                    source_instances = set(
-                        source.loc[source[source_field] == check.value, instance_field]
-                    )
-                    forbidden_instances = source_instances & set(absent[instance_field])
-                    violations = len(forbidden_instances)
-            results.append({"name": check.name, "violations": violations})
+                    matching_source = source[source[source_field] == check.value]
+                    source_instances = set(matching_source[instance_field].tolist())
+                    forbidden_instances = sorted(source_instances & set(absent[instance_field].tolist()))
+                    for inst_id in forbidden_instances:
+                        violations_list.append({
+                            "table": check.absent_table,
+                            "row": inst_id,
+                            "rule": check.name,
+                            "error": f"Forbidden record in '{check.absent_table}' for scenario instance '{inst_id}' when {check.source} == '{check.value}'.",
+                        })
+
+            # 4. STATE TRANSITION / STATE MACHINE
+            elif check.kind in ("state_transition", "state_machine"):
+                table_name = check.table or ""
+                df = tables.get(table_name)
+                transitions = check.transitions or {}
+                if df is None or check.field not in df:
+                    if not is_auto:
+                        violations_list.append({
+                            "table": table_name,
+                            "row": "N/A",
+                            "rule": check.name,
+                            "error": f"Table '{table_name}' or field '{check.field}' is missing for state transition check.",
+                        })
+                else:
+                    all_states = set(transitions.keys())
+                    for targets in transitions.values():
+                        all_states.update(targets)
+
+                    if check.previous_field and check.previous_field in df:
+                        for idx, row in df.iterrows():
+                            row_id = row.get(instance_field, idx)
+                            from_val = row.get(check.previous_field)
+                            to_val = row.get(check.field)
+                            if pd.notna(from_val) and pd.notna(to_val):
+                                allowed = transitions.get(str(from_val), [])
+                                if str(to_val) not in allowed:
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": row_id,
+                                        "rule": check.name,
+                                        "error": f"Illegal state transition from '{from_val}' to '{to_val}'. Allowed transitions from '{from_val}': {allowed}.",
+                                    })
+                    elif instance_field in df:
+                        order_col = check.order_by if (check.order_by and check.order_by in df) else None
+                        for inst_id, group in df.groupby(instance_field, sort=False):
+                            if order_col:
+                                group = group.sort_values(order_col)
+                            states: List[str] = [str(s) for s in group[check.field].dropna().tolist()]
+                            if not states:
+                                continue
+                            if len(states) > 1:
+                                if check.initial_states and states[0] not in check.initial_states:
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": inst_id,
+                                        "rule": check.name,
+                                        "error": f"Initial state '{states[0]}' not in allowed initial states: {check.initial_states}.",
+                                    })
+                                for i in range(len(states) - 1):
+                                    curr_s = states[i]
+                                    next_s = states[i + 1]
+                                    allowed: List[str] = transitions.get(curr_s, [])
+                                    if next_s not in allowed:
+                                        violations_list.append({
+                                            "table": table_name,
+                                            "row": inst_id,
+                                            "rule": check.name,
+                                            "error": f"Illegal transition sequence from '{curr_s}' to '{next_s}'. Allowed: {allowed}.",
+                                        })
+                            else:
+                                curr_s = states[0]
+                                if curr_s not in all_states:
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": inst_id,
+                                        "rule": check.name,
+                                        "error": f"Unknown state '{curr_s}' not part of declared state machine.",
+                                    })
+                    else:
+                        for idx, row in df.iterrows():
+                            val = row.get(check.field)
+                            if pd.notna(val) and str(val) not in all_states:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": idx,
+                                    "rule": check.name,
+                                    "error": f"State '{val}' is not in known states: {sorted(all_states)}.",
+                                })
+
+            # 5. SEMANTIC INVARIANT
+            elif check.kind == "semantic_invariant":
+                table_name = check.table or ""
+                df = tables.get(table_name)
+                if df is None:
+                    if not is_auto:
+                        violations_list.append({
+                            "table": table_name,
+                            "row": "N/A",
+                            "rule": check.name,
+                            "error": f"Table '{table_name}' is missing for semantic invariant check.",
+                        })
+                else:
+                    eval_df = df.copy()
+                    expr_text = f"{check.condition or ''} {check.assertion or ''} {check.expression or ''}"
+                    import re
+                    cleaned_expr = re.sub(r"'[^']*'|\"[^\"]*\"", "", expr_text)
+                    words = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", cleaned_expr)) - {
+                        "or", "and", "not", "True", "False", "None", "abs", "min", "max", "len", "str", "int", "float", "bool", "is_none"
+                    }
+                    if is_auto and not words.issubset(set(eval_df.columns)):
+                        continue
+                    for other_name, other_df in tables.items():
+                        if other_name != table_name and instance_field in eval_df and instance_field in other_df:
+                            if other_name in expr_text or any(col in expr_text for col in other_df.columns if col not in eval_df.columns):
+                                eval_df = eval_df.merge(
+                                    other_df,
+                                    on=instance_field,
+                                    how="left",
+                                    suffixes=("", f"_{other_name}"),
+                                )
+
+                    for idx, row in eval_df.iterrows():
+                        row_id = row.get(instance_field, idx)
+                        row_dict = {}
+                        for k, v in row.items():
+                            col_str = str(k)
+                            row_dict[col_str] = None if pd.isna(v) else v
+                        row_dict["row"] = row_dict
+                        row_dict["record"] = row_dict
+
+                        def _eval_safe(expr: str, scope: Dict[str, Any]) -> bool:
+                            try:
+                                builtins_dict = {
+                                    "abs": abs,
+                                    "min": min,
+                                    "max": max,
+                                    "len": len,
+                                    "str": str,
+                                    "int": int,
+                                    "float": float,
+                                    "bool": bool,
+                                    "is_none": lambda x: x is None or pd.isna(x),
+                                }
+                                val = eval(expr, {"__builtins__": builtins_dict}, scope)
+                                if pd.isna(val):
+                                    return False
+                                return bool(val)
+                            except Exception:
+                                return False
+
+                        if check.expression:
+                            if not _eval_safe(check.expression, row_dict):
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": row_id,
+                                    "rule": check.name,
+                                    "error": f"Semantic invariant '{check.expression}' failed for row data.",
+                                })
+                        elif check.condition and check.assertion:
+                            if _eval_safe(check.condition, row_dict):
+                                if not _eval_safe(check.assertion, row_dict):
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": row_id,
+                                        "rule": check.name,
+                                        "error": f"Semantic invariant violation: when '{check.condition}', expected '{check.assertion}'.",
+                                    })
+
+            # 6. CUSTOM RULE
+            elif check.kind == "custom_rule":
+                table_name = check.table or ""
+                df = tables.get(table_name)
+                if df is None:
+                    violations_list.append({
+                        "table": table_name,
+                        "row": "N/A",
+                        "rule": check.name,
+                        "error": f"Table '{table_name}' is missing for custom rule check.",
+                    })
+                elif check.expression:
+                    for idx, row in df.iterrows():
+                        row_id = row.get(instance_field, idx)
+                        row_dict = {}
+                        for k, v in row.items():
+                            col_str = str(k)
+                            row_dict[col_str] = None if pd.isna(v) else v
+                        row_dict["row"] = row_dict
+                        row_dict["record"] = row_dict
+
+                        try:
+                            builtins_dict = {
+                                "abs": abs,
+                                "min": min,
+                                "max": max,
+                                "len": len,
+                                "str": str,
+                                "int": int,
+                                "float": float,
+                                "bool": bool,
+                                "is_none": lambda x: x is None or pd.isna(x),
+                            }
+                            passed = bool(eval(check.expression, {"__builtins__": builtins_dict}, row_dict))
+                        except Exception:
+                            passed = False
+                        if not passed:
+                            violations_list.append({
+                                "table": table_name,
+                                "row": row_id,
+                                "rule": check.name,
+                                "error": f"Custom rule '{check.expression}' failed for row data.",
+                            })
+
+            results.append({
+                "name": check.name,
+                "violations": len(violations_list),
+                "details": violations_list,
+            })
+
         return results
+
+    @classmethod
+    def validate_causal_workflow(
+        cls,
+        definition: ScenarioDefinition,
+        tables: Mapping[str, pd.DataFrame],
+    ) -> Tuple[List[Dict[str, Any]], List[ViolationReport]]:
+        """Run post-generation causal integrity pass and return both metrics and structured violations."""
+        check_results = cls.evaluate_checks(definition, tables)
+        violations: List[ViolationReport] = []
+        for result in check_results:
+            for detail in result.get("details", []):
+                violations.append(
+                    ViolationReport(
+                        table=detail["table"],
+                        row=detail["row"],
+                        rule=detail["rule"],
+                        error=detail["error"],
+                    )
+                )
+        return check_results, violations
 
     @staticmethod
     def _build_row_contexts(
@@ -582,8 +1158,8 @@ class ScenarioEngine:
                 f"expected {len(expected_keys)}."
             )
 
-        actual_keys = frame[_ROW_KEY_FIELD].astype(str).tolist()
-        duplicate_keys = sorted(
+        actual_keys: List[str] = [str(k) for k in frame[_ROW_KEY_FIELD].tolist()]
+        duplicate_keys: List[str] = sorted(
             {key for key in actual_keys if actual_keys.count(key) > 1}
         )
         if duplicate_keys:
@@ -592,9 +1168,9 @@ class ScenarioEngine:
                 f"{', '.join(duplicate_keys)}."
             )
         if set(actual_keys) != set(expected_keys):
-            missing = sorted(set(expected_keys) - set(actual_keys))
-            unexpected = sorted(set(actual_keys) - set(expected_keys))
-            details = []
+            missing: List[str] = sorted(set(expected_keys) - set(actual_keys))
+            unexpected: List[str] = sorted(set(actual_keys) - set(expected_keys))
+            details: List[str] = []
             if missing:
                 details.append(f"missing {', '.join(missing)}")
             if unexpected:
@@ -620,11 +1196,12 @@ class ScenarioEngine:
 
         for column in _schema_fields(schema):
             mask = frame[column].isna()
-            frame.loc[mask, column] = indexed.loc[mask, column].to_numpy()
+            frame.loc[mask, column] = getattr(indexed.loc[mask, column], "values", indexed.loc[mask, column])
 
         declared = list(_schema_fields(definition.schemas[table]))
         metadata = [definition.instance_id_field, definition.path_field]
-        return frame[[*declared, *metadata]]
+        cols: List[str] = [*declared, *metadata]
+        return pd.DataFrame(frame[cols])
 
     @staticmethod
     def _apply_values(
@@ -890,15 +1467,15 @@ class ScenarioEngine:
                 rows = rows[rows[instance_field] == instance_id]
                 if rows.empty:
                     continue
-                timestamps = pd.to_datetime(rows[step.timestamp_field], errors="coerce")
-                if timestamps.isna().any():
+                ts_series = pd.Series(pd.to_datetime(rows[step.timestamp_field], errors="coerce"))
+                if ts_series.isna().any():
                     errors.append(
                         f"scenario '{instance_id}' has invalid timestamps in "
                         f"step '{step.name}'"
                     )
                     continue
-                current_min = timestamps.min()
-                current_max = timestamps.max()
+                current_min = ts_series.min()
+                current_max = ts_series.max()
                 if previous_max is not None and current_min <= previous_max:
                     errors.append(
                         f"scenario '{instance_id}' step '{step.name}' does not occur "

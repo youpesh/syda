@@ -86,7 +86,8 @@ class SchemaLoader:
         
         # Case 2: SQLAlchemy model - check for __table__ attribute which all SQLAlchemy models have
         elif SQLALCH_INSTALLED and isinstance(schema_source, type) and hasattr(schema_source, '__table__'):
-            return self._load_sqlalchemy_model(schema_source)
+            schema_dict = self._load_sqlalchemy_model(schema_source)
+            return self._load_dict_schema(schema_dict)
                 
         # Case 3: Path to JSON/YAML schema file
         elif isinstance(schema_source, str):
@@ -201,7 +202,7 @@ class SchemaLoader:
         
         return table_schema, metadata, table_description, foreign_keys, template_fields, depends_on_schemas
     
-    def _load_schema_file(self, file_path: str) -> Tuple[Dict, Dict, Optional[str], Dict]:
+    def _load_schema_file(self, file_path: str) -> Dict:
         """
         Process a schema file (JSON or YAML).
         
