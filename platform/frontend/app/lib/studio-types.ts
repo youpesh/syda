@@ -25,6 +25,13 @@ export interface CostEstimate {
   note: string;
 }
 
+export interface ViolationRecord {
+  table: string;
+  row: string | number;
+  rule: string;
+  error: string;
+}
+
 export interface JobStats {
   causalIntegrity: string;
   referentialIntegrity: string;
@@ -36,6 +43,7 @@ export interface JobStats {
   pathCounts: Record<string, number>;
   evaluationResult: "pass" | "fail" | "partial";
   evaluationMetrics: { key: string; label: string; status: "pass" | "fail" | "not_evaluated"; value: string; detail: string; violations: number }[];
+  violations?: ViolationRecord[];
 }
 
 export interface GenerationJob {

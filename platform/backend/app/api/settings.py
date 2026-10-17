@@ -32,9 +32,11 @@ class KeyRequest(BaseModel):
     base_url: str | None = None
 
 
-class KeySaveRequest(KeyRequest):
+class KeySaveRequest(BaseModel):
+    key: str
     provider: str
     model: str
+    base_url: str | None = None
 
 
 class ModelUpdate(BaseModel):
@@ -44,7 +46,7 @@ class ModelUpdate(BaseModel):
 def _detect_prefix(key: str) -> str | None:
     if key.startswith("sk-ant-"):
         return "anthropic"
-    if key.startswith("AIza"):
+    if key.startswith(("AIza", "AQ.")):
         return "gemini"
     if key.startswith("xai-"):
         return "grok"

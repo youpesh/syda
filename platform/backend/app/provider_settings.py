@@ -22,7 +22,7 @@ from .models.entities import (
 PROVIDERS: dict[str, dict[str, str]] = {
     "openai": {"name": "OpenAI", "model": "gpt-4o-mini"},
     "anthropic": {"name": "Anthropic", "model": "claude-haiku-4-5-20251001"},
-    "gemini": {"name": "Google Gemini", "model": "gemini-2.5-flash"},
+    "gemini": {"name": "Google Gemini", "model": "gemini-3.5-flash"},
     "grok": {"name": "xAI", "model": "grok-4"},
     "openai_compatible": {"name": "Other compatible API", "model": ""},
 }
@@ -125,6 +125,8 @@ def resolve_provider(db: Session | None = None, user_id: UUID | None = None) -> 
         if selected == "offline":
             return {"id": selected, "name": "Offline", "model": "Local schema synthesizer", "agent_model": None, "preference": preference, "configured": configured}
         model = models[selected]
+        if selected == "gemini" and model in ("gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.7-flash"):
+            model = "gemini-3.5-flash"
         agent_prefix = "google" if selected == "gemini" else ("openai" if selected in ("grok", "openai_compatible") else selected)
         return {
             "id": selected,

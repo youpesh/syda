@@ -1,7 +1,7 @@
 import re
 import asyncio
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, cast
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -38,7 +38,7 @@ A scenario consists of:
 6. paths: Optional weighted branches with name, included workflow steps, and per-step field overrides.
 7. rules: List of temporal, referential, and business constraints (e.g., "Visits occur before diagnoses", "Denied claims cannot be paid").
 8. schemas: Native relational table definitions mapping table name to column schemas with types, primary keys, and __foreign_keys__.
-9. checks: Machine-checkable rules. Use kind='allowed_values' with table, field, and values; kind='temporal_order' with before and after Table.field references; or kind='absence_by_value' with source='Table.field', value, and absent_table to prohibit a later table for matching instances. Encode target rates in path weights/overrides when applicable. Keep checks consistent with workflow paths and schemas. Do not claim a free-text rule is enforced unless it has a matching check or schema/path constraint.
+9. checks: Machine-checkable rules. Use kind='allowed_values' with table, field, and values; kind='temporal_order' with before and after Table.field references or chain; kind='absence_by_value' with source='Table.field', value, and absent_table; kind='state_machine' with transitions mapping; or kind='semantic_invariant' with condition and assertion. Translate the user's natural descriptions of entities, constraints, and edge cases into these machine-checkable rules. Keep checks consistent with workflow paths and schemas.
 
 Provide a concise, helpful response message explaining the design choices or updates."""
 
@@ -128,6 +128,8 @@ DOMAIN_TEMPLATES = [
             {"name": "policy_active_before_claim", "kind": "temporal_order", "before": "Policy.start_date", "after": "Claim.claim_date"},
             {"name": "diagnosis_before_claim", "kind": "temporal_order", "before": "Diagnosis.diagnosis_date", "after": "Claim.claim_date"},
             {"name": "claim_before_payment", "kind": "temporal_order", "before": "Claim.claim_date", "after": "Payment.payment_date"},
+            {"name": "claim_status_transitions", "kind": "state_machine", "table": "Claim", "field": "status", "transitions": {"submitted": ["pending", "under review", "approved", "denied"], "pending": ["under review", "approved", "denied"], "under review": ["approved", "denied"], "approved": ["paid"], "denied": [], "paid": []}},
+            {"name": "payment_requires_positive_amount", "kind": "semantic_invariant", "table": "Payment", "condition": "paid_amount is not None", "assertion": "paid_amount > 0"},
         ],
         "schemas": {
             "Patient": {
@@ -346,7 +348,7 @@ DEFAULT_TEMPLATE = {
 def _starter_scenario_for_context(context: str) -> ScenarioConfiguration:
     """Return the closest validated starter so the model only has to describe changes."""
     template = next(
-        (item for item in DOMAIN_TEMPLATES if item["matches"].search(context)),
+        (item for item in DOMAIN_TEMPLATES if cast(re.Pattern, item["matches"]).search(context)),
         DEFAULT_TEMPLATE,
     )
     data = {key: value for key, value in template.items() if key != "matches"}
@@ -354,7 +356,7 @@ def _starter_scenario_for_context(context: str) -> ScenarioConfiguration:
 
 
 def _has_concrete_scenario_subject(prompt: str) -> bool:
-    return any(template["matches"].search(prompt) for template in DOMAIN_TEMPLATES) or bool(
+    return any(cast(re.Pattern, template["matches"]).search(prompt) for template in DOMAIN_TEMPLATES) or bool(
         re.search(
             r"\b(patient|member|customer|user|account|policy|claim|visit|encounter|diagnosis|treatment|"
             r"order|product|payment|refund|transaction|shipment|appointment|loan|employee|device)\b",
@@ -596,7 +598,7 @@ async def compile_scenario_agent(
                     "record_count": validated.record_count,
                 }
 
-            @agent.output_validator
+            @cast(Any, agent).output_validator
             def require_created_draft(reply: ScenarioAgentReply) -> ScenarioAgentReply:
                 if should_attach_scenario and current_scenario is None and staged_candidate["scenario"] is None:
                     raise ModelRetry(
@@ -608,7 +610,7 @@ async def compile_scenario_agent(
 
             result = await asyncio.wait_for(
                 agent.run(context_str, usage_limits=UsageLimits(request_limit=4, tool_calls_limit=3)),
-                timeout=30.0,
+                timeout=120.0,
             )
             request_count, tool_call_count = _run_usage_counts(result)
             logger.info(
@@ -639,9 +641,57 @@ async def compile_scenario_agent(
             response = getattr(e, "response", None)
             status_code = getattr(e, "status_code", None) or getattr(response, "status_code", None)
             logger.warning(
-                "Pydantic AI agent call failed (error_type=%s, status_code=%s); no scenario changes were applied.",
+                "Pydantic AI agent call failed (error_type=%s, status_code=%s): %s",
                 type(e).__name__,
                 status_code,
+                e,
             )
+            error_str = str(e).lower()
+            provider_name = provider.get("name") or provider.get("id") or "AI provider"
+            if isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "timeout" in error_str:
+                return ChatResponse(
+                    message=(
+                        f"The AI model ({provider_name}) took longer than expected to complete its scenario design and timed out. "
+                        "Please try sending your message again."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code == 429 or "spending cap" in error_str or "quota" in error_str or "resource_exhausted" in error_str:
+                spend_msg = ""
+                if "spending cap" in error_str:
+                    spend_msg = " Google AI Studio reports that your project has exceeded its monthly spending cap (visit https://ai.studio/spend to adjust)."
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API returned a quota limit error (429 RESOURCE_EXHAUSTED). "
+                        f"Your API key or project has exceeded its quota or monthly spending cap.{spend_msg} "
+                        "Please update your spending limit in the provider console or choose a different provider/key in Settings."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code in (401, 403):
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API returned an authentication error ({status_code}). "
+                        "Please verify or re-enter your API key in Settings."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code == 404:
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API returned a 404 Not Found error for model '{provider.get('model')}'. "
+                        "This model may be restricted or deprecated for new projects (use gemini-3.5-flash). "
+                        "Please update your model selection in Settings."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code == 503:
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API is currently experiencing a temporary high demand spike (503 UNAVAILABLE) on model '{provider.get('model')}'. "
+                        "Please retry in a moment."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
 
     return _heuristic_compile_scenario(prompt, current_scenario, conversation_context)
