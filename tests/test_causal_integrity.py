@@ -409,3 +409,58 @@ def test_automatic_causal_inference_without_explicit_checks():
     assert any("lifecycle" in v.rule or "temporal" in v.rule for v in violations)
     assert any("paid_positive" in v.rule for v in violations)
 
+
+def test_resolved_paths_automatically_infers_branching_from_absence_check():
+    """Verify that absence_by_value checks automatically infer branching paths (approved vs rejected) when paths is empty."""
+    schemas = {
+        "Applicant": {"applicant_id": {"type": "integer", "constraints": {"primary_key": True}}},
+        "Application": {"application_id": {"type": "integer", "constraints": {"primary_key": True}}},
+        "Underwriting": {"underwriting_id": {"type": "integer", "constraints": {"primary_key": True}}, "status": "text"},
+        "Disbursement": {
+            "disbursement_id": {"type": "integer", "constraints": {"primary_key": True}},
+            "underwriting_id": "integer",
+            "__foreign_keys__": {"underwriting_id": "Underwriting.underwriting_id"},
+        },
+        "Repayment": {
+            "repayment_id": {"type": "integer", "constraints": {"primary_key": True}},
+            "disbursement_id": "integer",
+            "__foreign_keys__": {"disbursement_id": "Disbursement.disbursement_id"},
+        },
+    }
+
+    definition = ScenarioDefinition(
+        name="AutoBranchingTest",
+        schemas=schemas,
+        steps=[
+            ScenarioStep(name="Applicant", table="Applicant"),
+            ScenarioStep(name="Application", table="Application"),
+            ScenarioStep(name="Underwriting", table="Underwriting"),
+            ScenarioStep(name="Disbursement", table="Disbursement"),
+            ScenarioStep(name="Repayment", table="Repayment"),
+        ],
+        secondaryMetric={"label": "Rejection rate", "value": "20%"},
+        checks=[
+            ScenarioCheck(
+                name="no_disbursement_for_rejected",
+                kind="absence_by_value",
+                source="Underwriting.status",
+                value="rejected",
+                absent_table="Disbursement",
+            )
+        ],
+    )
+
+    paths = definition.resolved_paths()
+    assert len(paths) == 2
+    approved_path = next(p for p in paths if p.name == "approved")
+    rejected_path = next(p for p in paths if p.name == "rejected")
+
+    assert approved_path.weight == 0.8
+    assert approved_path.steps == ["Applicant", "Application", "Underwriting", "Disbursement", "Repayment"]
+
+    assert rejected_path.weight == 0.2
+    # Both Disbursement and its child Repayment must be absent!
+    assert rejected_path.steps == ["Applicant", "Application", "Underwriting"]
+    assert rejected_path.overrides == {"Underwriting": {"status": "rejected"}}
+
+

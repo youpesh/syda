@@ -555,15 +555,38 @@ class ScenarioEngine:
                         )
 
             # 3. Automatic sequential state machine transitions (FSM)
-            status_cols = [
-                f_name for f_name in schema_fields
-                if not f_name.startswith("__")
-                and not f_name.lower().startswith(("prev", "old_", "from_"))
-                and (
-                    f_name.lower() in ("status", "claim_status", "order_status", "state", "stage")
-                    or (f_name.lower().endswith(("_status", "_state")) and not f_name.lower().startswith(("prev", "old_", "from_")))
+            known_fsm_states = {
+                "submitted", "pending", "created", "new", "received", "under review", "in review",
+                "processing", "approved", "denied", "rejected", "cancelled", "paid", "completed",
+                "closed", "draft", "active", "inactive", "shipped", "delivered"
+            }
+            status_cols = []
+            for f_name in schema_fields:
+                if f_name.startswith("__") or f_name.lower().startswith(("prev", "old_", "from_")):
+                    continue
+                col_lower = f_name.lower()
+                is_status_col = (
+                    col_lower in ("status", "claim_status", "order_status", "state", "stage", "lifecycle_status")
+                    or (col_lower.endswith(("_status", "_state", "_stage")) and not col_lower.startswith(("prev", "old_", "from_")))
                 )
-            ]
+                if not is_status_col:
+                    continue
+                if col_lower in ("network_status", "marital_status", "tax_status", "employment_status", "vip_status", "tier_status"):
+                    continue
+                # If explicit allowed_values exist in checks or schema constraints, check overlap with known lifecycle states
+                f_def = schema_fields[f_name]
+                enum_vals = None
+                if isinstance(f_def, dict) and "constraints" in f_def and "values" in f_def["constraints"]:
+                    enum_vals = f_def["constraints"]["values"]
+                for c in definition.checks:
+                    if c.table == table_name and c.field == f_name and c.kind == "allowed_values" and c.values:
+                        enum_vals = c.values
+                if enum_vals:
+                    enum_set = {str(v).lower() for v in enum_vals}
+                    if not (enum_set & known_fsm_states):
+                        continue
+                status_cols.append(f_name)
+
             prev_status_cols = [
                 f_name for f_name in schema_fields
                 if not f_name.startswith("__")

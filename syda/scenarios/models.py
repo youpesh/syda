@@ -498,19 +498,89 @@ class ScenarioDefinition(BaseModel):
         return self
 
     def resolved_paths(self) -> List[ScenarioPath]:
-        """Return declared paths or a default path containing every step.
+        """Return declared paths or automatically infer branching paths from absence checks.
 
         Returns:
             Paths used for scenario allocation.
         """
         if self.paths:
             return self.paths
+
+        all_steps = [step.name for step in self.steps]
+        absence_checks = [
+            c for c in self.checks
+            if c.kind == "absence_by_value" and c.absent_table and c.source
+        ]
+
+        if not absence_checks:
+            return [
+                ScenarioPath(
+                    name="default",
+                    steps=all_steps,
+                    weight=1.0,
+                )
+            ]
+
+        # Inferred paths from absence rules
+        # 1. Determine rate / weight from secondary metric (e.g. "Rejection rate": "20%")
+        absent_weight = 0.20
+        metric_val = self.secondary_metric.get("value", "") if isinstance(self.secondary_metric, dict) else ""
+        if isinstance(metric_val, str) and "%" in metric_val:
+            try:
+                num = float(metric_val.replace("%", "").strip())
+                if 0 < num < 100:
+                    absent_weight = round(num / 100.0, 3)
+            except Exception:
+                pass
+
+        # 2. Collect all tables that must be absent and their cascading child dependents
+        absent_tables: Set[str] = {c.absent_table for c in absence_checks if c.absent_table}
+        changed = True
+        while changed:
+            changed = False
+            for tbl, sch in (self.schemas or {}).items():
+                if tbl in absent_tables:
+                    continue
+                fks = _foreign_keys(sch)
+                if any(parent in absent_tables for parent, _ in fks.values()):
+                    absent_tables.add(tbl)
+                    changed = True
+
+        absent_steps = [s for s in all_steps if s not in absent_tables]
+        if not absent_steps:
+            absent_steps = all_steps[:1]
+
+        # 3. Setup state overrides for the source status field
+        absent_overrides: Dict[str, Dict[str, Any]] = {}
+        normal_overrides: Dict[str, Dict[str, Any]] = {}
+        for c in absence_checks:
+            if c.source and "." in c.source and c.value:
+                src_tbl, src_col = c.source.split(".", 1)
+                absent_overrides.setdefault(src_tbl, {})[src_col] = c.value
+                normal_val = None
+                for other_check in self.checks:
+                    if other_check.kind == "allowed_values" and other_check.table == src_tbl and other_check.field == src_col:
+                        candidates = [v for v in (other_check.values or []) if v != c.value]
+                        if candidates:
+                            normal_val = candidates[0]
+                if normal_val is None:
+                    normal_val = "approved" if c.value in ("denied", "rejected", "cancelled") else "completed"
+                normal_overrides.setdefault(src_tbl, {})[src_col] = normal_val
+
+        path_name = absence_checks[0].value or "rejected"
         return [
             ScenarioPath(
-                name="default",
-                steps=[step.name for step in self.steps],
-                weight=1.0,
-            )
+                name="approved",
+                steps=all_steps,
+                weight=round(1.0 - absent_weight, 3),
+                overrides=normal_overrides,
+            ),
+            ScenarioPath(
+                name=path_name,
+                steps=absent_steps,
+                weight=absent_weight,
+                overrides=absent_overrides,
+            ),
         ]
 
 

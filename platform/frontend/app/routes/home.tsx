@@ -60,6 +60,7 @@ import {
 } from "~/components/ui/dialog";
 import { Progress, ProgressLabel, ProgressValue } from "~/components/ui/progress";
 import { AppShell } from "~/components/studio/app-shell";
+import { CleanMessageText } from "~/components/studio/clean-message-text";
 import { DataPreview } from "~/components/studio/data-preview";
 import type { ChatRunReference, CostEstimate, GenerationJob, SavedConversation, ScenarioConfiguration } from "~/lib/studio-types";
 
@@ -823,15 +824,12 @@ export default function Home() {
                             <MessageContent>
                               <Bubble align={message.role === "user" ? "end" : "start"} className={scenario ? "w-full" : undefined} variant={message.role === "user" ? "secondary" : "ghost"}>
                                 <BubbleContent className={scenario ? "w-full" : undefined}>
-                                  {text && (
-                                    <p className={scenario ? "mb-3 text-xs leading-5" : undefined}>
-                                      {text.split("\n\nDatabase schema context (")[0]}
-                                      {text.includes("\n\nDatabase schema context (") && <span className="mt-2 block text-xs text-muted-foreground">Database schema included with this prompt.</span>}
-                                      {isStreamingThis && (
-                                        <span className="ml-1 inline-block h-3.5 w-1.5 animate-pulse rounded-xs bg-primary align-middle" />
-                                      )}
-                                    </p>
-                                  )}
+                                  <CleanMessageText
+                                    text={text}
+                                    isStreaming={isStreamingThis}
+                                    isUser={message.role === "user"}
+                                    hasScenario={Boolean(scenario)}
+                                  />
                                   {scenario && (
                                     <ScenarioCard
                                       sourceName={messages.slice(0, index).reverse().find(item => item.role === "user")?.parts.filter(part => part.type === "text").map(part => part.text).join(" ").match(/Database schema context \((.*); structure only, output CSV\):/)?.[1] ?? "Chat instructions"}
