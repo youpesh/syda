@@ -767,7 +767,7 @@ export default function Home() {
           <main className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"><Spinner /> Loading chat history…</main>
         ) : !messages.length ? (
           <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-12">
-            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_38%,oklch(0.96_0.025_265),transparent_38%)]" />
+            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_38%,oklch(0.96_0.025_265),transparent_38%)] dark:bg-[radial-gradient(circle_at_50%_38%,oklch(0.24_0.03_265),transparent_42%)]" />
             <div className="relative flex w-full max-w-2xl flex-col items-center">
               <div className="mb-5 flex size-10 items-center justify-center border bg-card shadow-sm">
                 <HugeiconsIcon icon={SparklesIcon} strokeWidth={1.8} />

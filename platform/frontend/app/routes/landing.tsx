@@ -6,6 +6,7 @@ import type { Route } from "./+types/landing";
 import { Badge } from "~/components/ui/badge";
 import { buttonVariants } from "~/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "~/components/ui/card";
+import { ThemeToggle } from "~/components/ui/theme-toggle";
 
 export function meta({}: Route.MetaArgs) {
   return [
@@ -32,6 +33,7 @@ export default function Landing() {
         <a className="transition-colors hover:text-foreground" href="#built-for">Built for complex data</a>
       </nav>
       <div className="flex items-center gap-2">
+        <ThemeToggle />
         <Link className={buttonVariants({ variant: "ghost" })} to="/login">Log in</Link>
         <Link className={buttonVariants({})} to="/register">Get started <HugeiconsIcon data-icon="inline-end" icon={ArrowRight02Icon} strokeWidth={2} /></Link>
       </div>
