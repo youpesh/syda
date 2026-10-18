@@ -1,6 +1,7 @@
 import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { RunQualitySummary } from "~/components/studio/run-quality-summary";
+import { ConnectionsWorkspace, RunHistoryWorkspace, SchemaWorkspace } from "~/components/studio/chat-workspace";
 import {
   useEffect,
   useMemo,
@@ -447,6 +448,8 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
 export default function Home() {
   const navigate = useNavigate();
   const location = useLocation();
+  const requestedView = new URLSearchParams(location.search).get("view");
+  const workspaceView = ["connections", "schema", "runs"].includes(requestedView ?? "") ? requestedView : "scenario";
   const { conversationId } = useParams();
   const conversationIdRef = useRef<string | undefined>(conversationId);
   conversationIdRef.current = conversationId;
@@ -763,7 +766,7 @@ export default function Home() {
 
         {conversationError && <div className="mx-auto mt-4 w-full max-w-3xl px-5"><Alert variant="destructive"><AlertTitle>Chat history issue</AlertTitle><AlertDescription>{conversationError}</AlertDescription></Alert></div>}
 
-        {conversationLoading ? (
+        {workspaceView === "connections" ? <ConnectionsWorkspace connections={connections} source={source} onSource={setSource} /> : workspaceView === "schema" ? <SchemaWorkspace source={source} scenario={latestScenario} /> : workspaceView === "runs" ? <RunHistoryWorkspace /> : conversationLoading ? (
           <main className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"><Spinner /> Loading chat history…</main>
         ) : !messages.length ? (
           <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-12">

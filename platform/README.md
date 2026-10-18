@@ -48,8 +48,9 @@ syda/
 ## Quick Start
 
 ### Prerequisites
-- **Node.js**: >= 20
-- **Python**: >= 3.11 (or [uv](https://docs.astral.sh/uv/))
+- **Node.js**: >= 22.22.0
+- **Python**: >= 3.11
+- **uv**: Required for backend setup and development
 
 ### 1. Setup
 
@@ -60,7 +61,7 @@ npm run setup
 ```
 
 This will automatically:
-1. Sync backend Python dependencies with `uv` (or `pip`) and link the parent `syda` core in editable mode (`-e ../..`).
+1. Sync backend Python dependencies with `uv` and link the parent `syda` core in editable mode.
 2. Install frontend and platform npm packages.
 
 ### 2. Run Development Server
