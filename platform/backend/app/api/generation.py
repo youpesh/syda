@@ -509,7 +509,9 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration,
         await asyncio.sleep(0.5)
 
         # Save generated DataFrames using syda.output.save_dataframes
-        save_dataframes(dfs, str(job_dir), format="csv")
+        populated_dfs = {name: df for name, df in dfs.items() if not df.empty}
+        if populated_dfs:
+            save_dataframes(populated_dfs, str(job_dir), format="csv")
 
         elapsed = round(time.time() - t0, 1)
         total_records = sum(len(df) for df in dfs.values())

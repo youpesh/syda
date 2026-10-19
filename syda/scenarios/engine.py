@@ -22,6 +22,7 @@ from typing import (
     Union,
 )
 
+import ast
 import pandas as pd
 
 from ..output import save_dataframes
@@ -64,6 +65,189 @@ class TableGenerator(Protocol):
         sample_sizes: Optional[Dict[str, int]] = None,
         **kwargs: Any,
     ) -> Dict[str, pd.DataFrame]: ...
+
+
+class _RestrictedExpressionEvaluator(ast.NodeVisitor):
+    """Safely evaluates expressions for semantic invariants and custom rules without using eval().
+    Prevents arbitrary code execution and restricts syntax to safe comparisons, logic, and arithmetic.
+    """
+
+    ALLOWED_BUILTINS: Dict[str, Callable[..., Any]] = {
+        "abs": abs,
+        "min": min,
+        "max": max,
+        "len": len,
+        "str": str,
+        "int": int,
+        "float": float,
+        "bool": bool,
+        "is_none": lambda x: x is None or pd.isna(x),
+    }
+
+    def __init__(self, scope: Dict[str, Any], table_name: Optional[str] = None):
+        self.scope = scope
+        self.table_name = table_name
+
+    def eval(self, expr: str) -> Any:
+        try:
+            tree = ast.parse(expr.strip(), mode="eval")
+        except SyntaxError as e:
+            raise ValueError(f"Syntax error in expression '{expr}': {e}")
+        return self.visit(tree.body)
+
+    def visit_Constant(self, node: ast.Constant) -> Any:
+        return node.value
+
+    def visit_Name(self, node: ast.Name) -> Any:
+        name = node.id
+        if name in self.scope:
+            return self.scope[name]
+        if name in self.ALLOWED_BUILTINS:
+            return self.ALLOWED_BUILTINS[name]
+        if name in ("None", "True", "False"):
+            return {"None": None, "True": True, "False": False}[name]
+        raise NameError(f"Field or identifier '{name}' is not defined")
+
+    def visit_Attribute(self, node: ast.Attribute) -> Any:
+        if node.attr.startswith("_"):
+            raise ValueError(f"Access to private attribute '{node.attr}' is forbidden")
+
+        if isinstance(node.value, ast.Name):
+            tbl = node.value.id
+            col = node.attr
+            if tbl in self.scope and isinstance(self.scope[tbl], (dict, Mapping)):
+                if col in self.scope[tbl]:
+                    return self.scope[tbl][col]
+            if self.table_name and tbl.lower() == self.table_name.lower():
+                if col in self.scope:
+                    return self.scope[col]
+            for candidate in (f"{col}_{tbl}", f"{tbl}_{col}"):
+                if candidate in self.scope:
+                    return self.scope[candidate]
+
+        val = self.visit(node.value)
+        if isinstance(val, (dict, Mapping)):
+            if node.attr in val:
+                return val[node.attr]
+            raise KeyError(f"Key '{node.attr}' not found")
+        if hasattr(val, node.attr):
+            return getattr(val, node.attr)
+        raise AttributeError(f"Attribute '{node.attr}' not found")
+
+    def visit_UnaryOp(self, node: ast.UnaryOp) -> Any:
+        operand = self.visit(node.operand)
+        if isinstance(node.op, ast.Not):
+            return not bool(operand)
+        elif isinstance(node.op, ast.USub):
+            return -operand
+        elif isinstance(node.op, ast.UAdd):
+            return +operand
+        elif isinstance(node.op, ast.Invert):
+            return ~operand
+        raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
+
+    def visit_BinOp(self, node: ast.BinOp) -> Any:
+        left = self.visit(node.left)
+        right = self.visit(node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        elif isinstance(node.op, ast.Sub):
+            return left - right
+        elif isinstance(node.op, ast.Mult):
+            return left * right
+        elif isinstance(node.op, ast.Div):
+            return left / right
+        elif isinstance(node.op, ast.FloorDiv):
+            return left // right
+        elif isinstance(node.op, ast.Mod):
+            return left % right
+        elif isinstance(node.op, ast.Pow):
+            return left ** right
+        raise ValueError(f"Unsupported binary operator: {type(node.op).__name__}")
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> Any:
+        if isinstance(node.op, ast.And):
+            val = True
+            for val_node in node.values:
+                val = self.visit(val_node)
+                if not val:
+                    return val
+            return val
+        elif isinstance(node.op, ast.Or):
+            val = False
+            for val_node in node.values:
+                val = self.visit(val_node)
+                if val:
+                    return val
+            return val
+        raise ValueError(f"Unsupported boolean operator: {type(node.op).__name__}")
+
+    def visit_Compare(self, node: ast.Compare) -> Any:
+        left = self.visit(node.left)
+        for op, comparator_node in zip(node.ops, node.comparators):
+            right = self.visit(comparator_node)
+            res = False
+            if isinstance(op, ast.Eq):
+                res = (left == right)
+            elif isinstance(op, ast.NotEq):
+                res = (left != right)
+            elif isinstance(op, ast.Lt):
+                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                    res = False
+                else:
+                    res = (left < right)
+            elif isinstance(op, ast.LtE):
+                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                    res = False
+                else:
+                    res = (left <= right)
+            elif isinstance(op, ast.Gt):
+                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                    res = False
+                else:
+                    res = (left > right)
+            elif isinstance(op, ast.GtE):
+                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                    res = False
+                else:
+                    res = (left >= right)
+            elif isinstance(op, ast.Is):
+                res = (left is right)
+            elif isinstance(op, ast.IsNot):
+                res = (left is not right)
+            elif isinstance(op, ast.In):
+                res = (left in right) if right is not None else False
+            elif isinstance(op, ast.NotIn):
+                res = (left not in right) if right is not None else True
+            else:
+                raise ValueError(f"Unsupported comparison operator: {type(op).__name__}")
+            if not res:
+                return False
+            left = right
+        return True
+
+    def visit_Call(self, node: ast.Call) -> Any:
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("Only whitelisted standalone functions may be called")
+        func_name = node.func.id
+        if func_name not in self.ALLOWED_BUILTINS:
+            raise ValueError(f"Calling function '{func_name}' is not permitted in rules")
+        func = self.ALLOWED_BUILTINS[func_name]
+        args = [self.visit(arg) for arg in node.args]
+        kwargs: Dict[str, Any] = {
+            kw.arg: self.visit(kw.value) for kw in node.keywords if kw.arg is not None
+        }
+        return func(*args, **kwargs)
+
+    def visit_Subscript(self, node: ast.Subscript) -> Any:
+        val = self.visit(node.value)
+        slice_val = self.visit(node.slice)
+        if val is None:
+            return None
+        return val[slice_val]
+
+    def generic_visit(self, node: ast.AST) -> Any:
+        raise ValueError(f"Disallowed expression syntax in rule: {type(node).__name__}")
 
 
 class ScenarioEngine:
@@ -554,134 +738,6 @@ class ScenarioEngine:
                             )
                         )
 
-            # 3. Automatic sequential state machine transitions (FSM)
-            known_fsm_states = {
-                "submitted", "pending", "created", "new", "received", "under review", "in review",
-                "processing", "approved", "denied", "rejected", "cancelled", "paid", "completed",
-                "closed", "draft", "active", "inactive", "shipped", "delivered"
-            }
-            status_cols = []
-            for f_name in schema_fields:
-                if f_name.startswith("__") or f_name.lower().startswith(("prev", "old_", "from_")):
-                    continue
-                col_lower = f_name.lower()
-                is_status_col = (
-                    col_lower in ("status", "claim_status", "order_status", "state", "stage", "lifecycle_status")
-                    or (col_lower.endswith(("_status", "_state", "_stage")) and not col_lower.startswith(("prev", "old_", "from_")))
-                )
-                if not is_status_col:
-                    continue
-                if col_lower in ("network_status", "marital_status", "tax_status", "employment_status", "vip_status", "tier_status"):
-                    continue
-                # If explicit allowed_values exist in checks or schema constraints, check overlap with known lifecycle states
-                f_def = schema_fields[f_name]
-                enum_vals = None
-                if isinstance(f_def, dict) and "constraints" in f_def and "values" in f_def["constraints"]:
-                    enum_vals = f_def["constraints"]["values"]
-                for c in definition.checks:
-                    if c.table == table_name and c.field == f_name and c.kind == "allowed_values" and c.values:
-                        enum_vals = c.values
-                if enum_vals:
-                    enum_set = {str(v).lower() for v in enum_vals}
-                    if not (enum_set & known_fsm_states):
-                        continue
-                status_cols.append(f_name)
-
-            prev_status_cols = [
-                f_name for f_name in schema_fields
-                if not f_name.startswith("__")
-                and f_name.lower().startswith(("prev", "old_", "from_"))
-                and ("status" in f_name.lower() or "state" in f_name.lower())
-            ]
-            inferred_prev_field = prev_status_cols[0] if prev_status_cols else None
-
-            for s_col in status_cols:
-                fsm_name = f"auto_fsm_{table_name.lower()}_{s_col.lower()}"
-                if fsm_name not in existing_names and (table_name, s_col) not in existing_fsm:
-                    inferred.append(
-                        ScenarioCheck(
-                            name=fsm_name,
-                            kind="state_machine",
-                            table=table_name,
-                            field=s_col,
-                            previous_field=inferred_prev_field,
-                            initial_states=["submitted", "pending", "created", "new", "received"],
-                            terminal_states=["denied", "rejected", "cancelled", "paid", "closed", "completed"],
-                            transitions={
-                                "submitted": ["under review", "in review", "pending", "approved", "denied"],
-                                "pending": ["under review", "in review", "approved", "denied", "processing", "cancelled"],
-                                "created": ["processing", "under review", "pending", "approved", "cancelled"],
-                                "under review": ["approved", "denied", "rejected"],
-                                "in review": ["approved", "denied", "rejected"],
-                                "processing": ["shipped", "approved", "cancelled", "completed"],
-                                "approved": ["paid", "shipped", "completed"],
-                                "denied": [],
-                                "rejected": [],
-                                "cancelled": [],
-                                "paid": [],
-                                "completed": [],
-                                "closed": [],
-                            },
-                        )
-                    )
-
-            # 4. Automatic semantic invariants (e.g. paid claims must have payment > 0; denied must have 0)
-            amount_cols = [
-                f_name for f_name in schema_fields
-                if not f_name.startswith("__") and (
-                    f_name.lower() in ("amount", "payment_amount", "paid_amount", "total_amount", "claim_amount")
-                    or f_name.lower().endswith(("_amount", "_total", "_paid"))
-                )
-            ]
-            for s_col in status_cols:
-                for a_col in amount_cols:
-                    pos_rule = f"auto_{table_name.lower()}_paid_positive_{a_col.lower()}"
-                    if pos_rule not in existing_names and table_name not in existing_invariants:
-                        inferred.append(
-                            ScenarioCheck(
-                                name=pos_rule,
-                                kind="semantic_invariant",
-                                table=table_name,
-                                condition=f"{s_col} == 'paid' or {s_col} == 'approved'",
-                                assertion=f"{a_col} > 0",
-                            )
-                        )
-                    if "pay" in a_col.lower() or a_col.lower() in ("amount", "paid_amount"):
-                        zero_rule = f"auto_{table_name.lower()}_denied_zero_{a_col.lower()}"
-                        if zero_rule not in existing_names and table_name not in existing_invariants:
-                            inferred.append(
-                                ScenarioCheck(
-                                    name=zero_rule,
-                                    kind="semantic_invariant",
-                                    table=table_name,
-                                    condition=f"{s_col} == 'denied' or {s_col} == 'rejected'",
-                                    assertion=f"{a_col} == 0",
-                                )
-                            )
-
-        # 5. Automatic cross-table absence for rejected/denied workflow steps
-        table_names = list(target_schemas.keys())
-        payment_tables = [t for t in table_names if "payment" in t.lower() or "settlement" in t.lower()]
-        claim_tables = [t for t in table_names if "claim" in t.lower() or "order" in t.lower() or "visit" in t.lower()]
-        for c_tbl in claim_tables:
-            c_schema = schemas.get(c_tbl, {})
-            if isinstance(c_schema, dict):
-                c_status_cols = [f for f in c_schema if f.lower() in ("status", "claim_status", "order_status")]
-                for p_tbl in payment_tables:
-                    if c_tbl != p_tbl and c_status_cols:
-                        s_col = c_status_cols[0]
-                        rule_name = f"auto_no_{p_tbl.lower()}_for_denied_{c_tbl.lower()}"
-                        if rule_name not in existing_names:
-                            inferred.append(
-                                ScenarioCheck(
-                                    name=rule_name,
-                                    kind="absence_by_value",
-                                    source=f"{c_tbl}.{s_col}",
-                                    value="denied",
-                                    absent_table=p_tbl,
-                                )
-                            )
-
         return inferred
 
     @classmethod
@@ -778,11 +834,40 @@ class ScenarioEngine:
                                                 "error": f"Temporal violation: '{col_a}' ({row.get(col_a)}) must be {op_str} '{col_b}' ({row.get(col_b)}).",
                                             })
                                             break
+                            if instance_field in df:
+                                for inst_id, group in df.groupby(instance_field, sort=False):
+                                    if len(group) > 1:
+                                        for i in range(len(resolved_chain) - 1):
+                                            (_, col_a), (_, col_b) = resolved_chain[i], resolved_chain[i + 1]
+                                            a_vals: List[pd.Timestamp] = []
+                                            for raw_a in group[col_a]:
+                                                ts_a = pd.to_datetime(raw_a, errors="coerce", utc=True)
+                                                if pd.notna(ts_a) and isinstance(ts_a, pd.Timestamp):
+                                                    a_vals.append(ts_a)
+
+                                            b_vals: List[pd.Timestamp] = []
+                                            for raw_b in group[col_b]:
+                                                ts_b = pd.to_datetime(raw_b, errors="coerce", utc=True)
+                                                if pd.notna(ts_b) and isinstance(ts_b, pd.Timestamp):
+                                                    b_vals.append(ts_b)
+                                            if a_vals and b_vals:
+                                                earlier_max = max(a_vals)
+                                                later_min = min(b_vals)
+                                                is_violation = (earlier_max > later_min) if not check.strict else (earlier_max >= later_min)
+                                                if is_violation:
+                                                    op_str = "<" if check.strict else "<="
+                                                    violations_list.append({
+                                                        "table": tbl,
+                                                        "row": inst_id,
+                                                        "rule": check.name,
+                                                        "error": f"Temporal chain violation: '{col_a}' ({earlier_max.isoformat()}) must be {op_str} '{col_b}' ({later_min.isoformat()}).",
+                                                    })
+                                                    break
                         else:
-                            instance_timestamps: Dict[Any, Dict[str, pd.Timestamp]] = {}
+                            instance_timestamps: Dict[Any, Dict[str, Dict[str, pd.Timestamp]]] = {}
                             for t_name, f_name in resolved_chain:
-                                df = tables[t_name]
-                                if instance_field not in df:
+                                df = tables.get(t_name)
+                                if df is None or instance_field not in df:
                                     continue
                                 for _, row in df.iterrows():
                                     inst_id = row[instance_field]
@@ -790,24 +875,29 @@ class ScenarioEngine:
                                     if pd.notna(ts) and isinstance(ts, pd.Timestamp):
                                         ref_key = f"{t_name}.{f_name}"
                                         inst_dict = instance_timestamps.setdefault(inst_id, {})
-                                        if ref_key not in inst_dict or ts < inst_dict[ref_key]:
-                                            inst_dict[ref_key] = ts
+                                        if ref_key not in inst_dict:
+                                            inst_dict[ref_key] = {"min": ts, "max": ts}
+                                        else:
+                                            if ts < inst_dict[ref_key]["min"]:
+                                                inst_dict[ref_key]["min"] = ts
+                                            if ts > inst_dict[ref_key]["max"]:
+                                                inst_dict[ref_key]["max"] = ts
 
                             for inst_id, ts_map in instance_timestamps.items():
                                 for i in range(len(resolved_chain) - 1):
                                     ref_a = f"{resolved_chain[i][0]}.{resolved_chain[i][1]}"
                                     ref_b = f"{resolved_chain[i+1][0]}.{resolved_chain[i+1][1]}"
                                     if ref_a in ts_map and ref_b in ts_map:
-                                        val_a = ts_map[ref_a]
-                                        val_b = ts_map[ref_b]
-                                        is_violation = (val_a > val_b) if not check.strict else (val_a >= val_b)
+                                        earlier_max = ts_map[ref_a]["max"]
+                                        later_min = ts_map[ref_b]["min"]
+                                        is_violation = (earlier_max > later_min) if not check.strict else (earlier_max >= later_min)
                                         if is_violation:
                                             op_str = "<" if check.strict else "<="
                                             violations_list.append({
                                                 "table": resolved_chain[i+1][0],
                                                 "row": inst_id,
                                                 "rule": check.name,
-                                                "error": f"Temporal chain violation: '{ref_a}' ({val_a.isoformat()}) must be {op_str} '{ref_b}' ({val_b.isoformat()}).",
+                                                "error": f"Temporal chain violation: '{ref_a}' ({earlier_max.isoformat()}) must be {op_str} '{ref_b}' ({later_min.isoformat()}).",
                                             })
                                             break
                 else:
@@ -1003,28 +1093,41 @@ class ScenarioEngine:
                         row_dict["row"] = row_dict
                         row_dict["record"] = row_dict
 
-                        def _eval_safe(expr: str, scope: Dict[str, Any]) -> bool:
-                            try:
-                                builtins_dict = {
-                                    "abs": abs,
-                                    "min": min,
-                                    "max": max,
-                                    "len": len,
-                                    "str": str,
-                                    "int": int,
-                                    "float": float,
-                                    "bool": bool,
-                                    "is_none": lambda x: x is None or pd.isna(x),
-                                }
-                                val = eval(expr, {"__builtins__": builtins_dict}, scope)
-                                if pd.isna(val):
-                                    return False
-                                return bool(val)
-                            except Exception:
-                                return False
+                        # Provide table-level scoping for prefixes like Claim.status or Claim['status']
+                        if table_name:
+                            row_dict[table_name] = {
+                                col: row_dict.get(col)
+                                for col in df.columns
+                                if col in row_dict
+                            }
+                            row_dict[table_name.lower()] = row_dict[table_name]
+
+                        for other_name, other_df in tables.items():
+                            if other_name != table_name:
+                                other_scope = {}
+                                for c in other_df.columns:
+                                    suffixed = f"{c}_{other_name}"
+                                    if suffixed in row_dict:
+                                        other_scope[c] = row_dict[suffixed]
+                                    elif c in row_dict:
+                                        other_scope[c] = row_dict[c]
+                                row_dict[other_name] = other_scope
+                                row_dict[other_name.lower()] = other_scope
+
+                        evaluator = _RestrictedExpressionEvaluator(row_dict, table_name=table_name)
 
                         if check.expression:
-                            if not _eval_safe(check.expression, row_dict):
+                            try:
+                                passed = bool(evaluator.eval(check.expression))
+                            except Exception as e:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": row_id,
+                                    "rule": check.name,
+                                    "error": f"Failed to evaluate semantic invariant '{check.expression}': {e}",
+                                })
+                                continue
+                            if not passed:
                                 violations_list.append({
                                     "table": table_name,
                                     "row": row_id,
@@ -1032,8 +1135,29 @@ class ScenarioEngine:
                                     "error": f"Semantic invariant '{check.expression}' failed for row data.",
                                 })
                         elif check.condition and check.assertion:
-                            if _eval_safe(check.condition, row_dict):
-                                if not _eval_safe(check.assertion, row_dict):
+                            try:
+                                cond_met = bool(evaluator.eval(check.condition))
+                            except Exception as e:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": row_id,
+                                    "rule": check.name,
+                                    "error": f"Failed to evaluate semantic condition '{check.condition}': {e}",
+                                })
+                                continue
+
+                            if cond_met:
+                                try:
+                                    assert_met = bool(evaluator.eval(check.assertion))
+                                except Exception as e:
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": row_id,
+                                        "rule": check.name,
+                                        "error": f"Failed to evaluate semantic assertion '{check.assertion}': {e}",
+                                    })
+                                    continue
+                                if not assert_met:
                                     violations_list.append({
                                         "table": table_name,
                                         "row": row_id,
@@ -1061,22 +1185,21 @@ class ScenarioEngine:
                             row_dict[col_str] = None if pd.isna(v) else v
                         row_dict["row"] = row_dict
                         row_dict["record"] = row_dict
+                        if table_name:
+                            row_dict[table_name] = {k: v for k, v in row_dict.items() if k not in ("row", "record")}
+                            row_dict[table_name.lower()] = row_dict[table_name]
 
+                        evaluator = _RestrictedExpressionEvaluator(row_dict, table_name=table_name)
                         try:
-                            builtins_dict = {
-                                "abs": abs,
-                                "min": min,
-                                "max": max,
-                                "len": len,
-                                "str": str,
-                                "int": int,
-                                "float": float,
-                                "bool": bool,
-                                "is_none": lambda x: x is None or pd.isna(x),
-                            }
-                            passed = bool(eval(check.expression, {"__builtins__": builtins_dict}, row_dict))
-                        except Exception:
-                            passed = False
+                            passed = bool(evaluator.eval(check.expression))
+                        except Exception as e:
+                            violations_list.append({
+                                "table": table_name,
+                                "row": row_id,
+                                "rule": check.name,
+                                "error": f"Failed to evaluate custom rule '{check.expression}': {e}",
+                            })
+                            continue
                         if not passed:
                             violations_list.append({
                                 "table": table_name,
