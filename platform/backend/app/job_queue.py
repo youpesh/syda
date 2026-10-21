@@ -95,10 +95,19 @@ def update_attempt(job_id, token, updates):
 
 
 def retryable(error):
-    code = getattr(error, "status_code", None)
-    return isinstance(error, (ConnectionError, TimeoutError, httpx.TimeoutException, httpx.TransportError)) or code == 429 or (
-        isinstance(code, int) and 500 <= code < 600
-    )
+    # Provider SDKs commonly wrap the underlying HTTP timeout/transport error.
+    seen = set()
+    for _ in range(5):
+        if error is None or id(error) in seen:
+            return False
+        seen.add(id(error))
+        code = getattr(error, "status_code", None)
+        if isinstance(error, (ConnectionError, TimeoutError, httpx.TimeoutException, httpx.TransportError)) or code == 429 or (
+            isinstance(code, int) and 500 <= code < 600
+        ):
+            return True
+        error = error.__cause__
+    return False
 
 
 def fail_attempt(job_id, token, error):

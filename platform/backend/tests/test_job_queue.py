@@ -176,3 +176,18 @@ def test_missing_saved_key_fails_instead_of_changing_provider(queue_db, monkeypa
     job_runner.execute_job(job_id)
     with queue_db() as db:
         assert db.get(JobRecord,job_id).status=='failed'
+
+
+def test_provider_timeout_wrapped_by_sdk_is_retryable():
+    error=RuntimeError('provider wrapper')
+    error.__cause__=TimeoutError('network timeout')
+    assert job_queue.retryable(error)
+    assert not job_queue.retryable(SimpleNamespace(status_code=401, __cause__=None))
+
+
+def test_concurrent_deliveries_only_claim_one_attempt(queue_db):
+    from concurrent.futures import ThreadPoolExecutor
+    job_id=add_job(queue_db)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims=list(pool.map(job_queue.claim_job,[job_id,job_id]))
+    assert sum(value is not None for value in claims)==1
