@@ -76,6 +76,20 @@ def init_db():
         if "scenario_id" not in job_columns:
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE generation_jobs ADD COLUMN scenario_id VARCHAR(36)"))
+        # Additive migration for existing installations. Only API startup migrates;
+        # workers and dispatcher start after its health check succeeds.
+        queue_columns = {
+            "provider_snapshot": "JSON", "attempt_token": "VARCHAR(36)",
+            "output_attempt": "VARCHAR(36)", "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "heartbeat_at": "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME",
+            "next_dispatch_at": "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME",
+            "retry_at": "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME",
+        }
+        columns = {column["name"] for column in inspect(engine).get_columns("generation_jobs")}
+        with engine.begin() as connection:
+            for name, definition in queue_columns.items():
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE generation_jobs ADD COLUMN {name} {definition}"))
         conversation_columns = {column["name"] for column in inspect(engine).get_columns("chat_conversations")}
         with engine.begin() as connection:
             if "scenario_draft" not in conversation_columns:
@@ -110,17 +124,7 @@ def init_db():
                         "Found %s legacy shared records with multiple accounts; left unassigned to avoid exposing them to the wrong user.",
                         unowned,
                     )
-        # Generation currently runs inside the API process. An unfinished job
-        # cannot resume after restart, so persist its interrupted state.
-        with SessionLocal() as session:
-            interrupted = session.query(JobRecord).filter(JobRecord.status.in_(["generating", "validating", "evaluating"])).update({
-                JobRecord.status: "failed",
-                JobRecord.current_stage: "Interrupted by backend restart.",
-                JobRecord.updated_at: datetime.now(timezone.utc),
-            }, synchronize_session=False)
-            session.commit()
-            if interrupted:
-                logger.warning("Marked %s interrupted generation jobs as failed", interrupted)
+        # Worker heartbeats, not API restarts, determine whether a job was interrupted.
         logger.info("Database schema initialized successfully.")
     except Exception as e:
         logger.error(f"Error initializing database schema: {e}")
