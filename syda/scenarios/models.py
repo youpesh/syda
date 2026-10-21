@@ -546,7 +546,18 @@ class ScenarioDefinition(BaseModel):
                     absent_tables.add(tbl)
                     changed = True
 
-        absent_steps = [s for s in all_steps if s not in absent_tables]
+        table_to_step: Dict[str, str] = {}
+        for step in self.steps:
+            table_to_step[step.table] = step.name
+            table_to_step[step.table.lower()] = step.name
+            table_to_step[step.name] = step.name
+            table_to_step[step.name.lower()] = step.name
+
+        absent_step_names = {
+            table_to_step.get(tbl, table_to_step.get(tbl.lower(), tbl))
+            for tbl in absent_tables
+        }
+        absent_steps = [s for s in all_steps if s not in absent_step_names]
         if not absent_steps:
             absent_steps = all_steps[:1]
 
@@ -556,16 +567,22 @@ class ScenarioDefinition(BaseModel):
         for c in absence_checks:
             if c.source and "." in c.source and c.value:
                 src_tbl, src_col = c.source.split(".", 1)
-                absent_overrides.setdefault(src_tbl, {})[src_col] = c.value
+                src_step = table_to_step.get(src_tbl, table_to_step.get(src_tbl.lower(), src_tbl))
+                absent_overrides.setdefault(src_step, {})[src_col] = c.value
                 normal_val = None
                 for other_check in self.checks:
-                    if other_check.kind == "allowed_values" and other_check.table == src_tbl and other_check.field == src_col:
+                    tbl_match = (
+                        other_check.table == src_tbl
+                        or other_check.table == src_step
+                        or (other_check.table and other_check.table.lower() == src_tbl.lower())
+                    )
+                    if other_check.kind == "allowed_values" and tbl_match and other_check.field == src_col:
                         candidates = [v for v in (other_check.values or []) if v != c.value]
                         if candidates:
                             normal_val = candidates[0]
                 if normal_val is None:
                     normal_val = "approved" if c.value in ("denied", "rejected", "cancelled") else "completed"
-                normal_overrides.setdefault(src_tbl, {})[src_col] = normal_val
+                normal_overrides.setdefault(src_step, {})[src_col] = normal_val
 
         path_name = absence_checks[0].value or "rejected"
         return [

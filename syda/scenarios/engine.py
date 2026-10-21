@@ -23,6 +23,7 @@ from typing import (
 )
 
 import ast
+import re
 import pandas as pd
 
 from ..output import save_dataframes
@@ -118,10 +119,13 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
             if tbl in self.scope and isinstance(self.scope[tbl], (dict, Mapping)):
                 if col in self.scope[tbl]:
                     return self.scope[tbl][col]
+            if tbl.lower() in self.scope and isinstance(self.scope[tbl.lower()], (dict, Mapping)):
+                if col in self.scope[tbl.lower()]:
+                    return self.scope[tbl.lower()][col]
             if self.table_name and tbl.lower() == self.table_name.lower():
                 if col in self.scope:
                     return self.scope[col]
-            for candidate in (f"{col}_{tbl}", f"{tbl}_{col}"):
+            for candidate in (f"{col}_{tbl}", f"{tbl}_{col}", f"{col}_{tbl.lower()}", f"{tbl.lower()}_{col}"):
                 if candidate in self.scope:
                     return self.scope[candidate]
 
@@ -245,6 +249,18 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
         if val is None:
             return None
         return val[slice_val]
+
+    def visit_List(self, node: ast.List) -> List[Any]:
+        return [self.visit(elt) for elt in node.elts]
+
+    def visit_Tuple(self, node: ast.Tuple) -> Tuple[Any, ...]:
+        return tuple(self.visit(elt) for elt in node.elts)
+
+    def visit_Set(self, node: ast.Set) -> Set[Any]:
+        return {self.visit(elt) for elt in node.elts}
+
+    def visit_Dict(self, node: ast.Dict) -> Dict[Any, Any]:
+        return {self.visit(k): self.visit(v) for k, v in zip(node.keys, node.values) if k is not None}
 
     def generic_visit(self, node: ast.AST) -> Any:
         raise ValueError(f"Disallowed expression syntax in rule: {type(node).__name__}")
@@ -990,6 +1006,10 @@ class ScenarioEngine:
                     all_states = set(transitions.keys())
                     for targets in transitions.values():
                         all_states.update(targets)
+                    if check.initial_states:
+                        all_states.update(check.initial_states)
+                    if check.terminal_states:
+                        all_states.update(check.terminal_states)
 
                     if check.previous_field and check.previous_field in df:
                         for idx, row in df.iterrows():
@@ -1013,14 +1033,32 @@ class ScenarioEngine:
                             states: List[str] = [str(s) for s in group[check.field].dropna().tolist()]
                             if not states:
                                 continue
-                            if len(states) > 1:
-                                if check.initial_states and states[0] not in check.initial_states:
+
+                            if check.initial_states and states[0] not in check.initial_states:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": inst_id,
+                                    "rule": check.name,
+                                    "error": f"Initial state '{states[0]}' not in allowed initial states: {check.initial_states}.",
+                                })
+                            if check.terminal_states and states[-1] not in check.terminal_states:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": inst_id,
+                                    "rule": check.name,
+                                    "error": f"Terminal state '{states[-1]}' not in allowed terminal states: {check.terminal_states}.",
+                                })
+
+                            for s in states:
+                                if s not in all_states:
                                     violations_list.append({
                                         "table": table_name,
                                         "row": inst_id,
                                         "rule": check.name,
-                                        "error": f"Initial state '{states[0]}' not in allowed initial states: {check.initial_states}.",
+                                        "error": f"Unknown state '{s}' not part of declared state machine.",
                                     })
+
+                            if len(states) > 1:
                                 for i in range(len(states) - 1):
                                     curr_s = states[i]
                                     next_s = states[i + 1]
@@ -1032,15 +1070,6 @@ class ScenarioEngine:
                                             "rule": check.name,
                                             "error": f"Illegal transition sequence from '{curr_s}' to '{next_s}'. Allowed: {allowed}.",
                                         })
-                            else:
-                                curr_s = states[0]
-                                if curr_s not in all_states:
-                                    violations_list.append({
-                                        "table": table_name,
-                                        "row": inst_id,
-                                        "rule": check.name,
-                                        "error": f"Unknown state '{curr_s}' not part of declared state machine.",
-                                    })
                     else:
                         for idx, row in df.iterrows():
                             val = row.get(check.field)
@@ -1055,6 +1084,11 @@ class ScenarioEngine:
             # 5. SEMANTIC INVARIANT
             elif check.kind == "semantic_invariant":
                 table_name = check.table or ""
+                if table_name not in tables:
+                    for t in tables:
+                        if t.lower() == table_name.lower():
+                            table_name = t
+                            break
                 df = tables.get(table_name)
                 if df is None:
                     if not is_auto:
@@ -1067,22 +1101,32 @@ class ScenarioEngine:
                 else:
                     eval_df = df.copy()
                     expr_text = f"{check.condition or ''} {check.assertion or ''} {check.expression or ''}"
-                    import re
                     cleaned_expr = re.sub(r"'[^']*'|\"[^\"]*\"", "", expr_text)
                     words = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", cleaned_expr)) - {
                         "or", "and", "not", "True", "False", "None", "abs", "min", "max", "len", "str", "int", "float", "bool", "is_none"
                     }
                     if is_auto and not words.issubset(set(eval_df.columns)):
                         continue
+
+                    joined_tables: Set[str] = set()
                     for other_name, other_df in tables.items():
-                        if other_name != table_name and instance_field in eval_df and instance_field in other_df:
-                            if other_name in expr_text or any(col in expr_text for col in other_df.columns if col not in eval_df.columns):
+                        if other_name.lower() != table_name.lower() and instance_field in eval_df and instance_field in other_df:
+                            is_referenced = bool(
+                                re.search(rf"\b{re.escape(other_name)}\b", cleaned_expr, re.IGNORECASE)
+                                or any(
+                                    re.search(rf"\b{re.escape(col)}\b", cleaned_expr)
+                                    for col in other_df.columns
+                                    if col not in df.columns
+                                )
+                            )
+                            if is_referenced:
                                 eval_df = eval_df.merge(
                                     other_df,
                                     on=instance_field,
                                     how="left",
                                     suffixes=("", f"_{other_name}"),
                                 )
+                                joined_tables.add(other_name)
 
                     for idx, row in eval_df.iterrows():
                         row_id = row.get(instance_field, idx)
@@ -1095,22 +1139,29 @@ class ScenarioEngine:
 
                         # Provide table-level scoping for prefixes like Claim.status or Claim['status']
                         if table_name:
-                            row_dict[table_name] = {
+                            primary_scope = {
                                 col: row_dict.get(col)
                                 for col in df.columns
                                 if col in row_dict
                             }
-                            row_dict[table_name.lower()] = row_dict[table_name]
+                            row_dict[table_name] = primary_scope
+                            row_dict[table_name.lower()] = primary_scope
 
                         for other_name, other_df in tables.items():
-                            if other_name != table_name:
+                            if other_name.lower() != table_name.lower():
                                 other_scope = {}
-                                for c in other_df.columns:
-                                    suffixed = f"{c}_{other_name}"
-                                    if suffixed in row_dict:
-                                        other_scope[c] = row_dict[suffixed]
-                                    elif c in row_dict:
-                                        other_scope[c] = row_dict[c]
+                                if other_name in joined_tables:
+                                    for c in other_df.columns:
+                                        suffixed = f"{c}_{other_name}"
+                                        if suffixed in row_dict:
+                                            other_scope[c] = row_dict[suffixed]
+                                        elif c not in df.columns and c in row_dict:
+                                            other_scope[c] = row_dict[c]
+                                        else:
+                                            other_scope[c] = None
+                                else:
+                                    for c in other_df.columns:
+                                        other_scope[c] = None
                                 row_dict[other_name] = other_scope
                                 row_dict[other_name.lower()] = other_scope
 
@@ -1168,6 +1219,11 @@ class ScenarioEngine:
             # 6. CUSTOM RULE
             elif check.kind == "custom_rule":
                 table_name = check.table or ""
+                if table_name not in tables:
+                    for t in tables:
+                        if t.lower() == table_name.lower():
+                            table_name = t
+                            break
                 df = tables.get(table_name)
                 if df is None:
                     violations_list.append({
@@ -1177,7 +1233,29 @@ class ScenarioEngine:
                         "error": f"Table '{table_name}' is missing for custom rule check.",
                     })
                 elif check.expression:
-                    for idx, row in df.iterrows():
+                    eval_df = df.copy()
+                    cleaned_expr = re.sub(r"'[^']*'|\"[^\"]*\"", "", check.expression)
+                    joined_tables = set()
+                    for other_name, other_df in tables.items():
+                        if other_name.lower() != table_name.lower() and instance_field in eval_df and instance_field in other_df:
+                            is_referenced = bool(
+                                re.search(rf"\b{re.escape(other_name)}\b", cleaned_expr, re.IGNORECASE)
+                                or any(
+                                    re.search(rf"\b{re.escape(col)}\b", cleaned_expr)
+                                    for col in other_df.columns
+                                    if col not in df.columns
+                                )
+                            )
+                            if is_referenced:
+                                eval_df = eval_df.merge(
+                                    other_df,
+                                    on=instance_field,
+                                    how="left",
+                                    suffixes=("", f"_{other_name}"),
+                                )
+                                joined_tables.add(other_name)
+
+                    for idx, row in eval_df.iterrows():
                         row_id = row.get(instance_field, idx)
                         row_dict = {}
                         for k, v in row.items():
@@ -1186,8 +1264,31 @@ class ScenarioEngine:
                         row_dict["row"] = row_dict
                         row_dict["record"] = row_dict
                         if table_name:
-                            row_dict[table_name] = {k: v for k, v in row_dict.items() if k not in ("row", "record")}
-                            row_dict[table_name.lower()] = row_dict[table_name]
+                            primary_scope = {
+                                col: row_dict.get(col)
+                                for col in df.columns
+                                if col in row_dict
+                            }
+                            row_dict[table_name] = primary_scope
+                            row_dict[table_name.lower()] = primary_scope
+
+                        for other_name, other_df in tables.items():
+                            if other_name.lower() != table_name.lower():
+                                other_scope = {}
+                                if other_name in joined_tables:
+                                    for c in other_df.columns:
+                                        suffixed = f"{c}_{other_name}"
+                                        if suffixed in row_dict:
+                                            other_scope[c] = row_dict[suffixed]
+                                        elif c not in df.columns and c in row_dict:
+                                            other_scope[c] = row_dict[c]
+                                        else:
+                                            other_scope[c] = None
+                                else:
+                                    for c in other_df.columns:
+                                        other_scope[c] = None
+                                row_dict[other_name] = other_scope
+                                row_dict[other_name.lower()] = other_scope
 
                         evaluator = _RestrictedExpressionEvaluator(row_dict, table_name=table_name)
                         try:

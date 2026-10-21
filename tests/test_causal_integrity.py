@@ -611,4 +611,223 @@ def test_invalid_semantic_condition_fails_validation_and_resolves_table_prefix()
     assert "Failed to evaluate semantic condition" in violations[0].error
 
 
+def test_restricted_evaluator_supports_literal_collections():
+    """Verify that restricted evaluator supports safe list, tuple, and set literals for membership checks."""
+    schemas = _base_schemas()
+    definition = ScenarioDefinition(
+        name="LiteralCollectionsTest",
+        schemas=schemas,
+        steps=[ScenarioStep(name="Claim", table="Claim")],
+        checks=[
+            ScenarioCheck(
+                name="list_membership_check",
+                kind="semantic_invariant",
+                table="Claim",
+                condition="status in ['submitted', 'paid']",
+                assertion="status not in ('denied', 'cancelled')",
+            ),
+        ],
+    )
+
+    # Valid paid row: status in ['submitted', 'paid'] is True, not in ('denied', 'cancelled') is True.
+    valid_df = pd.DataFrame([
+        {"scenario_instance_id": "c1", "status": "paid", "payment_amount": 100.0},
+    ])
+    results, violations = ScenarioEngine.validate_causal_workflow(definition, {"Claim": valid_df})
+    assert len(violations) == 0
+
+    # Invalid row: status is 'denied', so not in ('denied', 'cancelled') is False.
+    # Note: if condition matches, assertion fails.
+    definition_fail = ScenarioDefinition(
+        name="LiteralCollectionsFailTest",
+        schemas=schemas,
+        steps=[ScenarioStep(name="Claim", table="Claim")],
+        checks=[
+            ScenarioCheck(
+                name="set_membership_check",
+                kind="semantic_invariant",
+                table="Claim",
+                condition="status in {'submitted', 'paid'}",
+                assertion="status in {'submitted'}",
+            ),
+        ],
+    )
+    results2, violations2 = ScenarioEngine.validate_causal_workflow(definition_fail, {"Claim": valid_df})
+    assert len(violations2) == 1
+    assert violations2[0].rule == "set_membership_check"
+
+
+def test_state_machine_enforces_terminal_states_on_multistep_history():
+    """Verify that terminal_states is enforced: submitted -> approved flags a violation when required terminal state is paid."""
+    schemas = _base_schemas()
+    definition = ScenarioDefinition(
+        name="TerminalStateTest",
+        schemas=schemas,
+        steps=[ScenarioStep(name="ClaimStatusHistory", table="ClaimStatusHistory")],
+        checks=[
+            ScenarioCheck(
+                name="claim_status_lifecycle",
+                kind="state_machine",
+                table="ClaimStatusHistory",
+                field="status",
+                order_by="timestamp",
+                initial_states=["submitted"],
+                terminal_states=["paid"],
+                transitions={
+                    "submitted": ["approved", "denied"],
+                    "approved": ["paid"],
+                    "denied": [],
+                    "paid": [],
+                },
+            )
+        ],
+    )
+
+    # Instance 1: submitted -> approved (ends at approved, but required terminal is paid!)
+    history_df = pd.DataFrame([
+        {"scenario_instance_id": "inst-1", "history_id": 1, "claim_id": 101, "status": "submitted", "timestamp": "2026-01-01"},
+        {"scenario_instance_id": "inst-1", "history_id": 2, "claim_id": 101, "status": "approved", "timestamp": "2026-01-05"},
+    ])
+    results, violations = ScenarioEngine.validate_causal_workflow(definition, {"ClaimStatusHistory": history_df})
+    assert len(violations) == 1
+    assert "Terminal state 'approved' not in allowed terminal states" in violations[0].error
+
+
+def test_state_machine_enforces_initial_states_on_single_row_history():
+    """Verify that initial_states is enforced for single-row histories: single approved row flags violation when required initial is submitted."""
+    schemas = _base_schemas()
+    definition = ScenarioDefinition(
+        name="SingleRowInitialStateTest",
+        schemas=schemas,
+        steps=[ScenarioStep(name="ClaimStatusHistory", table="ClaimStatusHistory")],
+        checks=[
+            ScenarioCheck(
+                name="claim_status_lifecycle",
+                kind="state_machine",
+                table="ClaimStatusHistory",
+                field="status",
+                initial_states=["submitted"],
+                terminal_states=["paid", "cancelled"],
+                transitions={
+                    "submitted": ["approved", "denied", "cancelled"],
+                    "approved": ["paid"],
+                },
+            )
+        ],
+    )
+
+    # Single row with status 'approved'
+    history_df = pd.DataFrame([
+        {"scenario_instance_id": "inst-1", "history_id": 1, "claim_id": 101, "status": "approved"},
+    ])
+    results, violations = ScenarioEngine.validate_causal_workflow(definition, {"ClaimStatusHistory": history_df})
+    assert len(violations) >= 1
+    assert any("Initial state 'approved' not in allowed initial states" in v.error for v in violations)
+
+
+def test_infer_paths_maps_table_names_to_step_names():
+    """Verify that resolved_paths maps table names to step names when steps are named place_order/ship_order."""
+    schemas = {
+        "Order": {
+            "order_id": {"type": "integer", "constraints": {"primary_key": True}},
+            "customer_id": "text",
+            "status": {"type": "text", "constraints": {"enum": ["completed", "cancelled"]}},
+        },
+        "Shipment": {
+            "shipment_id": {"type": "integer", "constraints": {"primary_key": True}},
+            "order_id": "integer",
+            "__foreign_keys__": {"order_id": ("Order", "order_id")},
+        },
+    }
+    definition = ScenarioDefinition(
+        name="OrderFulfillmentWorkflow",
+        schemas=schemas,
+        steps=[
+            ScenarioStep(name="place_order", table="Order"),
+            ScenarioStep(name="ship_order", table="Shipment"),
+        ],
+        checks=[
+            ScenarioCheck(
+                name="order_status_allowed",
+                kind="allowed_values",
+                table="Order",
+                field="status",
+                values=["completed", "cancelled"],
+            ),
+            ScenarioCheck(
+                name="cancelled_order_prohibits_shipment",
+                kind="absence_by_value",
+                source="Order.status",
+                value="cancelled",
+                absent_table="Shipment",
+            ),
+        ],
+    )
+
+    paths = definition.resolved_paths()
+    path_map = {p.name: p for p in paths}
+    assert "approved" in path_map
+    assert "cancelled" in path_map
+
+    cancelled_path = path_map["cancelled"]
+    # The cancelled path MUST exclude ship_order (the step for Shipment)!
+    assert cancelled_path.steps == ["place_order"]
+    # Overrides MUST be keyed by the step name 'place_order', NOT table name 'Order'!
+    assert "place_order" in cancelled_path.overrides
+    assert cancelled_path.overrides["place_order"] == {"status": "cancelled"}
+
+    approved_path = path_map["approved"]
+    assert approved_path.steps == ["place_order", "ship_order"]
+    assert "place_order" in approved_path.overrides
+    assert approved_path.overrides["place_order"] == {"status": "completed"}
+
+
+def test_semantic_invariant_resolves_table_case_insensitively_without_fallback():
+    """Verify that lowercase table reference 'payment.amount <= claim.amount' merges Payment and reports violation when Claim.amount=100 and Payment.amount=200."""
+    schemas = {
+        "Claim": {
+            "claim_id": {"type": "integer", "constraints": {"primary_key": True}},
+            "amount": "float",
+        },
+        "Payment": {
+            "payment_id": {"type": "integer", "constraints": {"primary_key": True}},
+            "amount": "float",
+        },
+    }
+    definition = ScenarioDefinition(
+        name="CrossTableAmountCheck",
+        schemas=schemas,
+        steps=[
+            ScenarioStep(name="Claim", table="Claim"),
+            ScenarioStep(name="Payment", table="Payment"),
+        ],
+        checks=[
+            ScenarioCheck(
+                name="payment_lte_claim",
+                kind="semantic_invariant",
+                table="Claim",
+                expression="payment.amount <= claim.amount",
+            ),
+        ],
+    )
+
+    claim_df = pd.DataFrame([
+        {"scenario_instance_id": "inst-1", "claim_id": 1, "amount": 100.0},
+    ])
+    # Payment amount is 200.0, which violates payment.amount <= claim.amount (200 <= 100 is False)
+    payment_df = pd.DataFrame([
+        {"scenario_instance_id": "inst-1", "payment_id": 101, "amount": 200.0},
+    ])
+
+    results, violations = ScenarioEngine.validate_causal_workflow(
+        definition,
+        {"Claim": claim_df, "Payment": payment_df},
+    )
+
+    # Must report 1 violation because 200 > 100
+    assert len(violations) == 1
+    assert violations[0].rule == "payment_lte_claim"
+    assert "payment.amount <= claim.amount" in violations[0].error
+
+
 
