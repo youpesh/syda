@@ -1,0 +1,51 @@
+name: Generation queue
+on:
+  pull_request:
+    paths:
+      - 'platform/backend/**'
+      - 'syda/**'
+      - 'platform/docker-compose.yml'
+      - '.github/workflows/generation-queue.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: syda_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/syda_test
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      PYTHONPATH: platform/backend:.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: uv sync --project platform/backend --extra test
+      - name: Dependency lock changes
+        run: git diff -- platform/backend/uv.lock
+      - name: Backend and scenario tests
+        run: uv run --project platform/backend pytest platform/backend/tests tests/test_scenarios.py
+      - name: Real Redis and Celery delivery
+        env:
+          SYDA_QUEUE_INTEGRATION: '1'
+        run: uv run --project platform/backend pytest platform/backend/tests/test_celery_transport.py -v
