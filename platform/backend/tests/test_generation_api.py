@@ -3,6 +3,7 @@ import io
 import uuid
 import zipfile
 
+import pandas as pd
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import create_engine
@@ -104,6 +105,18 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
             if metric["key"] == "declared_rules"
         )
         assert declared_rules["status"] == "not_evaluated"
+        privacy = next(
+            metric for metric in stats["evaluationMetrics"]
+            if metric["key"] == "privacy_leakage"
+        )
+        assert privacy == {
+            "key": "privacy_leakage",
+            "label": "Privacy leakage risk",
+            "status": "not_evaluated",
+            "value": "No quasi-identifiers detected",
+            "detail": "No populated table contains a recognized quasi-identifier column.",
+            "violations": 0,
+        }
 
         download = client.get(result["downloadUrl"])
         assert download.status_code == 200
@@ -137,6 +150,81 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
         assert html_report.status_code == 200
         assert "Syda evaluation report" in html_report.text
+
+
+def test_privacy_leakage_passes_when_every_equivalence_class_has_three_records():
+    records = pd.DataFrame(
+        {
+            "age": [30, 30, 30, 45, 45, 45],
+            "gender": ["F", "F", "F", "M", "M", "M"],
+            "diagnosis": ["A", "B", "C", "D", "E", "F"],
+        }
+    )
+    original = records.copy(deep=True)
+
+    metric = generation._privacy_leakage_metric({"Patient": records})
+
+    assert metric.status == "pass"
+    assert metric.value == "k=3; risk=0.0%"
+    assert metric.violations == 0
+    assert "Patient (age, gender)" in metric.detail
+    pd.testing.assert_frame_equal(records, original)
+
+
+def test_privacy_leakage_fails_and_counts_vulnerable_records():
+    records = pd.DataFrame(
+        {
+            "age": [30, 30, 30, 30, 30, 40],
+            "gender": ["F", "F", "F", "M", "M", "M"],
+        }
+    )
+
+    metric = generation._privacy_leakage_metric({"Patient": records})
+
+    assert metric.status == "fail"
+    assert metric.value == "k=1; risk=50.0%"
+    assert metric.violations == 3
+    assert "3 records are in equivalence classes smaller than 3" in metric.detail
+
+
+def test_privacy_leakage_is_not_evaluated_without_quasi_identifiers():
+    metric = generation._privacy_leakage_metric(
+        {"Claim": pd.DataFrame({"claim_id": [1, 2, 3], "status": ["paid"] * 3})}
+    )
+
+    assert metric.status == "not_evaluated"
+    assert metric.value == "No quasi-identifiers detected"
+    assert metric.violations == 0
+
+
+def test_evaluation_metrics_include_computed_privacy_result():
+    scenario = generation.ScenarioConfiguration.model_validate(
+        {
+            "title": "Privacy evaluation",
+            "description": "Evaluate a generated patient table",
+            "recordCount": 3,
+            "secondaryMetric": {"label": "Tables", "value": "1"},
+            "workflow": ["Patient"],
+            "rules": [],
+            "schemas": {"Patient": {"age": "integer", "gender": "text"}},
+        }
+    )
+    metrics, result, violations = generation._evaluation_metrics(
+        {
+            "Patient": pd.DataFrame(
+                {"age": [30, 30, 30], "gender": ["F", "F", "F"]}
+            )
+        },
+        scenario.schemas or {},
+        scenario,
+    )
+
+    privacy = next(metric for metric in metrics if metric.key == "privacy_leakage")
+    assert privacy.status == "pass"
+    assert privacy.value == "k=3; risk=0.0%"
+    assert privacy.violations == 0
+    assert result == "partial"
+    assert violations == 0
 
 
 def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):
