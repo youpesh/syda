@@ -87,6 +87,19 @@ class EvaluationMetric(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
 
+class ViolationRecord(BaseModel):
+    table: str
+    row: Any
+    rule: str
+    error: str
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        populate_by_name=True,
+        serialize_by_alias=True,
+    )
+
+
 class JobStats(BaseModel):
     causal_integrity: str = Field(alias="causalIntegrity")
     referential_integrity: str = Field(alias="referentialIntegrity")
@@ -98,6 +111,7 @@ class JobStats(BaseModel):
     path_counts: Dict[str, int] = Field(default_factory=dict, alias="pathCounts")
     evaluation_metrics: List[EvaluationMetric] = Field(default_factory=list, alias="evaluationMetrics")
     evaluation_result: Literal["pass", "fail", "partial"] = Field(default="partial", alias="evaluationResult")
+    violations: List[ViolationRecord] = Field(default_factory=list, alias="violations")
 
     model_config = ConfigDict(
         populate_by_name=True,

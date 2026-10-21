@@ -6,7 +6,7 @@ process.
 
 
 import networkx as nx
-from typing import Dict, List, Tuple, Any, Set
+from typing import Dict, List, Tuple, Any, Set, Optional
 from .custom_generators import GeneratorManager
 from .output import load_dataframe
 import pandas as pd
@@ -113,8 +113,8 @@ class ForeignKeyHandler:
         self,
         results: Dict[str, pd.DataFrame],
         extracted_foreign_keys: Dict[str, Dict[str, Tuple[str, str]]],
-        output_dir: str = None,
-        streamed_schemas: Set = None,
+        output_dir: Optional[str] = None,
+        streamed_schemas: Optional[Set] = None,
         output_format: str = "csv",
     ) -> bool:
         """

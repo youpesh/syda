@@ -14,7 +14,7 @@ import os
 import sys
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 import click
 
@@ -300,7 +300,11 @@ def cmd_generate(
     resolved_model = model or DEFAULT_MODELS.get(provider, "")
 
     # --- build ModelConfig kwargs ---
-    mc_kwargs = dict(provider=provider, model_name=resolved_model, max_tokens=max_tokens)
+    mc_kwargs: dict[str, Any] = dict(
+        provider=cast(Any, provider),
+        model_name=resolved_model,
+        max_tokens=max_tokens,
+    )
     if temperature is not None:
         mc_kwargs["temperature"] = temperature
     if batch_size is not None:
@@ -326,7 +330,7 @@ def cmd_generate(
     if extra:
         mc_kwargs["extra_kwargs"] = extra
 
-    model_config = ModelConfig(**mc_kwargs)
+    model_config = ModelConfig(**cast(Any, mc_kwargs))
 
     # --- build generator ---
     from .generate import SyntheticDataGenerator
@@ -734,7 +738,7 @@ def cmd_db_generate(
 
     try:
         results = generator.generate_for_schemas(
-            schemas=schemas,
+            schemas=cast(Any, schemas),
             prompts=prompts,
             default_sample_size=rows,
             output_dir=output_dir,
