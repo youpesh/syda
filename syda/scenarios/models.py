@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional, Set
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ._utils import (
     _ROW_KEY_FIELD,
@@ -137,6 +137,21 @@ class ScenarioCheck(BaseModel):
 
     model_config = _SCENARIO_MODEL_CONFIG
 
+    @field_validator("transitions", mode="before")
+    @classmethod
+    def normalize_transitions(cls, val: Any) -> Any:
+        if isinstance(val, dict):
+            normalized: Dict[str, List[str]] = {}
+            for k, v in val.items():
+                if isinstance(v, (list, tuple, set)):
+                    normalized[str(k)] = [str(x) for x in v]
+                elif v is not None:
+                    normalized[str(k)] = [str(v)]
+                else:
+                    normalized[str(k)] = []
+            return normalized
+        return val
+
     @model_validator(mode="after")
     def validate_check_shape(self) -> "ScenarioCheck":
         if self.kind == "allowed_values":
@@ -213,14 +228,27 @@ class ScenarioCheck(BaseModel):
             if self.absent_table not in schemas:
                 raise ValueError(f"unknown table '{self.absent_table}'")
         elif self.kind in ("state_transition", "state_machine"):
-            if self.table not in schemas:
+            real_tbl = self.table if (self.table and self.table in schemas) else next((t for t in schemas if t.lower() == (self.table or "").lower()), None)
+            if real_tbl is None:
                 raise ValueError(f"unknown table '{self.table}'")
-            if self.field not in _schema_fields(schemas[self.table]):
+            tbl_fields = _schema_fields(schemas[real_tbl])
+
+            def _find_field(name: Optional[str]) -> Optional[str]:
+                if not name:
+                    return None
+                if name in tbl_fields:
+                    return name
+                return next((f for f in tbl_fields if f.lower() == name.lower()), None)
+
+            if _find_field(self.field) is None:
                 raise ValueError(f"unknown field '{self.table}.{self.field}'")
-            if self.previous_field and self.previous_field not in _schema_fields(schemas[self.table]):
+            if self.previous_field and _find_field(self.previous_field) is None:
                 raise ValueError(f"unknown field '{self.table}.{self.previous_field}'")
+            if self.order_by and _find_field(self.order_by) is None:
+                raise ValueError(f"unknown field '{self.table}.{self.order_by}'")
         elif self.kind in ("semantic_invariant", "custom_rule"):
-            if self.table not in schemas:
+            real_tbl = self.table if (self.table and self.table in schemas) else next((t for t in schemas if t.lower() == (self.table or "").lower()), None)
+            if real_tbl is None:
                 raise ValueError(f"unknown table '{self.table}'")
 
 
@@ -565,7 +593,7 @@ class ScenarioDefinition(BaseModel):
         absent_overrides: Dict[str, Dict[str, Any]] = {}
         normal_overrides: Dict[str, Dict[str, Any]] = {}
         for c in absence_checks:
-            if c.source and "." in c.source and c.value:
+            if c.source and "." in c.source and c.value is not None:
                 src_tbl, src_col = c.source.split(".", 1)
                 src_step = table_to_step.get(src_tbl, table_to_step.get(src_tbl.lower(), src_tbl))
                 absent_overrides.setdefault(src_step, {})[src_col] = c.value
@@ -576,15 +604,67 @@ class ScenarioDefinition(BaseModel):
                         or other_check.table == src_step
                         or (other_check.table and other_check.table.lower() == src_tbl.lower())
                     )
-                    if other_check.kind == "allowed_values" and tbl_match and other_check.field == src_col:
-                        candidates = [v for v in (other_check.values or []) if v != c.value]
-                        if candidates:
-                            normal_val = candidates[0]
+                    if tbl_match and other_check.field == src_col:
+                        if other_check.kind == "allowed_values" and other_check.values:
+                            candidates = [
+                                v for v in (other_check.values or [])
+                                if not (type(v) is type(c.value) and v == c.value)
+                            ]
+                            if candidates:
+                                normal_val = candidates[0]
+                                break
+                        elif other_check.kind in ("state_machine", "state_transition") and other_check.transitions:
+                            fsm_states = set(other_check.transitions.keys())
+                            for targets in other_check.transitions.values():
+                                fsm_states.update(targets)
+                            if other_check.initial_states:
+                                fsm_states.update(other_check.initial_states)
+                            candidates = [
+                                s for s in sorted(fsm_states)
+                                if s != str(c.value)
+                            ]
+                            if candidates:
+                                if other_check.initial_states:
+                                    init_cands = [s for s in other_check.initial_states if s != str(c.value)]
+                                    normal_val = init_cands[0] if init_cands else candidates[0]
+                                else:
+                                    normal_val = candidates[0]
+                                break
+
+                if normal_val is None and src_tbl in (self.schemas or {}):
+                    col_def = self.schemas[src_tbl].get(src_col)
+                    if isinstance(col_def, dict) and "constraints" in col_def:
+                        enum_vals = col_def["constraints"].get("enum")
+                        if isinstance(enum_vals, list):
+                            candidates = [
+                                v for v in enum_vals
+                                if not (type(v) is type(c.value) and v == c.value)
+                            ]
+                            if candidates:
+                                normal_val = candidates[0]
+
                 if normal_val is None:
-                    normal_val = "approved" if c.value in ("denied", "rejected", "cancelled") else "completed"
+                    if isinstance(c.value, bool):
+                        normal_val = not c.value
+                    elif isinstance(c.value, (int, float)):
+                        normal_val = 0 if c.value != 0 else 1
+                    else:
+                        normal_val = "approved" if c.value in ("denied", "rejected", "cancelled") else "completed"
                 normal_overrides.setdefault(src_step, {})[src_col] = normal_val
 
-        path_name = absence_checks[0].value or "rejected"
+        trigger_val = absence_checks[0].value
+        if isinstance(trigger_val, bool):
+            path_name = str(trigger_val).lower()
+        elif isinstance(trigger_val, (int, float)):
+            path_name = str(trigger_val)
+        elif isinstance(trigger_val, str) and trigger_val.strip():
+            candidate = trigger_val.strip()
+            path_name = candidate if candidate != "approved" else "rejected"
+        elif trigger_val is not None:
+            path_name = str(trigger_val)
+        else:
+            path_name = "rejected"
+
         return [
             ScenarioPath(
                 name="approved",

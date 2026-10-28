@@ -74,15 +74,27 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
     """
 
     ALLOWED_BUILTINS: Dict[str, Callable[..., Any]] = {
-        "abs": abs,
-        "min": min,
-        "max": max,
-        "len": len,
-        "str": str,
-        "int": int,
-        "float": float,
+        "abs": lambda x: abs(x) if x is not None and not pd.isna(x) else None,
+        "min": lambda *args: min([x for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args) if x is not None and not pd.isna(x)]) if any(x is not None and not pd.isna(x) for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args)) else None,
+        "max": lambda *args: max([x for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args) if x is not None and not pd.isna(x)]) if any(x is not None and not pd.isna(x) for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args)) else None,
+        "round": lambda x, n=0: round(x, n) if x is not None and not pd.isna(x) else None,
+        "len": lambda x: len(x) if x is not None and not pd.isna(x) else 0,
+        "str": lambda x: "" if x is None or pd.isna(x) else str(x),
+        "int": lambda x: int(x) if x is not None and not pd.isna(x) else 0,
+        "float": lambda x: float(x) if x is not None and not pd.isna(x) else 0.0,
         "bool": bool,
+        "any": any,
+        "all": all,
+        "lower": lambda x: str(x).lower() if x is not None and not pd.isna(x) else "",
+        "upper": lambda x: str(x).upper() if x is not None and not pd.isna(x) else "",
+        "strip": lambda x: str(x).strip() if x is not None and not pd.isna(x) else "",
         "is_none": lambda x: x is None or pd.isna(x),
+    }
+
+    SAFE_METHODS = {
+        "lower", "upper", "strip", "lstrip", "rstrip",
+        "startswith", "endswith", "replace", "split",
+        "isdigit", "isalpha", "isalnum", "get", "isoformat"
     }
 
     def __init__(self, scope: Dict[str, Any], table_name: Optional[str] = None):
@@ -116,15 +128,20 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
         if isinstance(node.value, ast.Name):
             tbl = node.value.id
             col = node.attr
-            if tbl in self.scope and isinstance(self.scope[tbl], (dict, Mapping)):
-                if col in self.scope[tbl]:
-                    return self.scope[tbl][col]
-            if tbl.lower() in self.scope and isinstance(self.scope[tbl.lower()], (dict, Mapping)):
-                if col in self.scope[tbl.lower()]:
-                    return self.scope[tbl.lower()][col]
+            for t_candidate in (tbl, tbl.lower()):
+                if t_candidate in self.scope and isinstance(self.scope[t_candidate], (dict, Mapping)):
+                    scope_dict = self.scope[t_candidate]
+                    if col in scope_dict:
+                        return scope_dict[col]
+                    for k in scope_dict:
+                        if k.lower() == col.lower():
+                            return scope_dict[k]
             if self.table_name and tbl.lower() == self.table_name.lower():
                 if col in self.scope:
                     return self.scope[col]
+                for k in self.scope:
+                    if k.lower() == col.lower():
+                        return self.scope[k]
             for candidate in (f"{col}_{tbl}", f"{tbl}_{col}", f"{col}_{tbl.lower()}", f"{tbl.lower()}_{col}"):
                 if candidate in self.scope:
                     return self.scope[candidate]
@@ -133,6 +150,9 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
         if isinstance(val, (dict, Mapping)):
             if node.attr in val:
                 return val[node.attr]
+            for k in val:
+                if str(k).lower() == node.attr.lower():
+                    return val[k]
             raise KeyError(f"Key '{node.attr}' not found")
         if hasattr(val, node.attr):
             return getattr(val, node.attr)
@@ -143,30 +163,38 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
         if isinstance(node.op, ast.Not):
             return not bool(operand)
         elif isinstance(node.op, ast.USub):
-            return -operand
+            return -operand if operand is not None and not pd.isna(operand) else None
         elif isinstance(node.op, ast.UAdd):
-            return +operand
+            return +operand if operand is not None and not pd.isna(operand) else None
         elif isinstance(node.op, ast.Invert):
-            return ~operand
+            return ~operand if operand is not None and not pd.isna(operand) else None
         raise ValueError(f"Unsupported unary operator: {type(node.op).__name__}")
 
     def visit_BinOp(self, node: ast.BinOp) -> Any:
         left = self.visit(node.left)
         right = self.visit(node.right)
-        if isinstance(node.op, ast.Add):
-            return left + right
-        elif isinstance(node.op, ast.Sub):
-            return left - right
-        elif isinstance(node.op, ast.Mult):
-            return left * right
-        elif isinstance(node.op, ast.Div):
-            return left / right
-        elif isinstance(node.op, ast.FloorDiv):
-            return left // right
-        elif isinstance(node.op, ast.Mod):
-            return left % right
-        elif isinstance(node.op, ast.Pow):
-            return left ** right
+        if left is None or right is None or pd.isna(left) or pd.isna(right):
+            return None
+        if isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            if right == 0 or right == 0.0:
+                raise ValueError("Division by zero in rule expression")
+        try:
+            if isinstance(node.op, ast.Add):
+                return left + right
+            elif isinstance(node.op, ast.Sub):
+                return left - right
+            elif isinstance(node.op, ast.Mult):
+                return left * right
+            elif isinstance(node.op, ast.Div):
+                return left / right
+            elif isinstance(node.op, ast.FloorDiv):
+                return left // right
+            elif isinstance(node.op, ast.Mod):
+                return left % right
+            elif isinstance(node.op, ast.Pow):
+                return left ** right
+        except TypeError as e:
+            raise ValueError(f"Type error in binary operation ({type(node.op).__name__}): {e}")
         raise ValueError(f"Unsupported binary operator: {type(node.op).__name__}")
 
     def visit_BoolOp(self, node: ast.BoolOp) -> Any:
@@ -191,38 +219,66 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
         for op, comparator_node in zip(node.ops, node.comparators):
             right = self.visit(comparator_node)
             res = False
+
+            # Normalize date vs datetime / Timestamp / ISO date string comparisons
+            norm_left, norm_right = left, right
+            if (
+                isinstance(left, (date, datetime, pd.Timestamp))
+                or isinstance(right, (date, datetime, pd.Timestamp))
+            ):
+                if isinstance(left, str) or isinstance(right, str) or type(left) is not type(right):
+                    ts_l = pd.to_datetime(left, errors="coerce", utc=True)
+                    ts_r = pd.to_datetime(right, errors="coerce", utc=True)
+                    if (
+                        pd.notna(ts_l) and pd.notna(ts_r)
+                        and isinstance(ts_l, pd.Timestamp) and isinstance(ts_r, pd.Timestamp)
+                    ):
+                        norm_left, norm_right = ts_l, ts_r
+
             if isinstance(op, ast.Eq):
-                res = (left == right)
+                res = (norm_left == norm_right)
             elif isinstance(op, ast.NotEq):
-                res = (left != right)
+                res = (norm_left != norm_right)
             elif isinstance(op, ast.Lt):
-                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                if norm_left is None or norm_right is None or pd.isna(norm_left) or pd.isna(norm_right):
                     res = False
                 else:
-                    res = (left < right)
+                    res = (norm_left < norm_right)
             elif isinstance(op, ast.LtE):
-                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                if norm_left is None or norm_right is None or pd.isna(norm_left) or pd.isna(norm_right):
                     res = False
                 else:
-                    res = (left <= right)
+                    res = (norm_left <= norm_right)
             elif isinstance(op, ast.Gt):
-                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                if norm_left is None or norm_right is None or pd.isna(norm_left) or pd.isna(norm_right):
                     res = False
                 else:
-                    res = (left > right)
+                    res = (norm_left > norm_right)
             elif isinstance(op, ast.GtE):
-                if left is None or right is None or pd.isna(left) or pd.isna(right):
+                if norm_left is None or norm_right is None or pd.isna(norm_left) or pd.isna(norm_right):
                     res = False
                 else:
-                    res = (left >= right)
+                    res = (norm_left >= norm_right)
             elif isinstance(op, ast.Is):
                 res = (left is right)
             elif isinstance(op, ast.IsNot):
                 res = (left is not right)
             elif isinstance(op, ast.In):
-                res = (left in right) if right is not None else False
+                if left is None or pd.isna(left) or right is None:
+                    res = False
+                else:
+                    try:
+                        res = (left in right)
+                    except TypeError:
+                        res = False
             elif isinstance(op, ast.NotIn):
-                res = (left not in right) if right is not None else True
+                if left is None or pd.isna(left) or right is None:
+                    res = True
+                else:
+                    try:
+                        res = (left not in right)
+                    except TypeError:
+                        res = True
             else:
                 raise ValueError(f"Unsupported comparison operator: {type(op).__name__}")
             if not res:
@@ -230,23 +286,53 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
             left = right
         return True
 
+    def visit_IfExp(self, node: ast.IfExp) -> Any:
+        test_val = self.visit(node.test)
+        if bool(test_val):
+            return self.visit(node.body)
+        else:
+            return self.visit(node.orelse)
+
     def visit_Call(self, node: ast.Call) -> Any:
-        if not isinstance(node.func, ast.Name):
-            raise ValueError("Only whitelisted standalone functions may be called")
-        func_name = node.func.id
-        if func_name not in self.ALLOWED_BUILTINS:
-            raise ValueError(f"Calling function '{func_name}' is not permitted in rules")
-        func = self.ALLOWED_BUILTINS[func_name]
         args = [self.visit(arg) for arg in node.args]
         kwargs: Dict[str, Any] = {
             kw.arg: self.visit(kw.value) for kw in node.keywords if kw.arg is not None
         }
-        return func(*args, **kwargs)
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name not in self.ALLOWED_BUILTINS:
+                raise ValueError(f"Calling function '{func_name}' is not permitted in rules")
+            func = self.ALLOWED_BUILTINS[func_name]
+            return func(*args, **kwargs)
+        elif isinstance(node.func, ast.Attribute):
+            method_name = node.func.attr
+            if method_name.startswith("_") or method_name not in self.SAFE_METHODS:
+                raise ValueError(f"Method '{method_name}' is not permitted in rules")
+            obj = self.visit(node.func.value)
+            if obj is None or (isinstance(obj, float) and pd.isna(obj)):
+                return None
+            if hasattr(obj, method_name):
+                method = getattr(obj, method_name)
+                return method(*args, **kwargs)
+            return None
+        raise ValueError("Only whitelisted standalone functions and safe methods may be called")
+
+    def visit_JoinedStr(self, node: ast.JoinedStr) -> str:
+        return "".join(str(self.visit(val)) for val in node.values)
+
+    def visit_FormattedValue(self, node: ast.FormattedValue) -> Any:
+        return self.visit(node.value)
 
     def visit_Subscript(self, node: ast.Subscript) -> Any:
         val = self.visit(node.value)
         slice_val = self.visit(node.slice)
         if val is None:
+            return None
+        if isinstance(val, (dict, Mapping)):
+            return val.get(slice_val)
+        if isinstance(val, (list, tuple)) and isinstance(slice_val, int):
+            if 0 <= slice_val < len(val):
+                return val[slice_val]
             return None
         return val[slice_val]
 
@@ -269,7 +355,7 @@ class _RestrictedExpressionEvaluator(ast.NodeVisitor):
 class ScenarioEngine:
     """Plan deterministic lifecycles, then enrich them with an existing generator."""
 
-    def __init__(self, generator: TableGenerator):
+    def __init__(self, generator: Optional[TableGenerator] = None):
         """Initialize the scenario engine.
 
         Args:
@@ -310,6 +396,10 @@ class ScenarioEngine:
         Raises:
             ValueError: If generation violates the scenario plan or integrity rules.
         """
+        if self.generator is None:
+            raise ValueError(
+                "A TableGenerator must be provided to ScenarioEngine to generate data."
+            )
         plan = self.plan(
             definition,
             instance_count,
@@ -673,7 +763,26 @@ class ScenarioEngine:
         """
         inferred: List[ScenarioCheck] = []
         existing_names = {c.name for c in definition.checks}
-        existing_temporal_tables = {c.table for c in definition.checks if c.kind == "temporal_order" and c.table}
+        existing_temporal_tables: Set[str] = set()
+        for c in definition.checks:
+            if c.kind == "temporal_order":
+                if c.table:
+                    existing_temporal_tables.add(c.table)
+                    existing_temporal_tables.add(c.table.lower())
+                if c.chain:
+                    for ref in c.chain:
+                        if "." in ref:
+                            tbl, _ = _split_reference(ref)
+                            existing_temporal_tables.add(tbl)
+                            existing_temporal_tables.add(tbl.lower())
+                if c.before and "." in c.before:
+                    tbl, _ = _split_reference(c.before)
+                    existing_temporal_tables.add(tbl)
+                    existing_temporal_tables.add(tbl.lower())
+                if c.after and "." in c.after:
+                    tbl, _ = _split_reference(c.after)
+                    existing_temporal_tables.add(tbl)
+                    existing_temporal_tables.add(tbl.lower())
         existing_fsm = {(c.table, c.field) for c in definition.checks if c.kind in ("state_machine", "state_transition")}
         existing_invariants = {c.table for c in definition.checks if c.kind in ("semantic_invariant", "custom_rule") and c.table}
         schemas = definition.schemas or {}
@@ -776,6 +885,26 @@ class ScenarioEngine:
             if inf.name not in existing_names:
                 checks_to_run.append(inf)
 
+        def _resolve_table(t_name: Optional[str]) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
+            if not t_name:
+                return None, None
+            if t_name in tables:
+                return t_name, tables[t_name]
+            for real_t, df in tables.items():
+                if real_t.lower() == t_name.lower():
+                    return real_t, df
+            return t_name, None
+
+        def _resolve_col(frame: Optional[pd.DataFrame], col_name: Optional[str]) -> Optional[str]:
+            if frame is None or not col_name:
+                return None
+            if col_name in frame.columns:
+                return col_name
+            for c in frame.columns:
+                if c.lower() == col_name.lower():
+                    return c
+            return None
+
         for check in checks_to_run:
             is_auto = check.name.startswith("auto_")
             violations_list: List[Dict[str, Any]] = []
@@ -783,8 +912,10 @@ class ScenarioEngine:
             # 1. ALLOWED VALUES
             if check.kind == "allowed_values":
                 table_name = check.table or ""
-                frame = tables.get(table_name)
-                if frame is None or check.field not in frame:
+                real_table_name, frame = _resolve_table(table_name)
+                table_name = real_table_name or table_name
+                field_col = _resolve_col(frame, check.field)
+                if frame is None or field_col is None:
                     if not is_auto:
                         violations_list.append({
                             "table": table_name,
@@ -793,11 +924,11 @@ class ScenarioEngine:
                             "error": f"Table '{table_name}' or field '{check.field}' is missing from generated data.",
                         })
                 else:
-                    invalid_mask = ~frame[check.field].isin(check.values)
+                    invalid_mask = ~frame[field_col].isin(check.values)
                     if invalid_mask.any():
                         for idx, row in frame[invalid_mask].iterrows():
                             row_id = row.get(instance_field, idx)
-                            val = row.get(check.field)
+                            val = row.get(field_col)
                             violations_list.append({
                                 "table": table_name,
                                 "row": row_id,
@@ -814,7 +945,9 @@ class ScenarioEngine:
                             t_name, f_name = _split_reference(ref)
                         else:
                             t_name, f_name = check.table or "", ref
-                        resolved_chain.append((t_name, f_name))
+                        real_t, df = _resolve_table(t_name)
+                        col = _resolve_col(df, f_name) or f_name
+                        resolved_chain.append((real_t or t_name, col))
 
                     missing = [
                         f"{t}.{f}" for t, f in resolved_chain
@@ -835,50 +968,25 @@ class ScenarioEngine:
                             df = tables[tbl]
                             for idx, row in df.iterrows():
                                 row_id = row.get(instance_field, idx)
-                                for i in range(len(resolved_chain) - 1):
-                                    (_, col_a), (_, col_b) = resolved_chain[i], resolved_chain[i + 1]
-                                    val_a = pd.to_datetime(row.get(col_a), errors="coerce", utc=True)
-                                    val_b = pd.to_datetime(row.get(col_b), errors="coerce", utc=True)
-                                    if pd.notna(val_a) and pd.notna(val_b):
-                                        is_violation = (val_a > val_b) if not check.strict else (val_a >= val_b)
-                                        if is_violation:
-                                            op_str = "<" if check.strict else "<="
-                                            violations_list.append({
-                                                "table": tbl,
-                                                "row": row_id,
-                                                "rule": check.name,
-                                                "error": f"Temporal violation: '{col_a}' ({row.get(col_a)}) must be {op_str} '{col_b}' ({row.get(col_b)}).",
-                                            })
-                                            break
-                            if instance_field in df:
-                                for inst_id, group in df.groupby(instance_field, sort=False):
-                                    if len(group) > 1:
-                                        for i in range(len(resolved_chain) - 1):
-                                            (_, col_a), (_, col_b) = resolved_chain[i], resolved_chain[i + 1]
-                                            a_vals: List[pd.Timestamp] = []
-                                            for raw_a in group[col_a]:
-                                                ts_a = pd.to_datetime(raw_a, errors="coerce", utc=True)
-                                                if pd.notna(ts_a) and isinstance(ts_a, pd.Timestamp):
-                                                    a_vals.append(ts_a)
-
-                                            b_vals: List[pd.Timestamp] = []
-                                            for raw_b in group[col_b]:
-                                                ts_b = pd.to_datetime(raw_b, errors="coerce", utc=True)
-                                                if pd.notna(ts_b) and isinstance(ts_b, pd.Timestamp):
-                                                    b_vals.append(ts_b)
-                                            if a_vals and b_vals:
-                                                earlier_max = max(a_vals)
-                                                later_min = min(b_vals)
-                                                is_violation = (earlier_max > later_min) if not check.strict else (earlier_max >= later_min)
-                                                if is_violation:
-                                                    op_str = "<" if check.strict else "<="
-                                                    violations_list.append({
-                                                        "table": tbl,
-                                                        "row": inst_id,
-                                                        "rule": check.name,
-                                                        "error": f"Temporal chain violation: '{col_a}' ({earlier_max.isoformat()}) must be {op_str} '{col_b}' ({later_min.isoformat()}).",
-                                                    })
-                                                    break
+                                non_null_timestamps: List[Tuple[str, pd.Timestamp, Any]] = []
+                                for _, col in resolved_chain:
+                                    raw_val = row.get(col)
+                                    ts_val = pd.to_datetime(raw_val, errors="coerce", utc=True)
+                                    if pd.notna(ts_val) and isinstance(ts_val, pd.Timestamp):
+                                        non_null_timestamps.append((col, ts_val, raw_val))
+                                for i in range(len(non_null_timestamps) - 1):
+                                    col_a, val_a, raw_a = non_null_timestamps[i]
+                                    col_b, val_b, raw_b = non_null_timestamps[i + 1]
+                                    is_violation = (val_a > val_b) if not check.strict else (val_a >= val_b)
+                                    if is_violation:
+                                        op_str = "<" if check.strict else "<="
+                                        violations_list.append({
+                                            "table": tbl,
+                                            "row": row_id,
+                                            "rule": check.name,
+                                            "error": f"Temporal violation: '{col_a}' ({raw_a}) must be {op_str} '{col_b}' ({raw_b}).",
+                                        })
+                                        break
                         else:
                             instance_timestamps: Dict[Any, Dict[str, Dict[str, pd.Timestamp]]] = {}
                             for t_name, f_name in resolved_chain:
@@ -900,17 +1008,44 @@ class ScenarioEngine:
                                                 inst_dict[ref_key]["max"] = ts
 
                             for inst_id, ts_map in instance_timestamps.items():
-                                for i in range(len(resolved_chain) - 1):
-                                    ref_a = f"{resolved_chain[i][0]}.{resolved_chain[i][1]}"
-                                    ref_b = f"{resolved_chain[i+1][0]}.{resolved_chain[i+1][1]}"
-                                    if ref_a in ts_map and ref_b in ts_map:
+                                active_steps = [
+                                    (t, f) for t, f in resolved_chain if f"{t}.{f}" in ts_map
+                                ]
+                                for i in range(len(active_steps) - 1):
+                                    (t_a, f_a), (t_b, f_b) = active_steps[i], active_steps[i + 1]
+                                    ref_a = f"{t_a}.{f_a}"
+                                    ref_b = f"{t_b}.{f_b}"
+                                    if t_a.lower() == t_b.lower():
+                                        # Scope same-table checks within chain strictly per-record
+                                        df_same = tables.get(t_a)
+                                        if df_same is not None:
+                                            inst_rows = df_same[df_same[instance_field] == inst_id]
+                                            violation_found = False
+                                            for idx, s_row in inst_rows.iterrows():
+                                                ts_a = pd.to_datetime(s_row.get(f_a), errors="coerce", utc=True)
+                                                ts_b = pd.to_datetime(s_row.get(f_b), errors="coerce", utc=True)
+                                                if pd.notna(ts_a) and pd.notna(ts_b):
+                                                    is_viol = (ts_a > ts_b) if not check.strict else (ts_a >= ts_b)
+                                                    if is_viol:
+                                                        op_str = "<" if check.strict else "<="
+                                                        violations_list.append({
+                                                            "table": t_b,
+                                                            "row": s_row.get(instance_field, idx),
+                                                            "rule": check.name,
+                                                            "error": f"Temporal violation: '{f_a}' ({s_row.get(f_a)}) must be {op_str} '{f_b}' ({s_row.get(f_b)}).",
+                                                        })
+                                                        violation_found = True
+                                                        break
+                                            if violation_found:
+                                                break
+                                    else:
                                         earlier_max = ts_map[ref_a]["max"]
                                         later_min = ts_map[ref_b]["min"]
                                         is_violation = (earlier_max > later_min) if not check.strict else (earlier_max >= later_min)
                                         if is_violation:
                                             op_str = "<" if check.strict else "<="
                                             violations_list.append({
-                                                "table": resolved_chain[i+1][0],
+                                                "table": t_b,
                                                 "row": inst_id,
                                                 "rule": check.name,
                                                 "error": f"Temporal chain violation: '{ref_a}' ({earlier_max.isoformat()}) must be {op_str} '{ref_b}' ({later_min.isoformat()}).",
@@ -919,31 +1054,48 @@ class ScenarioEngine:
                 else:
                     before_table, before_field = _split_reference(check.before or "")
                     after_table, after_field = _split_reference(check.after or "")
-                    before = tables.get(before_table)
-                    after = tables.get(after_table)
+                    real_before_name, before = _resolve_table(before_table)
+                    real_after_name, after = _resolve_table(after_table)
+                    col_before = _resolve_col(before, before_field)
+                    col_after = _resolve_col(after, after_field)
                     if (
                         before is None or after is None
                         or instance_field not in before or instance_field not in after
-                        or before_field not in before or after_field not in after
+                        or col_before is None or col_after is None
                     ):
                         if not is_auto:
                             violations_list.append({
-                                "table": after_table or check.table or "",
+                                "table": real_after_name or after_table or check.table or "",
                                 "row": "N/A",
                                 "rule": check.name,
                                 "error": f"Temporal check references missing table or field: {check.before} -> {check.after}.",
                             })
+                    elif (real_before_name or before_table).lower() == (real_after_name or after_table).lower():
+                        for idx, row in before.iterrows():
+                            row_id = row.get(instance_field, idx)
+                            val_before = pd.to_datetime(row.get(col_before), errors="coerce", utc=True)
+                            val_after = pd.to_datetime(row.get(col_after), errors="coerce", utc=True)
+                            if pd.notna(val_before) and pd.notna(val_after):
+                                is_violation = (val_before > val_after) if not check.strict else (val_before >= val_after)
+                                if is_violation:
+                                    op_str = "<" if check.strict else "<="
+                                    violations_list.append({
+                                        "table": real_before_name or before_table,
+                                        "row": row_id,
+                                        "rule": check.name,
+                                        "error": f"Temporal violation: '{before_field}' ({row.get(col_before)}) must be {op_str} '{after_field}' ({row.get(col_after)}).",
+                                    })
                     else:
-                        before_values = before[[instance_field, before_field]].copy()
-                        after_values = after[[instance_field, after_field]].copy()
-                        before_values[before_field] = pd.to_datetime(
-                            before_values[before_field], errors="coerce", utc=True
+                        before_values = before[[instance_field, col_before]].copy()
+                        after_values = after[[instance_field, col_after]].copy()
+                        before_values[col_before] = pd.to_datetime(
+                            before_values[col_before], errors="coerce", utc=True
                         )
-                        after_values[after_field] = pd.to_datetime(
-                            after_values[after_field], errors="coerce", utc=True
+                        after_values[col_after] = pd.to_datetime(
+                            after_values[col_after], errors="coerce", utc=True
                         )
-                        before_groups = before_values.groupby(instance_field)[before_field]
-                        after_groups = after_values.groupby(instance_field)[after_field]
+                        before_groups = before_values.groupby(instance_field)[col_before]
+                        after_groups = after_values.groupby(instance_field)[col_after]
                         shared_instances = before_groups.indices.keys() & after_groups.indices.keys()
                         for instance_id in shared_instances:
                             earlier = before_groups.get_group(instance_id).dropna()
@@ -954,7 +1106,7 @@ class ScenarioEngine:
                             if is_violation:
                                 op_str = "<" if check.strict else "<="
                                 violations_list.append({
-                                    "table": after_table,
+                                    "table": real_after_name or after_table,
                                     "row": instance_id,
                                     "rule": check.name,
                                     "error": f"Temporal violation: '{check.before}' ({earlier.max().isoformat()}) must be {op_str} '{check.after}' ({later.min().isoformat()}).",
@@ -963,27 +1115,55 @@ class ScenarioEngine:
             # 3. ABSENCE BY VALUE
             elif check.kind == "absence_by_value":
                 source_table, source_field = _split_reference(check.source or "")
-                source = tables.get(source_table)
-                absent = tables.get(check.absent_table or "")
+                real_source_name, source = _resolve_table(source_table)
+                real_absent_name, absent = _resolve_table(check.absent_table or "")
+                field_match = _resolve_col(source, source_field)
                 if (
                     source is None or absent is None
                     or instance_field not in source or instance_field not in absent
-                    or source_field not in source
+                    or field_match is None
                 ):
                     if not is_auto:
                         violations_list.append({
-                            "table": check.absent_table or "",
+                            "table": real_absent_name or check.absent_table or "",
                             "row": "N/A",
                             "rule": check.name,
                             "error": f"Missing tables or fields for check: {check.source} absent {check.absent_table}.",
                         })
                 else:
-                    matching_source = source[source[source_field] == check.value]
+                    source_field = field_match
+                    val = check.value
+                    if val is None:
+                        match_mask = source[source_field].isna()
+                    elif isinstance(val, bool):
+                        is_bool_col = pd.api.types.is_bool_dtype(source[source_field])
+                        if is_bool_col:
+                            match_mask = source[source_field] == val
+                        else:
+                            match_mask = (
+                                (source[source_field].apply(lambda x: isinstance(x, bool) and x == val))
+                                | (source[source_field].astype(str).str.strip().str.lower() == str(val).strip().lower())
+                            )
+                    elif isinstance(val, (int, float)):
+                        is_bool_col = pd.api.types.is_bool_dtype(source[source_field])
+                        if is_bool_col:
+                            match_mask = pd.Series(False, index=source.index)
+                        else:
+                            match_mask = (
+                                (source[source_field].apply(lambda x: not isinstance(x, bool) and x == val))
+                                | (source[source_field].astype(str).str.strip() == str(val))
+                            )
+                    else:
+                        match_mask = (
+                            (source[source_field] == val)
+                            | (source[source_field].astype(str).str.strip().str.lower() == str(val).strip().lower())
+                        )
+                    matching_source = source[match_mask]
                     source_instances = set(matching_source[instance_field].tolist())
                     forbidden_instances = sorted(source_instances & set(absent[instance_field].tolist()))
                     for inst_id in forbidden_instances:
                         violations_list.append({
-                            "table": check.absent_table,
+                            "table": real_absent_name or check.absent_table,
                             "row": inst_id,
                             "rule": check.name,
                             "error": f"Forbidden record in '{check.absent_table}' for scenario instance '{inst_id}' when {check.source} == '{check.value}'.",
@@ -992,9 +1172,16 @@ class ScenarioEngine:
             # 4. STATE TRANSITION / STATE MACHINE
             elif check.kind in ("state_transition", "state_machine"):
                 table_name = check.table or ""
-                df = tables.get(table_name)
-                transitions = check.transitions or {}
-                if df is None or check.field not in df:
+                real_table_name, df = _resolve_table(table_name)
+                table_name = real_table_name or table_name
+                raw_transitions = check.transitions or {}
+                transitions: Dict[str, List[str]] = {
+                    k.strip(): [x.strip() for x in v]
+                    for k, v in raw_transitions.items()
+                }
+
+                field_col = _resolve_col(df, check.field)
+                if df is None or field_col is None:
                     if not is_auto:
                         violations_list.append({
                             "table": table_name,
@@ -1006,42 +1193,113 @@ class ScenarioEngine:
                     all_states = set(transitions.keys())
                     for targets in transitions.values():
                         all_states.update(targets)
-                    if check.initial_states:
-                        all_states.update(check.initial_states)
-                    if check.terminal_states:
-                        all_states.update(check.terminal_states)
+                    initial_states_set = {s.strip() for s in (check.initial_states or [])}
+                    terminal_states_set = {s.strip() for s in (check.terminal_states or [])}
+                    if initial_states_set:
+                        all_states.update(initial_states_set)
+                    if terminal_states_set:
+                        all_states.update(terminal_states_set)
 
-                    if check.previous_field and check.previous_field in df:
-                        for idx, row in df.iterrows():
-                            row_id = row.get(instance_field, idx)
-                            from_val = row.get(check.previous_field)
-                            to_val = row.get(check.field)
-                            if pd.notna(from_val) and pd.notna(to_val):
-                                allowed = transitions.get(str(from_val), [])
-                                if str(to_val) not in allowed:
+                    def _get_allowed(s_val: str) -> List[str]:
+                        if s_val in transitions:
+                            return transitions[s_val]
+                        for tk, tv in transitions.items():
+                            if tk.lower() == s_val.lower():
+                                return tv
+                        return []
+
+                    prev_col = _resolve_col(df, check.previous_field)
+                    if check.previous_field:
+                        if prev_col is None:
+                            if not is_auto:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": "N/A",
+                                    "rule": check.name,
+                                    "error": f"Table '{table_name}' is missing previous_field '{check.previous_field}' for state transition check.",
+                                })
+                        else:
+                            for idx, row in df.iterrows():
+                                row_id = row.get(instance_field, idx)
+                                from_val = row.get(prev_col)
+                                to_val = row.get(field_col)
+                                from_s = str(from_val).strip() if pd.notna(from_val) else None
+                                to_s = str(to_val).strip() if pd.notna(to_val) else None
+
+                                if to_s is not None and to_s not in all_states:
                                     violations_list.append({
                                         "table": table_name,
                                         "row": row_id,
                                         "rule": check.name,
-                                        "error": f"Illegal state transition from '{from_val}' to '{to_val}'. Allowed transitions from '{from_val}': {allowed}.",
+                                        "error": f"Unknown state '{to_val}' not part of declared state machine.",
                                     })
+                                if from_s is not None and from_s not in all_states:
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": row_id,
+                                        "rule": check.name,
+                                        "error": f"Unknown state '{from_val}' not part of declared state machine.",
+                                    })
+                                if from_s is None and to_s is not None and initial_states_set:
+                                    if to_s not in initial_states_set:
+                                        violations_list.append({
+                                            "table": table_name,
+                                            "row": row_id,
+                                            "rule": check.name,
+                                            "error": f"Initial state '{to_val}' not in allowed initial states: {check.initial_states}.",
+                                        })
+                                if from_s is not None and to_s is not None:
+                                    allowed = _get_allowed(from_s)
+                                    if to_s not in allowed:
+                                        violations_list.append({
+                                            "table": table_name,
+                                            "row": row_id,
+                                            "rule": check.name,
+                                            "error": f"Illegal state transition from '{from_val}' to '{to_val}'. Allowed transitions from '{from_val}': {allowed}.",
+                                        })
                     elif instance_field in df:
-                        order_col = check.order_by if (check.order_by and check.order_by in df) else None
+                        order_col = _resolve_col(df, check.order_by)
+                        if not order_col:
+                            for s in definition.steps:
+                                if s.table.lower() == table_name.lower() and s.timestamp_field:
+                                    order_col = _resolve_col(df, s.timestamp_field)
+                                    if order_col:
+                                        break
+                        if check.order_by and _resolve_col(df, check.order_by) is None:
+                            if not is_auto:
+                                violations_list.append({
+                                    "table": table_name,
+                                    "row": "N/A",
+                                    "rule": check.name,
+                                    "error": f"Table '{table_name}' is missing order_by field '{check.order_by}' for state transition check.",
+                                })
                         for inst_id, group in df.groupby(instance_field, sort=False):
                             if order_col:
-                                group = group.sort_values(order_col)
-                            states: List[str] = [str(s) for s in group[check.field].dropna().tolist()]
+                                try:
+                                    order_series = pd.Series(
+                                        pd.to_datetime(group[order_col], errors="coerce", utc=True),
+                                        index=group.index,
+                                    )
+                                    if bool(order_series.notna().any()):
+                                        group = group.iloc[order_series.argsort(kind="stable")]
+                                    else:
+                                        group = group.sort_values(order_col, kind="stable")
+                                except Exception:
+                                    group = group.sort_values(order_col, kind="stable")
+
+                            raw_states = group[field_col].dropna().tolist()
+                            states: List[str] = [str(s).strip() for s in raw_states]
                             if not states:
                                 continue
 
-                            if check.initial_states and states[0] not in check.initial_states:
+                            if initial_states_set and states[0] not in initial_states_set:
                                 violations_list.append({
                                     "table": table_name,
                                     "row": inst_id,
                                     "rule": check.name,
                                     "error": f"Initial state '{states[0]}' not in allowed initial states: {check.initial_states}.",
                                 })
-                            if check.terminal_states and states[-1] not in check.terminal_states:
+                            if terminal_states_set and states[-1] not in terminal_states_set:
                                 violations_list.append({
                                     "table": table_name,
                                     "row": inst_id,
@@ -1049,7 +1307,7 @@ class ScenarioEngine:
                                     "error": f"Terminal state '{states[-1]}' not in allowed terminal states: {check.terminal_states}.",
                                 })
 
-                            for s in states:
+                            for s in set(states):
                                 if s not in all_states:
                                     violations_list.append({
                                         "table": table_name,
@@ -1062,24 +1320,26 @@ class ScenarioEngine:
                                 for i in range(len(states) - 1):
                                     curr_s = states[i]
                                     next_s = states[i + 1]
-                                    allowed: List[str] = transitions.get(curr_s, [])
-                                    if next_s not in allowed:
+                                    allowed_next: List[str] = _get_allowed(curr_s)
+                                    if next_s not in allowed_next:
                                         violations_list.append({
                                             "table": table_name,
                                             "row": inst_id,
                                             "rule": check.name,
-                                            "error": f"Illegal transition sequence from '{curr_s}' to '{next_s}'. Allowed: {allowed}.",
+                                            "error": f"Illegal transition sequence from '{curr_s}' to '{next_s}'. Allowed: {allowed_next}.",
                                         })
                     else:
                         for idx, row in df.iterrows():
-                            val = row.get(check.field)
-                            if pd.notna(val) and str(val) not in all_states:
-                                violations_list.append({
-                                    "table": table_name,
-                                    "row": idx,
-                                    "rule": check.name,
-                                    "error": f"State '{val}' is not in known states: {sorted(all_states)}.",
-                                })
+                            val = row.get(field_col)
+                            if pd.notna(val):
+                                s_val = str(val).strip()
+                                if s_val not in all_states:
+                                    violations_list.append({
+                                        "table": table_name,
+                                        "row": idx,
+                                        "rule": check.name,
+                                        "error": f"State '{val}' is not in known states: {sorted(all_states)}.",
+                                    })
 
             # 5. SEMANTIC INVARIANT
             elif check.kind == "semantic_invariant":
