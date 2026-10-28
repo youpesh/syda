@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Link } from "react-router";
+import { Link, useParams } from "react-router";
 
 import { LiveConnections, type SchemaSource, useLiveProfiles } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
@@ -54,6 +54,7 @@ function statusVariant(status: string): "secondary" | "destructive" | "outline" 
 }
 
 export function RunHistoryWorkspace() {
+  const { conversationId } = useParams();
   const [jobs, setJobs] = useState<GenerationJob[]>([]);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -84,7 +85,7 @@ export function RunHistoryWorkspace() {
           <select aria-label="Filter runs by status" className="h-8 rounded-md border bg-background px-2 text-xs" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">All statuses</option><option value="generating">Generating</option><option value="validating">Validating</option><option value="evaluating">Evaluating</option><option value="complete">Complete</option><option value="failed">Failed</option></select></div>
           <div className="divide-y rounded-xl border">{filtered.map((job) => <div className="flex flex-wrap items-center justify-between gap-3 p-4" key={job.jobId}>
             <div className="min-w-0"><p className="truncate text-sm font-medium">{job.scenario?.title ?? `Run ${job.jobId}`}</p><p className="text-xs text-muted-foreground">{job.createdAt ? new Date(job.createdAt).toLocaleString() : job.jobId}</p></div>
-            <div className="flex items-center gap-3"><Badge variant={statusVariant(job.status)}>{job.status}</Badge><span className="text-xs tabular-nums text-muted-foreground">{job.progress}%</span><Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${job.jobId}`}>View run</Link></div>
+            <div className="flex items-center gap-3"><Badge variant={statusVariant(job.status)}>{job.status}</Badge><span className="text-xs tabular-nums text-muted-foreground">{job.progress}%</span><Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${job.jobId}${conversationId ? `?chat=${encodeURIComponent(conversationId)}` : ""}`}>View run</Link></div>
           </div>)}</div>{!filtered.length && <p className="text-sm text-muted-foreground">No runs match those filters.</p>}</> : <div className="space-y-3"><p className="text-sm text-muted-foreground">No generation runs yet.</p><Link className={buttonVariants({ size: "sm" })} to="?view=scenario">Create a scenario</Link></div>}
       </CardContent>
     </Card>}

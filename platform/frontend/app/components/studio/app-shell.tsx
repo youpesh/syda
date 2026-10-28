@@ -29,6 +29,7 @@ import {
   SidebarTrigger,
 } from "~/components/ui/sidebar";
 import type { SavedConversationSummary } from "~/lib/studio-types";
+import { useWorkspaceSession } from "~/components/studio/workspace-session";
 
 function RecentChat({ conversation, active, onDeleted }: {
   conversation: SavedConversationSummary;
@@ -96,7 +97,8 @@ export function AppShell({
   onNewScenario?: () => void;
 }) {
   const { pathname, search } = useLocation();
-  const chatWorkspacePath = pathname.startsWith("/app") ? pathname : "/app";
+  const workspaceSession = useWorkspaceSession();
+  const chatWorkspacePath = pathname.startsWith("/app") ? pathname : workspaceSession.activeChatPath;
   const requestedView = new URLSearchParams(search).get("view");
   const activeView = ["connections", "schema", "runs"].includes(requestedView ?? "") ? requestedView : "scenario";
   const navigate = useNavigate();
@@ -115,6 +117,7 @@ export function AppShell({
           setDisplayName(account.display_name || account.email || "Account");
         }
       } else {
+        if (active && (response.status === 401 || response.status === 403)) workspaceSession.clearSession();
         navigate(`/login?next=${encodeURIComponent(pathname)}`, { replace: true });
       }
     }).catch(() => { if (active) navigate(`/login?next=${encodeURIComponent(pathname)}`, { replace: true }); });
@@ -162,6 +165,8 @@ export function AppShell({
                     conversation={conversation}
                     active={pathname === `/app/${conversation.id}`}
                     onDeleted={(id) => {
+                      workspaceSession.clearDraft(id);
+                      if (workspaceSession.activeChatPath === `/app/${id}`) workspaceSession.setActiveChatPath("/app");
                       setRecentConversations((current) => current.filter((item) => item.id !== id));
                       if (pathname === `/app/${id}`) {
                         if (onNewScenario) onNewScenario();
@@ -182,14 +187,14 @@ export function AppShell({
           <SidebarGroup className="p-1">
             <SidebarGroupLabel>Workspace</SidebarGroupLabel>
             <SidebarGroupContent><SidebarMenu>
-              <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/app") && activeView === "scenario"} render={<Link to={chatWorkspacePath} />} tooltip="Scenario"><MessageSquareText /><span>Scenario</span></SidebarMenuButton></SidebarMenuItem>
+              <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/app") && activeView === "scenario"} render={<Link to={chatWorkspacePath} />} tooltip="Current chat"><MessageSquareText /><span>Current chat</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/app") && activeView === "connections"} render={<Link to={`${chatWorkspacePath}?view=connections`} />} tooltip="Connections"><Database /><span>Connections</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/app") && activeView === "schema"} render={<Link to={`${chatWorkspacePath}?view=schema`} />} tooltip="Schema review"><ScanSearch /><span>Schema review</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname.startsWith("/app") && activeView === "runs"} render={<Link to={`${chatWorkspacePath}?view=runs`} />} tooltip="Run history"><History /><span>Run history</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/scenarios"} render={<Link to="/scenarios" />} tooltip="Scenarios"><HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} /><span>Scenarios</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton isActive={pathname === "/settings"} render={<Link to="/settings" />} tooltip="Settings"><HugeiconsIcon icon={Settings02Icon} strokeWidth={2} /><span>Settings</span></SidebarMenuButton></SidebarMenuItem>
               <SidebarMenuItem><SidebarMenuButton onClick={toggleTheme} tooltip={resolvedTheme === "dark" ? "Switch to light mode" : "Switch to dark mode"}>{resolvedTheme === "dark" ? <Sun /> : <Moon />}<span>{resolvedTheme === "dark" ? "Light mode" : "Dark mode"}</span></SidebarMenuButton></SidebarMenuItem>
-              <SidebarMenuItem><SidebarMenuButton onClick={async () => { await fetch("/api/auth/cookie/logout", { method: "POST" }); navigate("/", { replace: true }); }} tooltip={`Log out ${displayName}`}><HugeiconsIcon icon={Logout01Icon} strokeWidth={2} /><span>Log out</span></SidebarMenuButton></SidebarMenuItem>
+              <SidebarMenuItem><SidebarMenuButton onClick={async () => { await fetch("/api/auth/cookie/logout", { method: "POST" }); workspaceSession.clearSession(); navigate("/", { replace: true }); }} tooltip={`Log out ${displayName}`}><HugeiconsIcon icon={Logout01Icon} strokeWidth={2} /><span>Log out</span></SidebarMenuButton></SidebarMenuItem>
             </SidebarMenu></SidebarGroupContent>
           </SidebarGroup>
         </SidebarFooter>
