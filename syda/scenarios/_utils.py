@@ -218,14 +218,14 @@ def _json_safe(value: Any) -> Any:
 
 
 def _known_record(
-    row: pd.Series,
+    row: pd.Series | Mapping[Any, Any],
     instance_field: str,
     path_field: str,
 ) -> Dict[str, Any]:
     return {
-        field: _json_safe(value)
+        str(field): _json_safe(value)
         for field, value in row.items()
-        if field not in {instance_field, path_field} and not _is_missing(value)
+        if str(field) not in {instance_field, path_field} and not _is_missing(value)
     }
 
 

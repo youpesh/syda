@@ -7,7 +7,7 @@ import asyncio
 import logging
 import zipfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Literal, cast
 from datetime import datetime, timedelta
 import random
 
@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from syda.schemas import validate_schema, ModelConfig
 from syda.generate import SyntheticDataGenerator
 from syda.output import save_dataframes
-from syda.scenarios import ScenarioEngine
+from syda.scenarios import ScenarioEngine, TableGenerator
 
 from .auth import require_authenticated
 from ..database import get_db, SessionLocal
@@ -38,6 +38,7 @@ from ..models.scenario import (
     ScenarioConfiguration,
     EvaluationMetric,
     CostEstimate,
+    ViolationRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -222,7 +223,7 @@ def _referential_integrity(
                 violations += len(non_null_values)
                 continue
             parent_values = set(parent_df[parent_column].dropna().tolist())
-            violations += int((~non_null_values.isin(parent_values)).sum())
+            violations += (~non_null_values.isin(parent_values)).sum()
 
     if checked == 0:
         return "Not applicable", 0
@@ -245,13 +246,13 @@ def _constraint_compliance(
                 continue
             constraints = field.get("constraints", {})
             if "min" in constraints:
-                values = pd.to_numeric(df[column_name], errors="coerce").dropna()
+                values = cast(pd.Series, pd.to_numeric(df[column_name], errors="coerce")).dropna()
                 checked += len(values)
-                violations += int((values < float(constraints["min"])).sum())
+                violations += (values < float(constraints["min"])).sum()
             if "max" in constraints:
-                values = pd.to_numeric(df[column_name], errors="coerce").dropna()
+                values = cast(pd.Series, pd.to_numeric(df[column_name], errors="coerce")).dropna()
                 checked += len(values)
-                violations += int((values > float(constraints["max"])).sum())
+                violations += (values > float(constraints["max"])).sum()
     if checked == 0:
         return "Not evaluated", 0, 0
     compliance = 100 * (checked - violations) / checked
@@ -276,8 +277,10 @@ def _temporal_consistency(
 
     for child_table, child_schema in schemas.items():
         child_df = dfs.get(child_table)
-        child_dates = temporal_columns(child_schema)
-        if child_df is None or not child_dates:
+        if child_df is None:
+            continue
+        child_dates = [c for c in temporal_columns(child_schema) if c in child_df]
+        if not child_dates:
             continue
         for child_fk, target in child_schema.get("__foreign_keys__", {}).items():
             if not isinstance(target, str) or "." not in target or child_fk not in child_df:
@@ -285,8 +288,10 @@ def _temporal_consistency(
             parent_table, parent_pk = target.split(".", 1)
             parent_schema = schemas.get(parent_table, {})
             parent_df = dfs.get(parent_table)
-            parent_dates = temporal_columns(parent_schema)
-            if parent_df is None or parent_pk not in parent_df or not parent_dates:
+            if parent_df is None or parent_pk not in parent_df:
+                continue
+            parent_dates = [c for c in temporal_columns(parent_schema) if c in parent_df]
+            if not parent_dates:
                 continue
             child_date = child_dates[0]
             parent_date = parent_dates[-1]
@@ -297,11 +302,13 @@ def _temporal_consistency(
                 how="inner",
                 suffixes=("_child", "_parent"),
             )
-            child_values = pd.to_datetime(merged[f"{child_date}_child"] if child_date == parent_date else merged[child_date], errors="coerce")
-            parent_values = pd.to_datetime(merged[f"{parent_date}_parent"] if child_date == parent_date else merged[parent_date], errors="coerce")
+            child_col = f"{child_date}_child" if child_date == parent_date else child_date
+            parent_col = f"{parent_date}_parent" if child_date == parent_date else parent_date
+            child_values = cast(pd.Series, pd.to_datetime(merged[child_col], errors="coerce"))
+            parent_values = cast(pd.Series, pd.to_datetime(merged[parent_col], errors="coerce"))
             comparable = child_values.notna() & parent_values.notna()
-            checked += int(comparable.sum())
-            violations += int((child_values[comparable] < parent_values[comparable]).sum())
+            checked += comparable.sum()
+            violations += cast(pd.Series, child_values[comparable] < parent_values[comparable]).sum()
 
     if checked == 0:
         return "Not evaluated", 0, 0
@@ -313,7 +320,8 @@ def _evaluation_metrics(
     dfs: Dict[str, pd.DataFrame],
     schemas: Dict[str, Any],
     scenario: ScenarioConfiguration,
-) -> tuple[list[EvaluationMetric], str, int]:
+    return_details: bool = False,
+) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
     causal_value, causal_violations, causal_checked = _temporal_consistency(dfs, schemas)
@@ -325,10 +333,25 @@ def _evaluation_metrics(
     missing_steps = [step for step in scenario.workflow if step not in dfs or dfs[step].empty]
     coverage_value = f"{100 * (len(scenario.workflow) - len(missing_steps)) / max(1, len(scenario.workflow)):.1f}%"
 
-    def measured_status(violations: int, checked: int) -> str:
+    violation_records: list[ViolationRecord] = []
+    for check_item in executable_checks:
+        for detail in check_item.get("details", []):
+            violation_records.append(
+                ViolationRecord(
+                    table=detail["table"],
+                    row=detail["row"],
+                    rule=detail["rule"],
+                    error=detail["error"],
+                )
+            )
+
+    def measured_status(violations: int, checked: int) -> Literal["not_evaluated", "pass", "fail"]:
         if checked == 0:
             return "not_evaluated"
         return "pass" if violations == 0 else "fail"
+
+    def binary_status(is_pass: bool) -> Literal["pass", "fail"]:
+        return "pass" if is_pass else "fail"
 
     metrics = [
         EvaluationMetric(
@@ -357,7 +380,7 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="scenario_coverage",
             label="Scenario coverage",
-            status="pass" if not missing_steps else "fail",
+            status=binary_status(not missing_steps),
             value=coverage_value,
             detail="Checks that every declared workflow step produced records.",
             violations=len(missing_steps),
@@ -372,7 +395,7 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="referential_integrity",
             label="Referential integrity",
-            status="pass" if referential_violations == 0 else "fail",
+            status=binary_status(referential_violations == 0),
             value=referential_value,
             detail="Checks every declared foreign key against generated parent keys.",
             violations=referential_violations,
@@ -380,11 +403,7 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="declared_rules",
             label="Declared rule checks",
-            status=(
-                "not_evaluated" if checked_rules == 0
-                else "pass" if check_violations == 0
-                else "fail"
-            ),
+            status=measured_status(check_violations, checked_rules),
             value=(
                 "No executable checks" if checked_rules == 0
                 else f"{checked_rules - sum(bool(item['violations']) for item in executable_checks)}/{checked_rules} checks passed"
@@ -399,7 +418,10 @@ def _evaluation_metrics(
     result = "fail" if any(metric.status == "fail" for metric in evaluated) else (
         "pass" if len(evaluated) == len(metrics) else "partial"
     )
-    return metrics, result, sum(metric.violations for metric in metrics)
+    total_violations = sum(metric.violations for metric in metrics)
+    if return_details:
+        return metrics, result, total_violations, violation_records
+    return metrics, result, total_violations
 
 
 async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration, provider: dict[str, Any]):
@@ -458,7 +480,7 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration,
                 model_cfg = ModelConfig(provider=provider["id"], model_name=provider["model"], batch_size=10, extra_kwargs={"api_key": provider["key"], **({"base_url": provider["base_url"]} if provider.get("base_url") else {})})
                 generator = SyntheticDataGenerator(model_config=model_cfg)
                 result = await asyncio.to_thread(
-                    ScenarioEngine(generator).generate,
+                    ScenarioEngine(cast(TableGenerator, generator)).generate,
                     definition,
                     scenario.record_count,
                     progress_callback=report_generation_progress,
@@ -487,11 +509,15 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration,
         await asyncio.sleep(0.5)
 
         # Save generated DataFrames using syda.output.save_dataframes
-        save_dataframes(dfs, str(job_dir), format="csv")
+        populated_dfs = {name: df for name, df in dfs.items() if not df.empty}
+        if populated_dfs:
+            save_dataframes(populated_dfs, str(job_dir), format="csv")
 
         elapsed = round(time.time() - t0, 1)
         total_records = sum(len(df) for df in dfs.values())
-        metrics, evaluation_result, total_violations = _evaluation_metrics(dfs, schemas, scenario)
+        metrics, evaluation_result, total_violations, violation_records = _evaluation_metrics(
+            dfs, schemas, scenario, return_details=True
+        )
         metric_by_key = {metric.key: metric for metric in metrics}
         table_row_counts = {name: len(df) for name, df in dfs.items()}
 
@@ -506,6 +532,7 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration,
             pathCounts=path_counts,
             evaluationMetrics=metrics,
             evaluationResult=evaluation_result,
+            violations=violation_records,
         )
 
         _update_job_in_db(job_id, {
@@ -725,6 +752,7 @@ async def download_evaluation_report(
         "recordsGenerated": stats.records_generated,
         "pathCounts": stats.path_counts,
         "metrics": [metric.model_dump(by_alias=True) for metric in stats.evaluation_metrics],
+        "violations": [violation.model_dump(by_alias=True) for violation in stats.violations],
     }
     if format == "json":
         return JSONResponse(
@@ -742,10 +770,27 @@ async def download_evaluation_report(
         "</tr>"
         for metric in stats.evaluation_metrics
     )
+    violation_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(v.table)}</td>"
+        f"<td>{html.escape(str(v.row))}</td>"
+        f"<td>{html.escape(v.rule)}</td>"
+        f"<td>{html.escape(v.error)}</td>"
+        "</tr>"
+        for v in stats.violations
+    )
+    violations_section = (
+        f"<h2>Causal & Semantic Rule Violations ({len(stats.violations)})</h2>"
+        f"<table><thead><tr><th>Table</th><th>Row</th><th>Rule</th><th>Error</th></tr></thead><tbody>{violation_rows}</tbody></table>"
+        if stats.violations
+        else "<p><em>No causal or semantic rule violations detected.</em></p>"
+    )
     document = f"""<!doctype html><html><head><meta charset="utf-8"><title>Syda evaluation {html.escape(job_id)}</title>
-<style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}</style>
+<style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%;margin-bottom:24px}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}h2{{margin-top:24px}}</style>
 </head><body><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p>
-<table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></body></html>"""
+<table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>
+{violations_section}
+</body></html>"""
     return HTMLResponse(
         document,
         headers={"Content-Disposition": f'attachment; filename="evaluation_{job_id}.html"'},
