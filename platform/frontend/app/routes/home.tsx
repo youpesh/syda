@@ -1,6 +1,8 @@
 import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { RunQualitySummary } from "~/components/studio/run-quality-summary";
+import { ConnectionsWorkspace, RunHistoryWorkspace, SchemaWorkspace } from "~/components/studio/chat-workspace";
+import { useWorkspaceSession } from "~/components/studio/workspace-session";
 import {
   useEffect,
   useMemo,
@@ -384,7 +386,7 @@ function ScenarioCard({
   );
 }
 
-function GenerationRunCard({ run }: { run: ChatRun }) {
+function GenerationRunCard({ run, conversationId }: { run: ChatRun; conversationId?: string }) {
   const [job, setJob] = useState<GenerationJob>();
   const [error, setError] = useState<string>();
 
@@ -433,7 +435,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
           <p className="text-[10px] text-muted-foreground">Run {run.jobId}</p>
           <div className="flex flex-wrap gap-2">
             {complete && (job?.downloadUrl || job?.filesAvailable) && <a className={buttonVariants({ size: "sm" })} href={job?.downloadUrl ?? `/api/download/${run.jobId}`}>Download dataset</a>}
-            <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data`}>Browse full dataset</Link>
+            <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data${conversationId ? `&chat=${encodeURIComponent(conversationId)}` : ""}`}>Browse full dataset</Link>
           </div>
         </div>
         {complete && <RunQualitySummary stats={job?.stats} scenario={run.scenario} />}
@@ -447,12 +449,18 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
 export default function Home() {
   const navigate = useNavigate();
   const location = useLocation();
+  const requestedView = new URLSearchParams(location.search).get("view");
+  const workspaceView = ["connections", "schema", "runs"].includes(requestedView ?? "") ? requestedView : "scenario";
   const { conversationId } = useParams();
+  const workspaceSession = useWorkspaceSession();
+  const draftKey = conversationId ?? "new";
+  const prompt = workspaceSession.drafts[draftKey]?.prompt ?? "";
+  const source = workspaceSession.drafts[draftKey]?.source ?? null;
+  const setPrompt = (value: string) => workspaceSession.updateDraft(draftKey, { prompt: value });
+  const setSource = (value: SchemaSource | null) => workspaceSession.updateDraft(draftKey, { source: value });
+  const connections = workspaceSession.connections;
   const conversationIdRef = useRef<string | undefined>(conversationId);
   conversationIdRef.current = conversationId;
-  const [prompt, setPrompt] = useState("");
-  const [source, setSource] = useState<SchemaSource | null>(null);
-  const connections = useLiveProfiles();
   const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);
   const [conversationTitle, setConversationTitle] = useState("");
   const [loadedConversationId, setLoadedConversationId] = useState<string>();
@@ -483,6 +491,10 @@ export default function Home() {
     transport: chatTransport,
   });
   const isThinking = status === "submitted" || status === "streaming";
+
+  useEffect(() => {
+    workspaceSession.setActiveChatPath(conversationId ? `/app/${conversationId}` : "/app");
+  }, [conversationId, workspaceSession.setActiveChatPath]);
 
   useEffect(() => {
     const returnState = location.state as {
@@ -565,6 +577,7 @@ export default function Home() {
           setConversationTitle(conversation.title);
           setChatRuns(legacyRuns);
           setMessages(legacyMessages);
+          workspaceSession.moveDraft("new", conversation.id);
           setLoadedConversationId(conversation.id);
           conversationIdRef.current = conversation.id;
           persistedSnapshotRef.current = JSON.stringify({ title: conversation.title, messages: [], runs: [], scenarioDraft: undefined });
@@ -663,6 +676,7 @@ export default function Home() {
     if (!text || isThinking || conversationLoading || (conversationId && loadedConversationId !== conversationId)) return;
 
     setConversationError(undefined);
+    let submittedDraftKey = draftKey;
     if (!conversationId) {
       try {
         const response = await fetch("/api/conversations", {
@@ -677,6 +691,8 @@ export default function Home() {
         setConversationTitle(conversation.title);
         setChatRuns([]);
         setLoadedConversationId(conversation.id);
+        workspaceSession.moveDraft("new", conversation.id);
+        submittedDraftKey = conversation.id;
         persistedSnapshotRef.current = JSON.stringify({ title: conversation.title, messages: [], runs: [], scenarioDraft: undefined });
         window.dispatchEvent(new Event("syda:conversations-changed"));
         navigate(`/app/${conversation.id}`, { replace: true });
@@ -690,23 +706,25 @@ export default function Home() {
       setConversationTitle(titleForPrompt(text));
     }
 
-    setPrompt("");
+    workspaceSession.updateDraft(submittedDraftKey, { prompt: "" });
     clearError();
     await sendMessage({ text: source ? `${text}\n\nDatabase schema context (${source.name}; structure only, output CSV):\n${JSON.stringify(source.schemas)}` : text });
   };
 
-  const startNewScenario = () => {
-    setSource(null);
+  const startNewScenario = (nextSource?: SchemaSource) => {
+    workspaceSession.clearDraft("new");
+    if (nextSource) workspaceSession.updateDraft("new", { source: nextSource });
     stop();
-    setPrompt("");
-    setMessages([]);
-    setChatRuns([]);
-    setConversationTitle("");
-    setLoadedConversationId(undefined);
-    setConversationError(undefined);
-    conversationIdRef.current = undefined;
-    persistedSnapshotRef.current = "";
-    navigate("/app");
+    if (!conversationId) {
+      setMessages([]);
+      setChatRuns([]);
+      setConversationTitle("");
+      setLoadedConversationId(undefined);
+      setConversationError(undefined);
+      conversationIdRef.current = undefined;
+      persistedSnapshotRef.current = "";
+    }
+    navigate("/app", { state: nextSource ? { schemaSource: nextSource } : null });
   };
 
   const openEditor = async (scenario: ScenarioConfiguration, messageId: string) => {
@@ -759,11 +777,11 @@ export default function Home() {
   };
 
   return (
-    <AppShell title={conversationTitle || latestScenario?.title || "New scenario"} subtitle={messages.length ? "Scenario design chat" : "Describe what you want to generate"} onNewScenario={startNewScenario}>
+    <AppShell title={conversationTitle || latestScenario?.title || "New scenario"} subtitle={messages.length ? "Scenario design chat" : "Describe what you want to generate"} onNewScenario={() => startNewScenario()}>
 
         {conversationError && <div className="mx-auto mt-4 w-full max-w-3xl px-5"><Alert variant="destructive"><AlertTitle>Chat history issue</AlertTitle><AlertDescription>{conversationError}</AlertDescription></Alert></div>}
 
-        {conversationLoading ? (
+        {workspaceView === "connections" ? <ConnectionsWorkspace connections={connections} source={source} onSource={setSource} /> : workspaceView === "schema" ? <SchemaWorkspace source={source} scenario={latestScenario} /> : workspaceView === "runs" ? <RunHistoryWorkspace /> : conversationLoading ? (
           <main className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"><Spinner /> Loading chat history…</main>
         ) : !messages.length ? (
           <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-12">
@@ -841,7 +859,7 @@ export default function Home() {
                                       scenario={scenario}
                                     />
                                   )}
-                                  {chatRuns.filter((run) => run.messageId === message.id).map((run) => <GenerationRunCard key={run.jobId} run={run} />)}
+                                  {chatRuns.filter((run) => run.messageId === message.id).map((run) => <GenerationRunCard conversationId={conversationId} key={run.jobId} run={run} />)}
                                 </BubbleContent>
                               </Bubble>
                             </MessageContent>
