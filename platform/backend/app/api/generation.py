@@ -26,6 +26,7 @@ from .auth import require_authenticated
 from ..database import get_db, SessionLocal
 from ..models.entities import JobRecord, ScenarioRecord
 from ..provider_settings import resolve_provider
+from ..evaluation.statistical_similarity import evaluate_statistical_similarity
 from ..scenario_definition import (
     scenario_definition as _scenario_definition,
     scenario_validation_message,
@@ -396,11 +397,15 @@ def _evaluation_metrics(
     dfs: Dict[str, pd.DataFrame],
     schemas: Dict[str, Any],
     scenario: ScenarioConfiguration,
+    reference_data: Optional[Dict[str, list[Dict[str, Any]]]] = None,
 ) -> tuple[list[EvaluationMetric], str, int]:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
     causal_value, causal_violations, causal_checked = _temporal_consistency(dfs, schemas)
     privacy_metric = _privacy_leakage_metric(dfs)
+    statistical_result = evaluate_statistical_similarity(
+        dfs, schemas, reference_data
+    )
     executable_checks = ScenarioEngine.evaluate_checks(
         _scenario_definition(scenario, schemas), dfs
     )
@@ -418,9 +423,14 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="statistical_similarity",
             label="Statistical similarity",
-            status="not_evaluated",
-            value="No reference",
-            detail="Provide a reference sample to compare numeric and categorical distributions.",
+            status=statistical_result.status,
+            value=(
+                "No reference"
+                if statistical_result.score is None
+                else f"{statistical_result.score:.3f}"
+            ),
+            detail=statistical_result.detail,
+            violations=statistical_result.violations,
         ),
         EvaluationMetric(
             key="semantic_correctness",
@@ -480,7 +490,12 @@ def _evaluation_metrics(
     return metrics, result, sum(metric.violations for metric in metrics)
 
 
-async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration, provider: dict[str, Any]):
+async def _run_generation_pipeline(
+    job_id: str,
+    scenario: ScenarioConfiguration,
+    provider: dict[str, Any],
+    reference_data: Optional[Dict[str, list[Dict[str, Any]]]] = None,
+):
     """
     Asynchronous generation pipeline using syda.generate.SyntheticDataGenerator
     and saving datasets to disk while persisting job metadata in the database.
@@ -569,7 +584,9 @@ async def _run_generation_pipeline(job_id: str, scenario: ScenarioConfiguration,
 
         elapsed = round(time.time() - t0, 1)
         total_records = sum(len(df) for df in dfs.values())
-        metrics, evaluation_result, total_violations = _evaluation_metrics(dfs, schemas, scenario)
+        metrics, evaluation_result, total_violations = _evaluation_metrics(
+            dfs, schemas, scenario, reference_data
+        )
         metric_by_key = {metric.key: metric for metric in metrics}
         table_row_counts = {name: len(df) for name, df in dfs.items()}
 
@@ -636,7 +653,13 @@ async def start_generation(
             detail="The generation database is unavailable. Restart the backend or check DATABASE_URL.",
         ) from error
 
-    background_tasks.add_task(_run_generation_pipeline, job_id, req.scenario, resolve_provider(db, user.id))
+    background_tasks.add_task(
+        _run_generation_pipeline,
+        job_id,
+        req.scenario,
+        resolve_provider(db, user.id),
+        req.reference_data,
+    )
 
     return JobStatusResponse(
         job_id=job_id,

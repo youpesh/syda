@@ -100,6 +100,18 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
             "referential_integrity",
             "declared_rules",
         }
+        statistical = next(
+            metric for metric in stats["evaluationMetrics"]
+            if metric["key"] == "statistical_similarity"
+        )
+        assert statistical == {
+            "key": "statistical_similarity",
+            "label": "Statistical similarity",
+            "status": "not_evaluated",
+            "value": "No reference",
+            "detail": "Provide a reference sample to compare numeric and categorical distributions.",
+            "violations": 0,
+        }
         declared_rules = next(
             metric for metric in stats["evaluationMetrics"]
             if metric["key"] == "declared_rules"
@@ -225,6 +237,43 @@ def test_evaluation_metrics_include_computed_privacy_result():
     assert privacy.violations == 0
     assert result == "partial"
     assert violations == 0
+
+
+def test_generation_evaluates_reference_data_and_surfaces_reports(monkeypatch, tmp_path):
+    reference_data = {
+        "Parent": [
+            {"name": "reference-a"},
+            {"name": "reference-b"},
+            {"name": "reference-a"},
+        ]
+    }
+    with _client(monkeypatch, tmp_path) as client:
+        created = client.post(
+            "/api/generate",
+            json={"scenario": _scenario(record_count=3), "referenceData": reference_data},
+        )
+        assert created.status_code == 200
+
+        job_id = created.json()["jobId"]
+        result = client.get(f"/api/status/{job_id}").json()
+        statistical = next(
+            metric for metric in result["stats"]["evaluationMetrics"]
+            if metric["key"] == "statistical_similarity"
+        )
+        assert statistical["status"] in {"pass", "fail"}
+        assert 0.0 <= float(statistical["value"]) <= 1.0
+        assert "chi-squared goodness-of-fit" in statistical["detail"]
+
+        json_report = client.get(f"/api/evaluation/{job_id}/report?format=json")
+        report_metric = next(
+            metric for metric in json_report.json()["metrics"]
+            if metric["key"] == "statistical_similarity"
+        )
+        assert report_metric == statistical
+
+        html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
+        assert "Statistical similarity" in html_report.text
+        assert statistical["value"] in html_report.text
 
 
 def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):
