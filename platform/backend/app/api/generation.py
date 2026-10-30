@@ -38,6 +38,7 @@ from ..models.scenario import (
     JobStats,
     ScenarioConfiguration,
     EvaluationMetric,
+    StatisticalFieldResult,
     CostEstimate,
 )
 
@@ -431,6 +432,18 @@ def _evaluation_metrics(
             ),
             detail=statistical_result.detail,
             violations=statistical_result.violations,
+            fieldResults=[
+                StatisticalFieldResult(
+                    table=field.table,
+                    column=field.column,
+                    kind=field.kind,
+                    score=field.score,
+                    ksStatistic=field.ks_statistic,
+                    wassersteinDistance=field.wasserstein_distance,
+                    chiSquareStatistic=field.chi_square_statistic,
+                )
+                for field in statistical_result.evaluated_fields
+            ],
         ),
         EvaluationMetric(
             key="semantic_correctness",
@@ -607,7 +620,7 @@ async def _run_generation_pipeline(
             "status": "complete",
             "progress": 100,
             "current_stage": "Generation and referential evaluation complete",
-            "stats": stats.model_dump(by_alias=True),
+            "stats": stats.model_dump(by_alias=True, exclude_none=True),
             "download_url": f"/api/download/{job_id}",
         })
     except Exception as e:
@@ -806,6 +819,174 @@ async def preview_generated_dataset(
     return {"jobId": job_id, "tables": tables}
 
 
+def _completed_evaluation_stats(
+    job_id: str,
+    db: Session,
+    user: User,
+) -> JobStats:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != "complete" or not job.stats:
+        raise HTTPException(status_code=409, detail="Evaluation report is not ready")
+    return JobStats.model_validate(job.stats)
+
+
+def _evaluation_report_payload(job_id: str, stats: JobStats) -> Dict[str, Any]:
+    return {
+        "schemaVersion": "1.0",
+        "jobId": job_id,
+        "result": stats.evaluation_result,
+        "recordsGenerated": stats.records_generated,
+        "pathCounts": stats.path_counts,
+        "metrics": [
+            metric.model_dump(by_alias=True, exclude_none=True)
+            for metric in stats.evaluation_metrics
+        ],
+    }
+
+
+def _format_report_number(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:.6g}"
+
+
+def _evaluation_report_html(job_id: str, stats: JobStats) -> str:
+    metrics = stats.evaluation_metrics
+    status_counts = {
+        status: sum(metric.status == status for metric in metrics)
+        for status in ("pass", "fail", "not_evaluated")
+    }
+    metric_count = max(1, len(metrics))
+    result_label = stats.evaluation_result.replace("_", " ").title()
+
+    scorecards = "".join(
+        f"""<article class="scorecard">
+          <div class="scorecard-heading"><h3>{html.escape(metric.label)}</h3><span class="badge {metric.status}">{html.escape(metric.status.replace('_', ' ').title())}</span></div>
+          <p class="metric-value">{html.escape(metric.value)}</p>
+          <p class="metric-detail">{html.escape(metric.detail)}</p>
+          <p class="violations">{metric.violations:,} violation{'s' if metric.violations != 1 else ''}</p>
+        </article>"""
+        for metric in metrics
+    )
+
+    status_chart = "".join(
+        f"""<div class="chart-row">
+          <span>{html.escape(status.replace('_', ' ').title())}</span>
+          <div class="bar-track"><span class="bar {status}" style="width:{100 * count / metric_count:.1f}%"></span></div>
+          <strong>{count}</strong>
+        </div>"""
+        for status, count in status_counts.items()
+    )
+
+    statistical_metric = next(
+        (metric for metric in metrics if metric.key == "statistical_similarity"),
+        None,
+    )
+    if statistical_metric is None or statistical_metric.field_results is None:
+        statistical_content = (
+            '<p class="empty-state">Per-field statistical details were not recorded for this run.</p>'
+        )
+    elif not statistical_metric.field_results:
+        statistical_content = (
+            '<p class="empty-state">No comparable numeric or categorical fields were evaluated.</p>'
+        )
+    else:
+        field_chart = "".join(
+            f"""<div class="field-chart-row">
+              <span><strong>{html.escape(field.table)}.{html.escape(field.column)}</strong><small>{html.escape(field.kind)}</small></span>
+              <div class="bar-track"><span class="bar score" style="width:{field.score * 100:.1f}%"></span></div>
+              <strong>{field.score * 100:.1f}%</strong>
+            </div>"""
+            for field in statistical_metric.field_results
+        )
+        field_rows = "".join(
+            f"""<tr>
+              <td>{html.escape(field.table)}</td>
+              <td>{html.escape(field.column)}</td>
+              <td>{html.escape(field.kind.title())}</td>
+              <td>{field.score:.6g}</td>
+              <td>{_format_report_number(field.ks_statistic)}</td>
+              <td>{_format_report_number(field.wasserstein_distance)}</td>
+              <td>{_format_report_number(field.chi_square_statistic)}</td>
+            </tr>"""
+            for field in statistical_metric.field_results
+        )
+        statistical_content = f"""
+          <div class="field-chart" role="img" aria-label="Per-field statistical similarity scores">{field_chart}</div>
+          <div class="table-scroll"><table>
+            <thead><tr><th>Table</th><th>Field</th><th>Type</th><th>Similarity score</th><th>KS statistic</th><th>Wasserstein distance</th><th>Chi-squared statistic</th></tr></thead>
+            <tbody>{field_rows}</tbody>
+          </table></div>"""
+
+    path_badges = "".join(
+        f'<span class="path-badge">{html.escape(path)} · {count:,}</span>'
+        for path, count in stats.path_counts.items()
+    ) or '<span class="muted">No scenario path counts recorded</span>'
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Syda evaluation {html.escape(job_id)}</title>
+  <style>
+    :root {{ color-scheme: light; --bg:#f8fafc; --surface:#fff; --text:#172033; --muted:#64748b; --border:#dbe3ee; --pass:#15803d; --pass-bg:#dcfce7; --fail:#b91c1c; --fail-bg:#fee2e2; --partial:#a16207; --partial-bg:#fef3c7; --neutral:#64748b; --neutral-bg:#e2e8f0; --accent:#0f766e; }}
+    * {{ box-sizing:border-box; }} body {{ margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }}
+    main {{ width:min(1180px,calc(100% - 32px)); margin:0 auto; padding:40px 0 56px; }}
+    header,.panel,.scorecard {{ background:var(--surface); border:1px solid var(--border); border-radius:16px; }}
+    header {{ padding:28px; }} h1,h2,h3,p {{ margin-top:0; }} h1 {{ margin-bottom:6px; font-size:clamp(1.75rem,4vw,2.5rem); }} h2 {{ margin-bottom:18px; }}
+    .headline {{ display:flex; align-items:flex-start; justify-content:space-between; gap:20px; }} .muted,.metric-detail {{ color:var(--muted); }}
+    .badge,.path-badge {{ display:inline-flex; align-items:center; border-radius:999px; font-weight:700; }} .badge {{ padding:5px 10px; font-size:12px; }} .path-badge {{ padding:5px 9px; border:1px solid var(--border); font-size:12px; }}
+    .badge.pass {{ color:var(--pass); background:var(--pass-bg); }} .badge.fail {{ color:var(--fail); background:var(--fail-bg); }} .badge.partial {{ color:var(--partial); background:var(--partial-bg); }} .badge.not_evaluated {{ color:var(--neutral); background:var(--neutral-bg); }}
+    .summary {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:24px; }} .summary div {{ padding-left:12px; border-left:3px solid var(--border); }} .summary strong {{ display:block; margin-top:2px; font-size:1.2rem; }}
+    .paths {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:20px; }} .panel {{ margin-top:20px; padding:24px; }}
+    .scorecards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }} .scorecard {{ padding:18px; }} .scorecard-heading {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }} .scorecard h3 {{ margin-bottom:0; font-size:1rem; }}
+    .metric-value {{ margin:18px 0 6px; font-size:1.7rem; font-weight:750; }} .metric-detail {{ min-height:42px; font-size:13px; }} .violations {{ margin-bottom:0; font-size:12px; font-weight:700; }}
+    .chart-row,.field-chart-row {{ display:grid; grid-template-columns:130px 1fr 40px; gap:12px; align-items:center; margin:12px 0; }} .field-chart-row {{ grid-template-columns:minmax(180px,260px) 1fr 58px; }} .field-chart-row small {{ display:block; color:var(--muted); font-weight:400; }}
+    .bar-track {{ height:12px; overflow:hidden; background:#e8edf4; border-radius:999px; }} .bar {{ display:block; height:100%; border-radius:inherit; }} .bar.pass {{ background:var(--pass); }} .bar.fail {{ background:var(--fail); }} .bar.not_evaluated {{ background:var(--neutral); }} .bar.score {{ background:var(--accent); }}
+    .table-scroll {{ margin-top:22px; overflow-x:auto; }} table {{ width:100%; border-collapse:collapse; }} th,td {{ padding:10px 12px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap; }} th {{ background:#f1f5f9; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }}
+    .empty-state {{ margin-bottom:0; padding:18px; color:var(--muted); background:#f1f5f9; border-radius:10px; }}
+    @media (max-width:700px) {{ main {{ width:min(100% - 20px,1180px); padding-top:20px; }} header,.panel {{ padding:18px; }} .headline {{ display:block; }} .headline .badge {{ margin-top:10px; }} .summary {{ grid-template-columns:1fr; }} .chart-row,.field-chart-row {{ grid-template-columns:1fr 48px; }} .chart-row>span:first-child,.field-chart-row>span:first-child {{ grid-column:1/-1; }} }}
+    @media print {{ body {{ background:#fff; }} main {{ width:100%; padding:0; }} header,.panel,.scorecard {{ break-inside:avoid; box-shadow:none; }} }}
+  </style>
+</head>
+<body><main>
+  <header>
+    <div class="headline"><div><h1>Syda evaluation report</h1><p class="muted">Job {html.escape(job_id)}</p></div><span class="badge {stats.evaluation_result}">{html.escape(result_label)}</span></div>
+    <div class="summary"><div><span class="muted">Records generated</span><strong>{stats.records_generated:,}</strong></div><div><span class="muted">Metrics evaluated</span><strong>{len(metrics)}</strong></div><div><span class="muted">Total violations</span><strong>{stats.flagged_records:,}</strong></div></div>
+    <div class="paths">{path_badges}</div>
+  </header>
+  <section class="panel"><h2>Metric scorecards</h2><div class="scorecards">{scorecards}</div></section>
+  <section class="panel"><h2>Quality status chart</h2><div role="img" aria-label="Counts of passed, failed, and not evaluated metrics">{status_chart}</div></section>
+  <section class="panel"><h2>Statistical similarity details</h2>{statistical_content}</section>
+</main></body></html>"""
+
+
+@router.get("/jobs/{job_id}/evaluation")
+async def get_evaluation_report_json(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
+):
+    """Return the structured evaluation report for one completed job."""
+    stats = _completed_evaluation_stats(job_id, db, user)
+    return JSONResponse(_evaluation_report_payload(job_id, stats))
+
+
+@router.get("/jobs/{job_id}/evaluation-report")
+async def view_evaluation_report_html(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
+):
+    """Display a self-contained evaluation report for one completed job."""
+    stats = _completed_evaluation_stats(job_id, db, user)
+    return HTMLResponse(
+        _evaluation_report_html(job_id, stats),
+        headers={"Content-Disposition": f'inline; filename="evaluation_{job_id}.html"'},
+    )
+
+
 @router.get("/evaluation/{job_id}/report")
 async def download_evaluation_report(
     job_id: str,
@@ -814,41 +995,15 @@ async def download_evaluation_report(
     user: User = Depends(require_authenticated),
 ):
     """Download the structured evaluation report as JSON or HTML."""
-    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "complete" or not job.stats:
-        raise HTTPException(status_code=409, detail="Evaluation report is not ready")
-    stats = JobStats.model_validate(job.stats)
-    report = {
-        "jobId": job_id,
-        "result": stats.evaluation_result,
-        "recordsGenerated": stats.records_generated,
-        "pathCounts": stats.path_counts,
-        "metrics": [metric.model_dump(by_alias=True) for metric in stats.evaluation_metrics],
-    }
+    stats = _completed_evaluation_stats(job_id, db, user)
+    report = _evaluation_report_payload(job_id, stats)
     if format == "json":
         return JSONResponse(
             report,
             headers={"Content-Disposition": f'attachment; filename="evaluation_{job_id}.json"'},
         )
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(metric.label)}</td>"
-        f"<td>{html.escape(metric.status.replace('_', ' ').title())}</td>"
-        f"<td>{html.escape(metric.value)}</td>"
-        f"<td>{metric.violations}</td>"
-        f"<td>{html.escape(metric.detail)}</td>"
-        "</tr>"
-        for metric in stats.evaluation_metrics
-    )
-    document = f"""<!doctype html><html><head><meta charset="utf-8"><title>Syda evaluation {html.escape(job_id)}</title>
-<style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}</style>
-</head><body><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p>
-<table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></body></html>"""
     return HTMLResponse(
-        document,
+        _evaluation_report_html(job_id, stats),
         headers={"Content-Disposition": f'attachment; filename="evaluation_{job_id}.html"'},
     )
 

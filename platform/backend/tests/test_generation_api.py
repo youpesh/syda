@@ -111,6 +111,7 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
             "value": "No reference",
             "detail": "Provide a reference sample to compare numeric and categorical distributions.",
             "violations": 0,
+            "fieldResults": [],
         }
         declared_rules = next(
             metric for metric in stats["evaluationMetrics"]
@@ -156,12 +157,30 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
 
         report = client.get(f"/api/evaluation/{job_id}/report?format=json")
         assert report.status_code == 200
+        assert report.headers["content-disposition"].startswith("attachment;")
+        assert report.json()["schemaVersion"] == "1.0"
         assert report.json()["result"] == "partial"
         assert len(report.json()["metrics"]) == 7
 
         html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
         assert html_report.status_code == 200
+        assert html_report.headers["content-disposition"].startswith("attachment;")
         assert "Syda evaluation report" in html_report.text
+
+        json_report = client.get(f"/api/jobs/{job_id}/evaluation")
+        assert json_report.status_code == 200
+        assert json_report.json() == report.json()
+
+        inline_report = client.get(f"/api/jobs/{job_id}/evaluation-report")
+        assert inline_report.status_code == 200
+        assert inline_report.headers["content-disposition"].startswith("inline;")
+        assert '<meta name="viewport"' in inline_report.text
+        assert "Metric scorecards" in inline_report.text
+        assert "Quality status chart" in inline_report.text
+        assert "Privacy leakage risk" in inline_report.text
+        assert "Statistical similarity" in inline_report.text
+        assert "<script" not in inline_report.text
+        assert "<link" not in inline_report.text
 
 
 def test_privacy_leakage_passes_when_every_equivalence_class_has_three_records():
@@ -242,15 +261,17 @@ def test_evaluation_metrics_include_computed_privacy_result():
 def test_generation_evaluates_reference_data_and_surfaces_reports(monkeypatch, tmp_path):
     reference_data = {
         "Parent": [
-            {"name": "reference-a"},
-            {"name": "reference-b"},
-            {"name": "reference-a"},
+            {"name": "reference-a", "age": 20},
+            {"name": "reference-b", "age": 30},
+            {"name": "reference-a", "age": 40},
         ]
     }
+    scenario = _scenario(record_count=3)
+    scenario["schemas"]["Parent"]["age"] = "integer"
     with _client(monkeypatch, tmp_path) as client:
         created = client.post(
             "/api/generate",
-            json={"scenario": _scenario(record_count=3), "referenceData": reference_data},
+            json={"scenario": scenario, "referenceData": reference_data},
         )
         assert created.status_code == 200
 
@@ -263,6 +284,14 @@ def test_generation_evaluates_reference_data_and_surfaces_reports(monkeypatch, t
         assert statistical["status"] in {"pass", "fail"}
         assert 0.0 <= float(statistical["value"]) <= 1.0
         assert "chi-squared goodness-of-fit" in statistical["detail"]
+        numeric = next(
+            field for field in statistical["fieldResults"]
+            if field["column"] == "age"
+        )
+        assert numeric["kind"] == "numeric"
+        assert 0.0 <= numeric["ksStatistic"] <= 1.0
+        assert numeric["wassersteinDistance"] >= 0.0
+        assert "chiSquareStatistic" not in numeric
 
         json_report = client.get(f"/api/evaluation/{job_id}/report?format=json")
         report_metric = next(
@@ -274,6 +303,97 @@ def test_generation_evaluates_reference_data_and_surfaces_reports(monkeypatch, t
         html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
         assert "Statistical similarity" in html_report.text
         assert statistical["value"] in html_report.text
+        assert "KS statistic" in html_report.text
+        assert "Wasserstein distance" in html_report.text
+        assert f'{numeric["ksStatistic"]:.6g}' in html_report.text
+        assert f'{numeric["wassersteinDistance"]:.6g}' in html_report.text
+
+        alias_json = client.get(f"/api/jobs/{job_id}/evaluation")
+        assert alias_json.status_code == 200
+        alias_statistical = next(
+            metric for metric in alias_json.json()["metrics"]
+            if metric["key"] == "statistical_similarity"
+        )
+        assert alias_statistical["fieldResults"] == statistical["fieldResults"]
+
+        alias_html = client.get(f"/api/jobs/{job_id}/evaluation-report")
+        assert alias_html.status_code == 200
+        assert "KS statistic" in alias_html.text
+        assert "Wasserstein distance" in alias_html.text
+
+
+def test_report_aliases_handle_historical_and_incomplete_jobs(monkeypatch, tmp_path):
+    historical_stats = {
+        "causalIntegrity": "Not evaluated",
+        "referentialIntegrity": "100.0%",
+        "compliance": "Not evaluated",
+        "recordsGenerated": 3,
+        "flaggedRecords": 0,
+        "durationSeconds": 0.1,
+        "tableRowCounts": {"Parent": 3},
+        "pathCounts": {"default": 3},
+        "evaluationResult": "partial",
+        "evaluationMetrics": [
+            {
+                "key": "statistical_similarity",
+                "label": "Statistical similarity",
+                "status": "not_evaluated",
+                "value": "No reference",
+                "detail": "Historical aggregate result",
+                "violations": 0,
+            },
+            {
+                "key": "privacy_leakage",
+                "label": "Privacy leakage risk",
+                "status": "pass",
+                "value": "k=3; risk=0.0%",
+                "detail": "Historical privacy result",
+                "violations": 0,
+            },
+        ],
+    }
+    with _client(monkeypatch, tmp_path) as client:
+        with database.SessionLocal() as session:
+            session.add_all(
+                [
+                    JobRecord(
+                        id="historical-report",
+                        status="complete",
+                        progress=100,
+                        current_stage="Complete",
+                        scenario=_scenario(record_count=3),
+                        stats=historical_stats,
+                        user_id=_TEST_USER.id,
+                    ),
+                    JobRecord(
+                        id="report-pending",
+                        status="evaluating",
+                        progress=90,
+                        current_stage="Evaluating",
+                        scenario=_scenario(record_count=3),
+                        user_id=_TEST_USER.id,
+                    ),
+                ]
+            )
+            session.commit()
+
+        historical_json = client.get("/api/jobs/historical-report/evaluation")
+        assert historical_json.status_code == 200
+        statistical = next(
+            metric for metric in historical_json.json()["metrics"]
+            if metric["key"] == "statistical_similarity"
+        )
+        assert "fieldResults" not in statistical
+
+        historical_html = client.get("/api/jobs/historical-report/evaluation-report")
+        assert historical_html.status_code == 200
+        assert "Per-field statistical details were not recorded for this run." in historical_html.text
+        assert "Privacy leakage risk" in historical_html.text
+
+        assert client.get("/api/jobs/report-pending/evaluation").status_code == 409
+        assert client.get("/api/jobs/report-pending/evaluation-report").status_code == 409
+        assert client.get("/api/jobs/missing-report/evaluation").status_code == 404
+        assert client.get("/api/jobs/missing-report/evaluation-report").status_code == 404
 
 
 def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):
