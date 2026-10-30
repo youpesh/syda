@@ -1,6 +1,7 @@
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
   AlertCircleIcon,
+  ArrowUpRight01Icon,
   CheckmarkCircle02Icon,
   Download01Icon,
   InformationCircleIcon,
@@ -205,10 +206,13 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
       </CardContent>
       <CardFooter className="flex-wrap justify-end gap-2">
         <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=json`, "_blank")} type="button" variant="outline">
-          <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Report JSON
+          <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Download JSON
         </Button>
-        <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=html`, "_blank")} type="button">
-          <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Report HTML
+        <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=html`, "_blank")} type="button" variant="outline">
+          <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Download HTML
+        </Button>
+        <Button onClick={() => window.open(`/api/jobs/${jobId}/evaluation-report`, "_blank")} type="button">
+          <HugeiconsIcon data-icon="inline-start" icon={ArrowUpRight01Icon} strokeWidth={2} />View Evaluation Report
         </Button>
       </CardFooter>
     </Card>
