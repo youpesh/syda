@@ -54,31 +54,13 @@ jobs:
         run: python3 scripts/deploy_staging.py resolve
 
   build:
-    name: Build selected commit without deployment credentials
     needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ needs.resolve.outputs.sha }}
-          path: source
-          persist-credentials: false
-      - name: Build platform images
-        env:
-          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
-        run: |
-          docker build --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t syda-staging-backend:build -f source/platform/backend/Dockerfile source
-          docker build --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t syda-staging-frontend:build source/platform/frontend
-          docker save syda-staging-backend:build syda-staging-frontend:build | gzip > "$RUNNER_TEMP/staging-images.tar.gz"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: staging-images
-          path: ${{ runner.temp }}/staging-images.tar.gz
-          retention-days: 1
-          compression-level: 0
+    uses: ./.github/workflows/build-staging-images.yml
+    with:
+      source_sha: ${{ needs.resolve.outputs.sha }}
+      upload_artifact: true
 
   publish:
     name: Publish built images from a fresh runner
