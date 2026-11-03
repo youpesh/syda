@@ -14,7 +14,8 @@ deploy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deploy)
 SHA = "a" * 40
 CONTROL_SHA = "b" * 40
-SNAPSHOT = f"staging-snapshots/12-1-{SHA}"
+BACKEND = "ghcr.io/owner/repo-staging-backend@sha256:" + "c" * 64
+FRONTEND = "ghcr.io/owner/repo-staging-frontend@sha256:" + "d" * 64
 TITLE = f"github-staging-12-1-{SHA}"
 
 
@@ -28,7 +29,7 @@ class DeploymentTests(unittest.TestCase):
             "GITHUB_OUTPUT": self.temp.name + "/output",
             "GITHUB_STEP_SUMMARY": self.temp.name + "/summary",
             "DEFAULT_BRANCH": "feat/web-platform", "INPUT_BRANCH": "", "INPUT_PR": "",
-            "DEPLOY_SHA": SHA, "STAGING_ISOLATION_CONFIRMED": "true",
+            "DEPLOY_SHA": SHA, "STAGING_BACKEND_IMAGE": BACKEND, "STAGING_FRONTEND_IMAGE": FRONTEND,
             "DOKPLOY_URL": "https://example.ngrok-free.app",
             "DOKPLOY_API_KEY": "test-dokploy-key", "DOKPLOY_COMPOSE_ID": "staging",
             "DOKPLOY_ENVIRONMENT_ID": "stage-env",
@@ -38,14 +39,12 @@ class DeploymentTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.config = {
-            "composeId": "staging", "environmentId": "stage-env", "sourceType": "github",
-            "owner": "owner", "repository": "repo", "branch": "feat/web-platform",
+            "composeId": "staging", "environmentId": "stage-env", "sourceType": "raw",
+            "composeFile": (Path(__file__).resolve().parents[2] / "platform/docker-compose.staging.yml").read_text(),
             "autoDeploy": False, "composeStatus": "done", "env": "sensitive-runtime-env",
             "appName": "keep-volume-identity", "composePath": "existing/compose.yml",
         }
         self.gh = Mock(repo="owner/repo")
-        self.gh.ref_sha.return_value = SHA
-        self.gh.call.return_value = [{"type": "update"}, {"type": "deletion", "parameters": None}]
         self.dokploy = deploy.Dokploy()
         self.calls = []
 
@@ -55,8 +54,11 @@ class DeploymentTests(unittest.TestCase):
                 return dict(self.config)
             if endpoint.startswith("deployment.allByCompose"):
                 return []
-            if endpoint == "compose.update":
-                self.config.update(payload)
+            if endpoint == "compose.saveEnvironment":
+                values = dict(line.split("=", 1) for line in payload["env"].splitlines())
+                self.config.update(sourceCommit=values["STAGING_SOURCE_SHA"],
+                                   backendImage=values["STAGING_BACKEND_IMAGE"],
+                                   frontendImage=values["STAGING_FRONTEND_IMAGE"])
             return True
 
         self.dokploy.call = Mock(side_effect=call)
@@ -67,10 +69,11 @@ class DeploymentTests(unittest.TestCase):
             deploy.deploy(self.gh, self.dokploy)
         return health
 
-    def test_success_preserves_configuration_and_uses_exact_snapshot(self):
+    def test_success_preserves_configuration_and_uses_exact_digests(self):
         health = self.run_deploy()
-        self.gh.create_ref.assert_any_call(SNAPSHOT, SHA)
-        self.assertIn(("compose.update", {"composeId": "staging", "branch": SNAPSHOT}), self.calls)
+        self.gh.create_ref.assert_called_once_with(deploy.LOCK_BRANCH, CONTROL_SHA)
+        self.assertEqual(self.config["backendImage"], BACKEND)
+        self.assertEqual(self.config["frontendImage"], FRONTEND)
         self.assertIn(("compose.deploy", {"composeId": "staging", "title": TITLE,
                       "description": f"Exact source commit {SHA}", "freshVolumes": False}), self.calls)
         self.assertEqual(self.config["env"], "sensitive-runtime-env")
@@ -79,15 +82,10 @@ class DeploymentTests(unittest.TestCase):
         health.assert_called_once()
         self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
 
-    def test_custom_git_source(self):
-        self.config.update(sourceType="git", customGitUrl="git@github.com:owner/repo.git")
-        self.run_deploy()
-        self.assertIn(("compose.update", {"composeId": "staging", "customGitBranch": SNAPSHOT}), self.calls)
-
     def test_guard_rejections_never_deploy(self):
         for change in ({"environmentId": "production"}, {"composeId": "production"},
-                       {"autoDeploy": True}, {"autoDeploy": None}, {"sourceType": "raw"},
-                       {"repository": "other"}, {"composeStatus": "running"}):
+                       {"autoDeploy": True}, {"autoDeploy": None}, {"sourceType": "github"},
+                       {"composeFile": "untrusted compose"}, {"composeStatus": "running"}):
             with self.subTest(change=change):
                 original = dict(self.config)
                 self.config.update(change)
@@ -96,24 +94,14 @@ class DeploymentTests(unittest.TestCase):
                 self.config = original
         self.assertFalse(any(endpoint == "compose.deploy" for endpoint, _ in self.calls))
 
-    def test_isolation_acknowledgement_required(self):
-        os.environ["STAGING_ISOLATION_CONFIRMED"] = "false"
-        with self.assertRaises(deploy.DeployError):
-            self.run_deploy()
+    def test_mutable_or_foreign_image_rejected(self):
+        for image in ("ghcr.io/owner/repo-staging-backend:latest", FRONTEND,
+                      "ghcr.io/other/repo-staging-backend@sha256:" + "a" * 64):
+            with self.subTest(image=image):
+                os.environ["STAGING_BACKEND_IMAGE"] = image
+                with self.assertRaises(deploy.DeployError):
+                    self.run_deploy()
         self.gh.create_ref.assert_not_called()
-
-    def test_snapshot_rules_required(self):
-        self.gh.call.return_value = [{"type": "deletion"}]
-        with self.assertRaisesRegex(deploy.DeployError, "Snapshot branch"):
-            self.run_deploy()
-        self.assertFalse(any(endpoint == "compose.update" for endpoint, _ in self.calls))
-
-    def test_snapshot_rules_allowing_merges_rejected(self):
-        self.gh.call.return_value = [
-            {"type": "update", "parameters": {"update_allows_fetch_and_merge": True}},
-            {"type": "deletion"}]
-        with self.assertRaisesRegex(deploy.DeployError, "Snapshot branch"):
-            self.run_deploy()
 
     def test_active_deployment_blocks_source_update(self):
         original = self.dokploy.call.side_effect
@@ -126,13 +114,7 @@ class DeploymentTests(unittest.TestCase):
         self.dokploy.call.side_effect = active
         with self.assertRaisesRegex(deploy.DeployError, "active/unknown"):
             self.run_deploy()
-        self.assertFalse(any(endpoint == "compose.update" for endpoint, _ in self.calls))
-
-    def test_changed_snapshot_cannot_trigger_deploy(self):
-        self.gh.ref_sha.return_value = CONTROL_SHA
-        with self.assertRaisesRegex(deploy.DeployError, "SHA mismatch"):
-            self.run_deploy()
-        self.assertFalse(any(endpoint == "compose.deploy" for endpoint, _ in self.calls))
+        self.assertFalse(any(endpoint == "compose.saveEnvironment" for endpoint, _ in self.calls))
 
     def test_existing_lock_blocks_all_dokploy_access(self):
         self.gh.create_ref.side_effect = deploy.HTTPFailure(422)

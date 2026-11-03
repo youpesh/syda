@@ -1,11 +1,12 @@
 """Manual shared-staging deploy controller. Python standard library only.
 
 Only this script from the trusted workflow revision runs on the Actions runner;
-selected source is fetched and built by Dokploy, never imported here.
+selected source builds on an isolated GitHub runner. Dokploy only pulls images.
 """
 
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import time
@@ -91,10 +92,6 @@ class GitHub:
     def create_ref(self, branch, sha):
         self.call("git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
 
-    def ref_sha(self, branch):
-        return self.call(f"git/ref/heads/{quote(branch)}")["object"]["sha"]
-
-
 def quote(value):
     return urllib.parse.quote(value, safe="")
 
@@ -127,7 +124,7 @@ def resolve(gh):
         sha = valid_sha(source["head"]["sha"])
     else:
         branch = branch or os.environ["DEFAULT_BRANCH"]
-        if branch.startswith("staging-snapshots/") or branch == LOCK_BRANCH:
+        if branch == LOCK_BRANCH:
             raise DeployError("Choose a source branch, not a deployment control branch")
         sha = valid_sha(gh.call(f"branches/{quote(branch)}")["commit"]["sha"])
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
@@ -160,7 +157,7 @@ class Dokploy:
             raise DeployError("Unexpected Dokploy deployment history schema")
         return rows
 
-    def check_config(self, config, repo):
+    def check_config(self, config):
         if (config.get("composeId") != self.compose_id
                 or config.get("environmentId") != self.environment_id):
             raise DeployError("Dokploy staging service/environment identity mismatch")
@@ -168,18 +165,16 @@ class Dokploy:
             raise DeployError("Disable Dokploy Auto Deploy for staging before proceeding")
         if config.get("composeStatus") == "running":
             raise DeployError("Dokploy staging is already running a deployment")
-        source = config.get("sourceType")
-        if source == "github":
-            if f"{config.get('owner')}/{config.get('repository')}".lower() != repo.lower():
-                raise DeployError("Staging source repository does not match GitHub")
-            return "branch"
-        if source == "git":
-            urls = {f"https://github.com/{repo}", f"https://github.com/{repo}.git",
-                    f"git@github.com:{repo}.git"}
-            if config.get("customGitUrl", "").lower() not in {url.lower() for url in urls}:
-                raise DeployError("Staging custom Git source does not match this GitHub repository")
-            return "customGitBranch"
-        raise DeployError("This workflow requires an existing Git/GitHub Dokploy Compose service")
+        template = Path(__file__).resolve().parents[1] / "platform/docker-compose.staging.yml"
+        if config.get("sourceType") != "raw" or config.get("composeFile") != template.read_text():
+            raise DeployError("Staging must use the fixed trusted image-only Compose template")
+
+
+def image_reference(repo, service, value):
+    prefix = f"ghcr.io/{repo.lower()}-staging-{service}@sha256:"
+    if not re.fullmatch(re.escape(prefix) + r"[0-9a-f]{64}", value):
+        raise DeployError("Expected an immutable staging image digest for this repository")
+    return value
 
 
 def wait_for_deployment(dokploy, title, previous):
@@ -222,16 +217,15 @@ def check_health(api_url, web_url):
 
 
 def deploy(gh, dokploy):
-    if os.environ.get("STAGING_ISOLATION_CONFIRMED") != "true":
-        raise DeployError("Complete the staging isolation/security checklist in platform/STAGING.md")
     sha = valid_sha(os.environ["DEPLOY_SHA"])
+    backend = image_reference(gh.repo, "backend", os.environ["STAGING_BACKEND_IMAGE"])
+    frontend = image_reference(gh.repo, "frontend", os.environ["STAGING_FRONTEND_IMAGE"])
     api_url = https_url(os.environ["STAGING_API_HEALTH_URL"])
     web_url = https_url(os.environ["STAGING_WEB_HEALTH_URL"])
     run = os.environ["GITHUB_RUN_ID"]
     attempt = os.environ["GITHUB_RUN_ATTEMPT"]
     if not re.fullmatch(r"[0-9]+", run) or not re.fullmatch(r"[0-9]+", attempt):
         raise DeployError("Invalid GitHub run identity")
-    snapshot = f"staging-snapshots/{run}-{attempt}-{sha}"
     title = f"github-staging-{run}-{attempt}-{sha}"
     # Atomic, durable lock survives runner cancellation, timeouts and ambiguous
     # API failures. It is intentionally outside the immutable snapshot ruleset.
@@ -244,25 +238,20 @@ def deploy(gh, dokploy):
     safe_to_unlock = True
     try:
         config = dokploy.one()
-        branch_field = dokploy.check_config(config, gh.repo)
+        dokploy.check_config(config)
         history = dokploy.history()
         if any(row.get("status") not in ("done", "error", "cancelled") for row in history):
             raise DeployError("Staging has an active/unknown deployment; wait for it to finish")
         previous = {row["deploymentId"] for row in history}
-        gh.create_ref(snapshot, sha)
-        rules = gh.call(f"rules/branches/{quote(snapshot)}?per_page=100")
-        immutable = {rule["type"] for rule in rules
-                     if not (rule.get("parameters") or {}).get("update_allows_fetch_and_merge", False)}
-        if not {"update", "deletion"}.issubset(immutable):
-            raise DeployError("Snapshot branch requires active rules restricting updates AND deletions")
-        if gh.ref_sha(snapshot) != sha:
-            raise DeployError("Snapshot SHA mismatch")
-        # Patch only the source pointer. Preserve env, domains, compose path,
-        # project name, volumes, database and every other existing setting.
-        dokploy.call("compose.update", {"composeId": dokploy.compose_id, branch_field: snapshot})
-        if dokploy.one().get(branch_field) != snapshot:
-            raise DeployError("Dokploy did not retain the selected source snapshot")
-        note(f"Deploying staging commit `{sha}` using `{snapshot}`.")
+        # The staging gateway merges only these three values server-side, keeping
+        # runtime secrets off the runner. It rejects all Compose/mount changes.
+        env = f"STAGING_BACKEND_IMAGE={backend}\nSTAGING_FRONTEND_IMAGE={frontend}\nSTAGING_SOURCE_SHA={sha}"
+        dokploy.call("compose.saveEnvironment", {"composeId": dokploy.compose_id, "env": env})
+        selected = dokploy.one()
+        if (selected.get("sourceCommit") != sha or selected.get("backendImage") != backend
+                or selected.get("frontendImage") != frontend):
+            raise DeployError("Staging gateway did not retain the selected image digests")
+        note(f"Deploying staging commit `{sha}` with immutable backend/frontend image digests.")
         safe_to_unlock = False  # A failed POST may still have enqueued a deployment.
         dokploy.call("compose.deploy", {"composeId": dokploy.compose_id, "title": title,
                                        "description": f"Exact source commit {sha}",
@@ -271,8 +260,10 @@ def deploy(gh, dokploy):
         safe_to_unlock = True  # This run is definitively terminal.
         if status != "done":
             raise DeployError(f"Dokploy staging deployment ended with status: {status}")
-        if gh.ref_sha(snapshot) != sha or dokploy.one().get(branch_field) != snapshot:
-            raise DeployError("Source configuration changed during deployment")
+        selected = dokploy.one()
+        if (selected.get("sourceCommit") != sha or selected.get("backendImage") != backend
+                or selected.get("frontendImage") != frontend):
+            raise DeployError("Selected images changed during deployment")
         check_health(api_url, web_url)
         note(f"Staging deployment completed for `{sha}`; API and frontend health checks passed.")
     finally:
@@ -289,7 +280,8 @@ def main():
             resolve(GitHub())
         elif sys.argv[1:] == ["deploy"]:
             required = ("DOKPLOY_URL", "DOKPLOY_API_KEY", "DOKPLOY_COMPOSE_ID",
-                        "DOKPLOY_ENVIRONMENT_ID", "STAGING_API_HEALTH_URL", "STAGING_WEB_HEALTH_URL")
+                        "DOKPLOY_ENVIRONMENT_ID", "STAGING_API_HEALTH_URL", "STAGING_WEB_HEALTH_URL",
+                        "STAGING_BACKEND_IMAGE", "STAGING_FRONTEND_IMAGE")
             if any(not os.environ.get(key) for key in required):
                 raise DeployError("Missing staging environment configuration; see platform/STAGING.md")
             deploy(GitHub(), Dokploy())

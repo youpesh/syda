@@ -1,275 +1,241 @@
-# Manual staging deployment
+# Manual staging deployments
 
-## Architecture and decision
+## Architecture
 
-Inspection on 2026-11-03 found `platform/docker-compose.yml` with PostgreSQL,
-backend and frontend services, and named `postgres_data`, `job_data`, and
-`settings_data` volumes. The backend builds from the repository root; the frontend
-builds from `platform/frontend`. The root `Dockerfile` builds documentation, **not
-the platform**. The checked-out branch contains only the GitHub Pages docs
-workflow (pushes to `main`); it is unchanged. GitHub also lists CI and Generation
-queue workflows, but their files are absent on both the default branch and main.
-GitHub's current default branch is `feat/web-platform`, despite the local
-`origin/HEAD` pointing at `main`. No staging branch, Dokploy configuration,
-Actions environments, Actions secrets or variables were found during the initial
-repository inspection.
+Production remains the existing `syda-stack` raw Compose service in Dokploy
+v0.30.6, on the same machine as the new staging stack. Production's Compose,
+containers, data, domains and ngrok tunnel are not changed. Its current ngrok
+endpoint forwards to the production frontend, not Dokploy.
 
-Follow-up server inspection over Tailscale SSH found Dokploy **v0.30.6** and an
-existing `syda-stack` service in the `syda` project's **production** environment.
-It uses **raw Compose**, has Auto Deploy enabled, and builds from absolute host
-paths under `/etc/dokploy/syda`. Its ngrok tunnel forwards to `frontend:3000`,
-not the Dokploy API. No separate staging service or registered remote server was
-found. The existing public frontend and `/api/health` responded successfully to
-read-only probes; `/health` on that frontend returned 404. This is a health probe,
-not a deployment test. The existing stack, tunnel and data were left unchanged.
+Staging is a separate Dokploy project/environment/service, with its own database,
+volumes, auth secret and network. GitHub-hosted runners build the selected commit;
+Dokploy only pulls the finished images and starts containers. This avoids builds
+competing with production for CPU/memory and reuses the repository's existing
+backend/frontend Dockerfiles. The root Dockerfile builds docs, not the platform.
 
-GitHub setup completed: the `staging` Environment allows only the default branch,
-has no required deployment reviewers/wait timer, and disallows administrator
-bypass. The immutable snapshot ruleset is active with no bypass actors. No
-Dokploy credentials or target variables have been configured. The workflow is in
-PR #10 and still requires the default branch's normal code review before merge.
-Provision or identify the intended staging target before enabling deployment;
-do not use the existing production service ID. A Git-based staging service must
-build from its cloned source, with relative contexts as in the platform Compose
-file; copying the existing absolute host paths would build unrelated working-tree
-content instead of the selected commit.
+The workflow has four jobs:
 
-Use **one shared staging Compose service** with a selectable branch or open
-same-repository PR. This reuses the existing stack and needs no registry, preview
-database, additional deployment platform or engineer Dokploy accounts. Concurrent
-PR environments would require unique Compose/container names, separate databases,
-volumes, ports and domains; the existing fixed container names and published ports
-are unsuitable for that. This implementation does not create preview environments.
+1. **Resolve:** runs trusted controller code from the protected repository default
+   branch (currently `feat/web-platform`), resolving a branch or open
+   same-repository PR to a full commit SHA.
+2. **Build:** checks out only that SHA, builds both images without deployment
+   credentials or registry write access, and uploads a one-day image artifact.
+   No selected repository script runs outside Docker's build sandbox.
+3. **Publish:** on a fresh runner, loads the artifact and pushes it to GHCR using
+   the short-lived `GITHUB_TOKEN`. It does not execute either image. Unique tags
+   contain the SHA/run/attempt; the deployment receives immutable SHA256 digests.
+4. **Deploy:** on another fresh runner, executes only trusted controller code.
+   It selects the two digests, triggers staging through a restricted gateway,
+   polls this run's Dokploy deployment record, and checks API/frontend health.
 
-The workflow runs only on `workflow_dispatch`, and only when its **Run workflow
-branch selector is the repository default branch**. It resolves the input to a
-full SHA, displays it in the run summary, then creates a unique branch
-`staging-snapshots/<run>-<attempt>-<sha>` at that SHA. Active GitHub rules must
-prohibit all updates and deletions of these snapshots. Dokploy's Git/GitHub clone
-uses a branch name (`git clone --branch … --depth 1`); passing an arbitrary SHA
-there is not a supported substitute. The workflow updates only the staging
-service's source branch, calls `compose.deploy`, waits for the deployment record
-with this run's unique title, and checks the API and frontend health URLs.
+There are **no push, PR or merge triggers**. Repository writers can manually
+select a branch or PR without deployment approvals. The GitHub `staging`
+Environment permits only the exact default branch, has no required reviewers or
+wait timer, and disallows admin bypass. Normal reviews for changes to the default
+branch remain enforced. Public read access does not grant deployment permission.
 
-The selected source is never checked out or executed on the Actions runner. The
-runner executes the controller from the workflow's trusted `github.sha`. Selected
-Dockerfiles and Compose code **do execute on staging**, with access to staging
-runtime secrets and data. Review the resolved SHA accordingly. A PR deploy uses
-its head commit, not GitHub's synthetic merge commit; it does not test integration
-with the base branch. New commits pushed after source resolution are excluded.
-Any engineer with repository write access can dispatch staging without a separate
-deployment review; public read access does not grant permission to deploy.
+PRs deploy their head SHA, not GitHub's synthetic merge commit. Fork PRs are
+rejected. Later branch pushes do not change a previously resolved selection.
+Every selection replaces one shared staging environment; separate PR databases,
+domains or per-PR stacks are not provisioned.
 
-## One-time owner setup: security boundary
+## Shared-host security boundary
 
-Complete these before enabling the workflow or setting the confirmation variable:
+The staging service uses the **fixed, owner-installed**
+`platform/docker-compose.staging.yml`. It has no builds, host filesystem mounts,
+Docker socket, privileged containers or production credentials. App containers
+run without root/capabilities, with read-only root filesystems, temporary writable
+storage and resource limits. Staging jobs/settings volumes must be initialized
+with UID/GID 10001 ownership. PostgreSQL uses a separate staging-only password.
 
-1. Keep staging on a Docker host/VM isolated from production. Do not share the
-   Docker daemon/socket, host mounts, deployment SSH credentials, databases,
-   production API keys or networks that permit production administration. A
-   Dokploy project/environment alone does not sandbox hostile Compose code: it
-   can request privileged containers or host mounts. If staging already has its
-   own host, reuse it. Otherwise provision this isolation before deploying PRs.
-   Do not copy production data or credentials into staging.
-2. Have an owner create a dedicated Dokploy automation identity. Engineers need
-   repository write access to dispatch, **not** Dokploy accounts. Grant the
-   automation identity access only to the staging Compose service/project and
-   environment. Grant service read/source-update and deployment read/create
-   permissions as narrowly as the installed edition allows. Disable terminal,
-   Docker/global settings, other servers, user management and production access.
-   Generate its API key; do not use an owner/admin API key on a shared instance.
-3. Verify scope on the **installed Dokploy version** before storing the key:
-   staging `compose.one`, `compose.update` (same branch value), deployment history
-   and deploy must be allowed; production reads must be denied. Verify update and
-   deployment authorization using an expendable inaccessible test service, never
-   by attempting a production deployment. Review the identity's service allowlist
-   and role permissions. API authentication/authorization behavior varies by
-   version/edition. If it cannot enforce this boundary, use a staging-only
-   Dokploy instance on the isolated staging host with no production servers or
-   credentials registered. An unrestricted shared-instance key is not acceptable.
-4. Protect the repository default branch: require reviewed PRs, dismiss stale
-   approvals, prevent force pushes/deletion, and limit bypass/admin access.
-   Require trusted deployment owners to review changes to **all** workflows and
-   `scripts/deploy_staging.py`, including through CODEOWNERS if desired. Configure
-   actual required-review enforcement; a CODEOWNERS file by itself is insufficient.
-   No CODEOWNERS identities are invented in this change.
-5. Create the GitHub Environment **`staging`**. Its deployment branch policy must
-   allow **only the exact default branch** (currently `feat/web-platform`), not
-   all protected branches or all tags. Leave required reviewers empty and the
-   wait timer disabled: deployment starts after a manual dispatch without an
-   approval gate. Keep administrator bypass disabled. Repository write access
-   controls who can dispatch; workflow/controller changes still require the
-   default branch's normal code review protections.
-6. Create an **active branch ruleset** matching
-   `refs/heads/staging-snapshots/**/*` (or UI pattern `staging-snapshots/**/*`).
-   Enable **Restrict updates** and **Restrict deletions**, with an **empty bypass
-   list**, including no Actions app bypass. Allow creation (do not enable Restrict
-   creations). Disable any exception allowing fetch-and-merge updates. Do not
-   require PRs/status checks on snapshot creation. Leave
-   `staging-deployment-lock` outside this ruleset. The controller checks the
-   effective rules for each snapshot and fails before changing Dokploy if absent.
-   Keep Actions `contents: write` permitted for this workflow. Its short-lived
-   `GITHUB_TOKEN` creates refs; no PAT is needed. Snapshots remain for audit.
+A selected PR's Dockerfile runs on a disposable GitHub runner, never the server.
+Its Compose file is not used. Selected application code does run in staging and
+can read/modify staging data and any staging runtime credentials; all repository
+writers must be trusted with those. Shared containers still share a kernel and
+host resources. This is not VM isolation: a container/kernel escape or host-wide
+outage can affect production. Resource limits reduce contention but do not remove
+that shared-host risk.
 
-Environment secrets do **not** make arbitrary workflow changes safe. An engineer
-who can alter an approved workflow can add a step to exfiltrate any secret that
-job receives, remove its guards, or request broader `GITHUB_TOKEN` permissions.
-The exact-branch environment restriction and reviewed default branch reduce that
-risk; there is no per-deployment reviewer. Treat every repository writer as
-authorized to run selected code with staging runtime secrets and data.
-The Dokploy-side scope and host isolation enforce the
-production boundary even if the staging key is stolen. Repository/environment
-administrators remain trusted. Keep production secrets inaccessible to this
-environment and production workflows protected independently.
+A tiny standard-library gateway (`scripts/staging_gateway.py`) is necessary on
+this Dokploy edition because its base member role also permits mount management.
+Putting a normal member key directly in Actions would give the workflow more
+control than selecting images and deploying. Instead:
 
-## One-time owner setup: existing Dokploy and ngrok
+- The real Dokploy key belongs to a dedicated non-admin automation account whose
+  allowlist contains only the staging project, environment and service. It has
+  no service-creation, Docker, SSH-key, Git-provider or production access.
+- That key stays in a private server-side configuration file and is **never**
+  stored in GitHub, passed to a build, or returned by the gateway.
+- GitHub receives an independent random **staging deployment token**. The gateway
+  accepts only four API operations: staging config read, filtered staging history,
+  selection of two validated GHCR digests plus SHA, and a volume-preserving
+  staging deployment. Arbitrary environment keys, Compose edits, mounts, other
+  service IDs, redirects and volume resets are rejected.
+- The gateway verifies the fixed Compose text and absence of extra mounts/custom
+  commands before deployment. It merges image selection into Dokploy's existing
+  staging environment server-side, keeping runtime secrets off Actions runners.
+- It listens on loopback and forwards other HTTP requests to the staging frontend;
+  the real Dokploy UI/API is not publicly proxied. It does not have Docker socket
+  or host filesystem administration access.
 
-1. Identify the actual existing **staging Compose service** and its environment
-   ID. Check that it is not production. The workflow supports source type
-   `github` or `git` pointing at this GitHub repository; it deliberately rejects
-   raw Compose, GitLab and unrelated repositories. If the live deployment uses
-   separate Dokploy Applications instead of Compose, do not repoint this workflow
-   at one of their IDs: adapt it after inspecting that setup.
-2. Keep the existing Compose path, app/project name, domain mappings, environment
-   variables, mounts and volume identities. For a new platform staging service,
-   the repository's platform Compose path is `platform/docker-compose.yml`, not
-   the root Dockerfile. Review its development defaults (database password,
-   published database port, CORS) and provide staging settings in Dokploy. Reuse
-   existing staging overrides rather than replacing them with this development
-   file. Do not rename/recreate an existing service or change its Compose project
-   name to install this workflow; that can create new volumes. Back up staging
-   data before the first deployment. Audit any Dokploy file patches: these apply
-   after cloning and can alter source files. Pinning the Git commit does not make
-   external image tags, package downloads or existing Dokploy patches reproducible.
-3. Disable **Auto Deploy**, preview deployments, and any push/PR webhooks or
-   external automation that deploy this staging service. Keep repository read
-   access configured in Dokploy (GitHub App or read-only deploy key) so it can
-   clone snapshot branches. Keep that integration's permissions limited to the
-   needed repository. No workflow enables auto deployment or changes production.
-4. Reuse the existing ngrok HTTPS origin forwarding to Dokploy. Keep the agent
-   running as a service. Free ngrok supplies an assigned dev domain; if your
-   actual forwarding URL changes, update the environment variable. No ngrok
-   authtoken belongs in GitHub: Actions is an HTTP client, not a tunnel host.
-   Ensure any ngrok access policy permits these API requests; browser OAuth/login
-   redirects are rejected. Keep Dokploy authentication enabled. Consider ngrok
-   request inspection/log retention because the tunnel carries the API key.
-5. Supply an externally reachable staging API health URL and frontend page URL.
-   The API URL must return JSON with `status: ok` and
-   `service: syda-platform-api` (existing `/health` or `/api/health`). Use the
-   actual public backend route; Vite's development proxy does not establish a
-   production frontend proxy. Frontend health must return HTTP 2xx HTML. These
-   are liveness checks, not database/provider readiness or proof of build content.
+GitHub Environments alone do not stop someone who can alter approved workflow
+code from exfiltrating available secrets or requesting a broader repository
+`GITHUB_TOKEN`. Protect the default branch and review **all** workflows/controller
+changes. The constrained gateway token provides the production boundary even if
+that token is stolen. Keep production deployment credentials and production image
+packages inaccessible to this workflow. Repository/server administrators remain
+trusted. If a Dokploy key is pasted into chat, revoke it in Dokploy; do not use it
+as the permanent GitHub deployment credential.
 
-The client sends `x-api-key`, `Accept: application/json` and
-`ngrok-skip-browser-warning: 1`, verifies HTTPS, rejects redirects and non-JSON API
-responses, and never prints request/response bodies or credentials. Health checks
-receive **no Dokploy credential**. The free tier currently allows 20,000 HTTP
-requests and 1 GB outbound transfer monthly; quota exhaustion, agent downtime and
-tunnel failures fail the run. There is no free-endpoint duration timeout. Polling
-every 15 seconds uses about 120 history calls for a maximum 30-minute deployment.
-Trigger POSTs are never retried automatically because a lost response may still
-mean a deployment was queued.
+## One-time setup
 
-## GitHub staging Environment configuration
+1. Merge the workflow/controller through the default branch's normal code review.
+   GitHub must have this dispatched workflow on its default branch before the
+   first full Actions run. PR #10 contains the implementation.
+2. Create a separate Dokploy project `syda-staging`, environment `staging`, and raw
+   Compose service with a stable app/project name. Install the fixed staging
+   Compose file exactly. Disable **Auto Deploy** and configure no deployment
+   webhooks, preview triggers or external deployment automation for this service.
+   Do not convert, repoint, recreate or redeploy production to install staging.
+3. Set `createEnvFile=true` and staging-only values in Dokploy:
+   `STAGING_POSTGRES_PASSWORD`, `STAGING_AUTH_SECRET_KEY`, `STAGING_PUBLIC_URL`,
+   `STAGING_BACKEND_IMAGE`, `STAGING_FRONTEND_IMAGE`, and `STAGING_SOURCE_SHA`.
+   Use fresh generated database/auth secrets, not production copies. The controller
+   changes only the image references and source SHA. Provider credentials, if
+   required for functional testing, must also be staging-only.
+4. Give the dedicated automation account access only to this new project,
+   environment and Compose service. Enable API access, disable service/project/
+   environment creation/deletion, Docker, SSH keys, Git providers and Traefik-file
+   access. Verify production `compose.one` is denied and staging `compose.update`
+   is denied. Default member mount permissions are the reason its API key remains
+   private behind the gateway. Verify the gateway token also rejects production
+   IDs, arbitrary Compose/mount APIs and extra environment keys. Configure an
+   appropriate API-key request limit (installed defaults were only 10/day, too
+   small for polling); the gateway key uses 120 requests per minute.
+5. Run the gateway from reviewed controller code, under an unprivileged identity,
+   with no capabilities, a read-only root filesystem and no Docker socket.
+   `settings.json` is private (0600), containing `dokploy_url` (loopback API),
+   `dokploy_api_key`, `deploy_token`, `compose_id`, `environment_id`,
+   `compose_template` (exact fixed file contents), `app_name` (stable volume prefix), `repository`, `frontend_url`
+   (`http://127.0.0.1:3011`) and `public_host` (public staging hostname/port).
+   Start it with `python3 staging_gateway.py /config/settings.json /state`;
+   give it a private writable `/state` directory for its durable deployment lock.
+6. Expose the loopback gateway at `127.0.0.1:3012` using a **separate** HTTPS
+   ingress. Keep the existing production ngrok tunnel unchanged. A separate ngrok
+   account/domain or a dedicated Tailscale Funnel HTTPS port can serve staging.
+   The server already has tailnet-only Tailscale Serve on port 443 for Dokploy:
+   **never enable public Funnel on that existing port**, which would expose the
+   admin UI. A separate Funnel port such as 8443 must target only the gateway.
+7. GHCR image names are `ghcr.io/<owner>/<repo>-staging-backend` and
+   `ghcr.io/<owner>/<repo>-staging-frontend`. Grant this repository's Actions access
+   to those staging-only packages. Either make just these packages public, or
+   configure a read-only registry credential server-side for Dokploy pulls. The
+   publishing job uses `GITHUB_TOKEN`; no long-lived registry write credential is
+   needed. Image artifacts and packages consume GitHub storage; retention is one
+   day for intermediate image artifacts.
+8. Initialize only the **new staging** job/settings volumes with UID/GID 10001
+   ownership. Leave production volumes untouched. Keep the staging Compose app
+   name stable so deploys retain the same database and volumes. PostgreSQL is not
+   published; only the staging frontend binds to `127.0.0.1:3011`.
 
-Store these under **Settings → Environments → staging**, not as repository-wide
-secrets. No production credential is required.
+## GitHub Environment values
+
+Configure these under **Settings → Environments → staging**:
 
 | Kind | Name | Value |
 | --- | --- | --- |
-| Secret | `STAGING_DOKPLOY_API_KEY` | Dedicated staging automation identity's API key |
-| Variable | `STAGING_DOKPLOY_URL` | ngrok HTTPS origin, without `/api`, query or credentials |
-| Variable | `STAGING_DOKPLOY_COMPOSE_ID` | Existing staging Compose ID |
-| Variable | `STAGING_DOKPLOY_ENVIRONMENT_ID` | Expected Dokploy environment ID for that service |
-| Variable | `STAGING_API_HEALTH_URL` | HTTPS staging API health endpoint |
-| Variable | `STAGING_WEB_HEALTH_URL` | HTTPS staging frontend page |
-| Variable | `STAGING_ISOLATION_CONFIRMED` | `true`, only after verifying the security boundary above |
+| Secret | `STAGING_DEPLOY_TOKEN` | Random gateway token; **not** a Dokploy API key |
+| Variable | `STAGING_DOKPLOY_URL` | Gateway HTTPS origin, without `/api`, credentials or query |
+| Variable | `STAGING_DOKPLOY_COMPOSE_ID` | New staging Compose ID |
+| Variable | `STAGING_DOKPLOY_ENVIRONMENT_ID` | New staging Dokploy environment ID |
+| Variable | `STAGING_API_HEALTH_URL` | Gateway HTTPS origin + `/api/health` |
+| Variable | `STAGING_WEB_HEALTH_URL` | Gateway HTTPS origin + `/` |
 
-URLs and IDs may be environment secrets instead if preferred; change the
-corresponding workflow `vars.*` references to `secrets.*`. The confirmation is an
-owner acknowledgement, not an automated proof of isolation or credential scope.
+The image digests and selected SHA are job outputs, not user-entered deployment
+parameters. No production or Dokploy admin credential belongs in GitHub. The old
+snapshot-branch ruleset and `STAGING_ISOLATION_CONFIRMED` setting are not needed
+with runner builds and the constrained image-only gateway.
 
-## Deploy from GitHub
+## Deploy and test
 
-1. Merge these files through review into the repository's default branch.
-2. Open **Actions → Deploy staging → Run workflow**. Keep the workflow branch
-   selector on the **default branch**, even when testing another branch.
-3. Enter a source **branch**, or leave branch blank and enter an open
-   same-repository **PR number**. Both blank deploys the current default branch.
-   Fork PRs are rejected. Do not use an arbitrary SHA as the branch input.
-4. The deployment starts without a review or approval step. The full resolved
-   SHA appears in the resolve job summary and staging job name.
-5. Wait for the deployment and both health checks. A green run means Dokploy
-   reported this run's deployment `done` and both liveness checks passed. It does
-   not mean a full end-to-end application test passed.
+Open **Actions → Deploy staging → Run workflow**. Keep the workflow branch
+selector on the **default branch**. Enter a source branch, or leave branch blank
+and enter an open same-repository PR number. Both blank selects the default
+branch. The run builds, publishes and deploys without an approval step.
 
-Pushing, opening/updating/merging PRs, and creating snapshots do not trigger this
-workflow. The existing documentation workflow retains its existing behavior.
-Shared staging is replaced by the most recent successful manual selection; PRs
-share staging data. Inspect schema migrations for compatibility with that data.
-For a conventional fixed staging branch, enter that branch each time; it is still
-snapshotted to a SHA. To restore a prior revision, select a source branch pointing
-at it and dispatch again. There is no automatic rollback or data rollback.
+A green run means the correlated Dokploy deployment reported `done`, the API
+returned `status: ok` and `service: syda-platform-api`, and the frontend returned
+an application page. Health checks do not receive deployment credentials. They
+are liveness checks, not a full provider/database workflow or browser test.
+The API probe uses `/api/health`; the current production frontend's `/health`
+returned 404 during inspection. Full functional testing needs staging provider
+configuration and application exercises after the first successful deployment.
 
-## Concurrency and recovery
+A fixed staging branch is supported by entering that branch each time. For a
+rollback, select a branch pointing at the previous commit and dispatch again;
+there is no automatic data/migration rollback. No builds or deployments happen
+when a PR is opened, updated or merged. Existing docs/production behavior stays
+unchanged.
 
-One workflow concurrency group serializes all selections. GitHub may replace an
-older pending dispatch with a newer one; running deployments are not cancelled.
-An atomic Git ref `staging-deployment-lock` additionally prevents a later run from
-changing the source after a runner cancellation or an uncertain API response.
-The controller refuses existing active deployments and only removes its lock
-after a known terminal result (or an error before submitting a deployment).
-Owner/UI deploys and other automation do not honor the GitHub lock: reserve this
-staging service for this workflow and coordinate any maintenance.
+## Failures and recovery
 
-If the run is cancelled, times out, or loses contact after submitting a deploy,
-**do not just rerun or delete the lock**. An owner must:
+The workflow serializes shared staging through one concurrency group. GitHub can
+supersede pending runs but never cancels an active run for a newer dispatch.
+An atomic `staging-deployment-lock` Git ref survives runner loss/cancellation.
+The gateway separately writes its in-flight record **before** calling Dokploy.
+Neither lock is automatically discarded after an uncertain trigger response.
 
-1. Inspect Dokploy's staging deployment history and queue. Match
-   `github-staging-<run>-<attempt>-<sha>` to the Actions run. Wait for completion or
-   explicitly cancel and verify the queue/processes have stopped. Do not assume
-   an empty history means an unacknowledged trigger was never queued.
-2. Verify no deployment is pending/running and confirm staging's source branch,
-   volumes and service health. Resolve any build failure in Dokploy privately;
-   API response/log bodies are intentionally not copied into public Actions logs.
-3. Delete **only** the `staging-deployment-lock` branch in GitHub. This can also be
-   done by an authorized engineer after the Dokploy owner confirms it is safe.
-   Dispatch a new deployment; do not resume an uncertain old attempt.
+On cancellation, timeout or trigger/network failure, inspect Dokploy history and
+queue for `github-staging-<run>-<attempt>-<sha>`. Wait for completion or explicitly
+cancel and verify there are no remaining queued/running processes. The gateway
+clears its in-flight record only after that exact title becomes terminal. If no
+record exists and the outcome is uncertain, an owner must reconcile the queue
+before manually clearing `/state/inflight.json` and deleting the GitHub
+`staging-deployment-lock` branch. Then start a new dispatch, not an old rerun.
+A terminal build/deploy failure or failed health check fails Actions clearly.
+POST triggers are not retried automatically.
 
-Snapshot branches are retained, and Dokploy remains pointed at the selected
-snapshot after deployment. Do not delete or move the current snapshot. For later
-cleanup, an owner can temporarily adjust the snapshot ruleset during a deployment
-maintenance window, remove unused snapshots, then re-enable it. Cleanup is never
-automatic and never touches volumes. `freshVolumes` is explicitly false and the
-controller never calls delete, recreate, environment-save or volume-reset APIs.
-Selected application/Compose code can still change data; persistence is not a
-security sandbox or a migration rollback mechanism.
+The gateway/runner omit API response bodies and credentials from logs. Inspect
+Dokploy logs privately for build/runtime errors. `freshVolumes` is always false;
+no workflow operation deletes/recreates the service, resets volumes, or modifies
+production. Staging application code can still change staging data.
+
+If ngrok is used for the separate staging ingress, requests send
+`ngrok-skip-browser-warning: 1`; API responses must be JSON, HTTPS is verified,
+and redirects are rejected. Free ngrok quotas/tunnel downtime can fail a run.
+Polling uses one request every 15 seconds for up to 30 minutes, followed by up to
+3 minutes for health checks. No ngrok authtoken is needed in GitHub.
 
 ## Validation and references
 
-Local validation uses `python3 -m unittest discover -s scripts/tests -v` and
-`actionlint .github/workflows/deploy-staging.yml`. Tests simulate the APIs and
-failure paths; they do not contact Dokploy. Complete an owner-supervised first
-deployment after configuration and verify the snapshot SHA in Dokploy's clone,
-the deployment history, application pages, and retained staging data.
+Run `python3 -m unittest discover -s scripts/tests -v`,
+`actionlint .github/workflows/deploy-staging.yml`, and `docker compose -f
+platform/docker-compose.staging.yml config --quiet` with dummy required values.
+The controller/gateway tests simulate API/state failures and exercise HTTP
+credential/target rejection; they do not constitute a live deployment test.
 
-API contracts checked against current upstream documentation/source:
+Contracts checked against installed Dokploy v0.30.6 and official references:
 
-- [Dokploy Compose API](https://docs.dokploy.com/docs/api/compose): source update,
-  service read, deploy with title and `freshVolumes`.
+- [Dokploy Compose API](https://docs.dokploy.com/docs/api/compose): `compose.one`,
+  `compose.saveEnvironment`, `compose.deploy`.
 - [Dokploy deployment API](https://docs.dokploy.com/docs/api/deployment):
   `deployment.allByCompose`.
-- [Dokploy GitHub clone implementation](https://github.com/Dokploy/dokploy/blob/canary/packages/server/src/utils/providers/github.ts)
-  and [service authorization](https://github.com/Dokploy/dokploy/blob/canary/packages/server/src/services/permission.ts).
-- [GitHub environment protections](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
-  and [effective branch rules API](https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch).
-- [ngrok free-tier limits and warning bypass](https://ngrok.com/docs/pricing-limits/free-plan-limits).
+- [GitHub image publishing](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)
+  and [GHCR](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+- [GitHub Environment protections](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
+- [ngrok free plan](https://ngrok.com/docs/pricing-limits/free-plan-limits).
 
-Check these contracts against the installed Dokploy release. This change does
-not install/upgrade Dokploy or ngrok, configure remote secrets/protections, or
-claim that a live staging deployment has been tested.
+Current setup status: the separate staging project/environment/raw service,
+dedicated automation account, private loopback gateway and new staging data
+volumes have been created. The gateway token and staging IDs are configured in
+the GitHub Environment. Public ingress/health URLs await a separate staging
+ngrok hostname/account; production's tunnel is unchanged. The workflow remains
+in PR #10 pending normal default-branch code review/merge. GHCR package pull
+access must be configured when the first runner build publishes the packages.
 
-Implementation validation: all 27 controller tests passed, actionlint 1.7.7
-accepted the workflow, and `git diff --check` passed. Follow-up setup created the
-GitHub staging Environment and immutable snapshot ruleset. Dokploy/server
-inspection was read-only; no server credential or deployment was changed.
+Validation completed: 34 controller/gateway tests, workflow actionlint and Compose
+configuration validation passed. Live loopback gateway config reads returned
+200; invalid tokens returned 403, production IDs and arbitrary env writes were
+rejected. The real staging-only Dokploy key was denied production reads and
+Compose edits. Production frontend/API read-only probes still returned 200.
+No Actions image build or staging deployment has yet been executed successfully.
