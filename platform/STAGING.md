@@ -28,7 +28,10 @@ The workflow has four jobs:
    It selects the two digests, triggers staging through a restricted gateway,
    polls this run's Dokploy deployment record, and checks API/frontend health.
 
-There are **no push, PR or merge triggers**. Repository writers can manually
+The deployment workflow has **no push, PR or merge triggers**. A separate
+build-only PR check validates the controller/gateway and Docker images with a
+read-only token, no package publishing and no deployment credentials. Its build
+job is reused by the manual workflow. Repository writers can manually
 select a branch or PR without deployment approvals. The GitHub `staging`
 Environment permits only the exact default branch, has no required reviewers or
 wait timer, and disallows admin bypass. Normal reviews for changes to the default
@@ -176,8 +179,9 @@ configuration and application exercises after the first successful deployment.
 
 A fixed staging branch is supported by entering that branch each time. For a
 rollback, select a branch pointing at the previous commit and dispatch again;
-there is no automatic data/migration rollback. No builds or deployments happen
-when a PR is opened, updated or merged. Existing docs/production behavior stays
+there is no automatic data/migration rollback. No deployments happen when a PR
+is opened, updated or merged. The separate read-only PR check only validates
+builds for deployment-related changes. Existing docs/production behavior stays
 unchanged.
 
 ## Failures and recovery
@@ -212,7 +216,7 @@ Polling uses one request every 15 seconds for up to 30 minutes, followed by up t
 ## Validation and references
 
 Run `python3 -m unittest discover -s scripts/tests -v`,
-`actionlint .github/workflows/deploy-staging.yml`, and `docker compose -f
+`actionlint .github/workflows/deploy-staging.yml .github/workflows/build-staging-images.yml`, and `docker compose -f
 platform/docker-compose.staging.yml config --quiet` with dummy required values.
 The controller/gateway tests simulate API/state failures and exercise HTTP
 credential/target rejection; they do not constitute a live deployment test.
@@ -231,14 +235,19 @@ Contracts checked against installed Dokploy v0.30.6 and official references:
 Current setup status: the separate staging project/environment/raw service,
 dedicated automation account, private loopback gateway and new staging data
 volumes have been created. The gateway token and staging IDs are configured in
-the GitHub Environment. Public ingress/health URLs await a separate staging
-ngrok hostname/account; production's tunnel is unchanged. The workflow remains
+the GitHub Environment. A separate ngrok account now exposes only the staging
+gateway, with request inspection disabled, and staging HTTPS/health URL variables
+are configured; production's tunnel is unchanged. The workflow remains
 in PR #10 pending normal default-branch code review/merge. GHCR package pull
 access must be configured when the first runner build publishes the packages.
 
 Validation completed: 34 controller/gateway tests, workflow actionlint and Compose
-configuration validation passed. Live loopback gateway config reads returned
+configuration validation passed locally and in the read-only GitHub PR check.
+Both backend and frontend images built successfully on a GitHub-hosted runner
+([run 41696469018](https://github.com/youpesh/syda/actions/runs/41696469018)).
+Live loopback and external HTTPS gateway config reads returned
 200; invalid tokens returned 403, production IDs and arbitrary env writes were
 rejected. The real staging-only Dokploy key was denied production reads and
 Compose edits. Production frontend/API read-only probes still returned 200.
-No Actions image build or staging deployment has yet been executed successfully.
+No image publication or actual staging deployment has yet been executed
+successfully; the staging application is not running yet.
