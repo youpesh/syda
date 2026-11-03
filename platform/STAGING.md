@@ -132,7 +132,10 @@ as the permanent GitHub deployment credential.
    configure a read-only registry credential server-side for Dokploy pulls. The
    publishing job uses `GITHUB_TOKEN`; no long-lived registry write credential is
    needed. Image artifacts and packages consume GitHub storage; retention is one
-   day for intermediate image artifacts.
+   day for intermediate image artifacts. For initial package creation, dispatch
+   once with **Deploy after publishing** disabled. This tests the runner build
+   and creates the packages without touching staging. Configure package visibility
+   or server pull credentials, then dispatch with deployment enabled.
 8. Initialize only the **new staging** job/settings volumes with UID/GID 10001
    ownership. Leave production volumes untouched. Keep the staging Compose app
    name stable so deploys retain the same database and volumes. PostgreSQL is not

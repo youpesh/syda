@@ -12,6 +12,10 @@ on:
         description: Open same-repository PR number (leave branch blank)
         type: string
         required: false
+      deploy:
+        description: Deploy after publishing (disable for first-time GHCR package setup)
+        type: boolean
+        default: true
 
 permissions: {}
 
@@ -115,6 +119,7 @@ jobs:
   deploy:
     name: Deploy staging commit ${{ needs.resolve.outputs.sha }}
     needs: [resolve, publish]
+    if: inputs.deploy
     runs-on: ubuntu-latest
     timeout-minutes: 40
     environment: staging
