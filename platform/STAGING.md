@@ -11,8 +11,28 @@ workflow (pushes to `main`); it is unchanged. GitHub also lists CI and Generatio
 queue workflows, but their files are absent on both the default branch and main.
 GitHub's current default branch is `feat/web-platform`, despite the local
 `origin/HEAD` pointing at `main`. No staging branch, Dokploy configuration,
-Actions environments, Actions secrets or variables were found. The live Dokploy
-service/version/configuration could not be inspected without its URL and credentials.
+Actions environments, Actions secrets or variables were found during the initial
+repository inspection.
+
+Follow-up server inspection over Tailscale SSH found Dokploy **v0.30.6** and an
+existing `syda-stack` service in the `syda` project's **production** environment.
+It uses **raw Compose**, has Auto Deploy enabled, and builds from absolute host
+paths under `/etc/dokploy/syda`. Its ngrok tunnel forwards to `frontend:3000`,
+not the Dokploy API. No separate staging service or registered remote server was
+found. The existing public frontend and `/api/health` responded successfully to
+read-only probes; `/health` on that frontend returned 404. This is a health probe,
+not a deployment test. The existing stack, tunnel and data were left unchanged.
+
+GitHub setup completed: the `staging` Environment allows only the default branch,
+has no required deployment reviewers/wait timer, and disallows administrator
+bypass. The immutable snapshot ruleset is active with no bypass actors. No
+Dokploy credentials or target variables have been configured. The workflow is in
+PR #10 and still requires the default branch's normal code review before merge.
+Provision or identify the intended staging target before enabling deployment;
+do not use the existing production service ID. A Git-based staging service must
+build from its cloned source, with relative contexts as in the platform Compose
+file; copying the existing absolute host paths would build unrelated working-tree
+content instead of the selected commit.
 
 Use **one shared staging Compose service** with a selectable branch or open
 same-repository PR. This reuses the existing stack and needs no registry, preview
@@ -250,5 +270,6 @@ not install/upgrade Dokploy or ngrok, configure remote secrets/protections, or
 claim that a live staging deployment has been tested.
 
 Implementation validation: all 27 controller tests passed, actionlint 1.7.7
-accepted the workflow, and `git diff --check` passed. GitHub inspection was
-read-only. No remote environment, credential, ruleset or deployment was changed.
+accepted the workflow, and `git diff --check` passed. Follow-up setup created the
+GitHub staging Environment and immutable snapshot ruleset. Dokploy/server
+inspection was read-only; no server credential or deployment was changed.
