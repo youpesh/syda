@@ -15,7 +15,7 @@ import sys
 import threading
 import urllib.parse
 
-from deploy_staging import DeployError, image_reference, request, valid_sha
+from deploy_staging import GATEWAY_IDENTITY, DeployError, image_reference, request, valid_sha
 
 
 class Gateway:
@@ -34,6 +34,7 @@ class Gateway:
         if (data.get("composeId") != self.settings["compose_id"]
                 or data.get("environmentId") != self.settings["environment_id"]
                 or data.get("sourceType") != "raw" or data.get("autoDeploy") is not False
+                or data.get("composeType") != "docker-compose"
                 or data.get("composeFile") != self.settings["compose_template"]
                 or data.get("mounts") or data.get("command")
                 or data.get("createEnvFile") is not True
@@ -57,6 +58,7 @@ class Gateway:
         rows = self.history()
         if self.state.exists() or any(r["status"] not in ("done", "error", "cancelled") for r in rows):
             raise DeployError("A staging deployment is active or uncertain; reconcile it first")
+        return rows
 
     @staticmethod
     def values(env):
@@ -69,7 +71,8 @@ class Gateway:
         if endpoint == "compose.one":
             data = self.config()
             values = self.values(data.get("env"))
-            return {**{k: data.get(k) for k in ("composeId", "environmentId", "sourceType",
+            return {"gateway": GATEWAY_IDENTITY,
+                    **{k: data.get(k) for k in ("composeId", "environmentId", "sourceType",
                                                "autoDeploy", "composeStatus", "composeFile")},
                     "sourceCommit": values.get("STAGING_SOURCE_SHA"),
                     "backendImage": values.get("STAGING_BACKEND_IMAGE"),
@@ -104,7 +107,9 @@ class Gateway:
             sha = self.values(config.get("env")).get("STAGING_SOURCE_SHA")
             if title.rsplit("-", 1)[-1] != sha or payload["freshVolumes"] is not False:
                 raise DeployError("Deployment must match the selected images and preserve volumes")
-            self.idle()
+            history = self.idle()
+            if any(row["title"] == title for row in history):
+                raise DeployError("This deployment identity has already been used")
             # Persist before the trigger: a lost response must never unlock it.
             temporary = self.state.with_suffix(".tmp")
             temporary.write_text(json.dumps({"title": title}))
@@ -123,17 +128,34 @@ CONTROL_METHODS = {"compose.one": "GET", "deployment.allByCompose": "GET",
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
     def log_message(self, *_):
         pass  # URLs, application bodies, headers and credentials never enter logs.
 
     def json_response(self, status, data):
+        # Close on rejection instead of interpreting an unread body as the next
+        # request on this HTTP/1.1 connection.
+        self.close_connection = True
         body = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def body_length(self, limit):
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) > 1 or self.headers.get("Transfer-Encoding"):
+            raise DeployError("Ambiguous request body framing")
+        value = lengths[0] if lengths else "0"
+        if not re.fullmatch(r"[0-9]+", value) or int(value) > limit:
+            raise DeployError("Invalid request size")
+        return int(value)
 
     def handle_request(self):
         parsed = urllib.parse.urlsplit(self.path)
@@ -147,9 +169,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != CONTROL_METHODS[endpoint]:
             return self.json_response(405, {"error": "Method not allowed"})
         try:
-            size = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= size <= 4096 or self.headers.get("Transfer-Encoding"):
-                raise DeployError("Invalid request size")
+            size = self.body_length(4096)
             if self.command == "POST":
                 if parsed.query:
                     raise DeployError("Query is not permitted")
@@ -164,24 +184,23 @@ class Handler(BaseHTTPRequestHandler):
             with self.server.gateway.lock:
                 result = self.server.gateway.control(endpoint, payload)
             return self.json_response(200, result)
-        except (DeployError, ValueError, TypeError, KeyError, AttributeError):
+        except (DeployError, ValueError, TypeError, KeyError, AttributeError, OSError):
             return self.json_response(409, {"error": "Staging request rejected; inspect gateway configuration privately"})
 
     def proxy_app(self):
         if not self.path.startswith("/") or self.path.startswith("//"):
             return self.json_response(400, {"error": "Invalid path"})
-        if self.headers.get("Transfer-Encoding"):
-            return self.json_response(400, {"error": "Chunked request bodies are not supported"})
         connection = None
         response_started = False
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 <= length <= 32 * 1024 * 1024:
-                return self.json_response(413, {"error": "Request too large"})
+            length = self.body_length(32 * 1024 * 1024)
             upstream = urllib.parse.urlsplit(self.server.gateway.settings["frontend_url"])
             connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=300)
-            excluded = {"connection", "host", "transfer-encoding", "x-api-key", "authorization-proxy",
+            excluded = {"connection", "host", "transfer-encoding", "x-api-key", "proxy-authorization",
+                        "proxy-authenticate", "keep-alive", "te", "trailer", "upgrade",
                         "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"}
+            excluded.update(value.strip().lower()
+                            for value in self.headers.get("Connection", "").split(","))
             headers = {k: v for k, v in self.headers.items() if k.lower() not in excluded}
             headers.update({"Host": self.server.gateway.settings["public_host"],
                             "X-Forwarded-Proto": "https"})
@@ -198,6 +217,8 @@ class Handler(BaseHTTPRequestHandler):
             while chunk := response.read1(64 * 1024):
                 self.wfile.write(chunk)
                 self.wfile.flush()
+        except DeployError:
+            self.json_response(400, {"error": "Invalid request body framing"})
         except (OSError, ValueError, http.client.HTTPException):
             self.close_connection = True
             if not response_started:

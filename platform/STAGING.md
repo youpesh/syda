@@ -16,7 +16,7 @@ backend/frontend Dockerfiles. The root Dockerfile builds docs, not the platform.
 The workflow has four jobs:
 
 1. **Resolve:** runs trusted controller code from the protected repository default
-   branch (currently `feat/web-platform`), resolving a branch or open
+   branch, resolving a branch or open
    same-repository PR to a full commit SHA.
 2. **Build:** checks out only that SHA, builds both images without deployment
    credentials or registry write access, and uploads a one-day image artifact.
@@ -94,7 +94,7 @@ as the permanent GitHub deployment credential.
 
 1. Merge the workflow/controller through the default branch's normal code review.
    GitHub must have this dispatched workflow on its default branch before the
-   first full Actions run. PR #10 contains the implementation.
+   first full manual Actions run.
 2. Create a separate Dokploy project `syda-staging`, environment `staging`, and raw
    Compose service with a stable app/project name. Install the fixed staging
    Compose file exactly. Disable **Auto Deploy** and configure no deployment
@@ -123,12 +123,13 @@ as the permanent GitHub deployment credential.
    (`http://127.0.0.1:3011`) and `public_host` (public staging hostname/port).
    Start it with `python3 staging_gateway.py /config/settings.json /state`;
    give it a private writable `/state` directory for its durable deployment lock.
-6. Expose the loopback gateway at `127.0.0.1:3012` using a **separate** HTTPS
-   ingress. Keep the existing production ngrok tunnel unchanged. A separate ngrok
-   account/domain or a dedicated Tailscale Funnel HTTPS port can serve staging.
-   The server already has tailnet-only Tailscale Serve on port 443 for Dokploy:
-   **never enable public Funnel on that existing port**, which would expose the
-   admin UI. A separate Funnel port such as 8443 must target only the gateway.
+6. Expose only the loopback gateway at `127.0.0.1:3012` using the dedicated
+   staging ngrok account/domain. Keep the production tunnel unchanged. Do not
+   share a production hostname with unreviewed staging code; browser sessions
+   must remain on separate origins. Keep the staging agent running with automatic
+   restart and request inspection disabled. Store its authtoken in a private
+   server configuration file, not GitHub or the repository. Do not point this
+   tunnel at the real Dokploy UI/API.
 7. GHCR image names are `ghcr.io/<owner>/<repo>-staging-backend` and
    `ghcr.io/<owner>/<repo>-staging-frontend`. Grant this repository's Actions access
    to those staging-only packages. Either make just these packages public, or
@@ -158,9 +159,9 @@ Configure these under **Settings → Environments → staging**:
 | Variable | `STAGING_WEB_HEALTH_URL` | Gateway HTTPS origin + `/` |
 
 The image digests and selected SHA are job outputs, not user-entered deployment
-parameters. No production or Dokploy admin credential belongs in GitHub. The old
-snapshot-branch ruleset and `STAGING_ISOLATION_CONFIRMED` setting are not needed
-with runner builds and the constrained image-only gateway.
+parameters. No production or Dokploy admin credential belongs in GitHub. The
+controller verifies the gateway identity before selecting images, so configuring
+the real Dokploy API URL directly is rejected.
 
 ## Deploy and test
 
@@ -207,7 +208,7 @@ Dokploy logs privately for build/runtime errors. `freshVolumes` is always false;
 no workflow operation deletes/recreates the service, resets volumes, or modifies
 production. Staging application code can still change staging data.
 
-If ngrok is used for the separate staging ingress, requests send
+Requests to the staging ngrok ingress send
 `ngrok-skip-browser-warning: 1`; API responses must be JSON, HTTPS is verified,
 and redirects are rejected. Free ngrok quotas/tunnel downtime can fail a run.
 Polling uses one request every 15 seconds for up to 30 minutes, followed by up to
@@ -218,8 +219,11 @@ Polling uses one request every 15 seconds for up to 30 minutes, followed by up t
 Run `python3 -m unittest discover -s scripts/tests -v`,
 `actionlint .github/workflows/deploy-staging.yml .github/workflows/build-staging-images.yml`, and `docker compose -f
 platform/docker-compose.staging.yml config --quiet` with dummy required values.
-The controller/gateway tests simulate API/state failures and exercise HTTP
-credential/target rejection; they do not constitute a live deployment test.
+The controller/gateway tests exercise API/state failures, HTTP framing and
+credential/target rejection. The read-only PR check also starts the fixed stack
+on a disposable GitHub runner with dummy secrets, verifies API/frontend health,
+and removes its temporary containers/volumes. This is a CI runtime smoke test,
+not evidence of a successful deployment on the staging server.
 
 Contracts checked against installed Dokploy v0.30.6 and official references:
 
@@ -231,23 +235,3 @@ Contracts checked against installed Dokploy v0.30.6 and official references:
   and [GHCR](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 - [GitHub Environment protections](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
 - [ngrok free plan](https://ngrok.com/docs/pricing-limits/free-plan-limits).
-
-Current setup status: the separate staging project/environment/raw service,
-dedicated automation account, private loopback gateway and new staging data
-volumes have been created. The gateway token and staging IDs are configured in
-the GitHub Environment. A separate ngrok account now exposes only the staging
-gateway, with request inspection disabled, and staging HTTPS/health URL variables
-are configured; production's tunnel is unchanged. The workflow remains
-in PR #10 pending normal default-branch code review/merge. GHCR package pull
-access must be configured when the first runner build publishes the packages.
-
-Validation completed: 34 controller/gateway tests, workflow actionlint and Compose
-configuration validation passed locally and in the read-only GitHub PR check.
-Both backend and frontend images built successfully on a GitHub-hosted runner
-([run 41696469018](https://github.com/youpesh/syda/actions/runs/41696469018)).
-Live loopback and external HTTPS gateway config reads returned
-200; invalid tokens returned 403, production IDs and arbitrary env writes were
-rejected. The real staging-only Dokploy key was denied production reads and
-Compose edits. Production frontend/API read-only probes still returned 200.
-No image publication or actual staging deployment has yet been executed
-successfully; the staging application is not running yet.

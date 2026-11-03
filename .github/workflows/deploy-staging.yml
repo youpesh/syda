@@ -117,7 +117,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_SHA: ${{ needs.resolve.outputs.sha }}
           DOKPLOY_URL: ${{ vars.STAGING_DOKPLOY_URL }}
-          DOKPLOY_API_KEY: ${{ secrets.STAGING_DEPLOY_TOKEN }}
+          STAGING_DEPLOY_TOKEN: ${{ secrets.STAGING_DEPLOY_TOKEN }}
           DOKPLOY_COMPOSE_ID: ${{ vars.STAGING_DOKPLOY_COMPOSE_ID }}
           DOKPLOY_ENVIRONMENT_ID: ${{ vars.STAGING_DOKPLOY_ENVIRONMENT_ID }}
           STAGING_API_HEALTH_URL: ${{ vars.STAGING_API_HEALTH_URL }}

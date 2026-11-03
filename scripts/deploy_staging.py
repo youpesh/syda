@@ -16,6 +16,7 @@ import urllib.request
 
 
 LOCK_BRANCH = "staging-deployment-lock"
+GATEWAY_IDENTITY = "syda-staging"
 POLL_SECONDS = 15
 DEPLOY_TIMEOUT = 1800
 HEALTH_TIMEOUT = 180
@@ -92,6 +93,7 @@ class GitHub:
     def create_ref(self, branch, sha):
         self.call("git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
 
+
 def quote(value):
     return urllib.parse.quote(value, safe="")
 
@@ -132,13 +134,13 @@ def resolve(gh):
     note(f"Selected staging commit: `{sha}`. Manual deployment proceeds without an approval gate.")
 
 
-class Dokploy:
+class StagingGatewayClient:
     def __init__(self):
         self.base = https_url(os.environ["DOKPLOY_URL"], True)
         self.compose_id = os.environ["DOKPLOY_COMPOSE_ID"]
         self.environment_id = os.environ["DOKPLOY_ENVIRONMENT_ID"]
         self.headers = {
-            "x-api-key": os.environ["DOKPLOY_API_KEY"],
+            "x-api-key": os.environ["STAGING_DEPLOY_TOKEN"],
             "Content-Type": "application/json",
             "Accept": "application/json",
             "ngrok-skip-browser-warning": "1",
@@ -158,6 +160,8 @@ class Dokploy:
         return rows
 
     def check_config(self, config):
+        if config.get("gateway") != GATEWAY_IDENTITY:
+            raise DeployError("Deployment URL must point to the restricted staging gateway")
         if (config.get("composeId") != self.compose_id
                 or config.get("environmentId") != self.environment_id):
             raise DeployError("Dokploy staging service/environment identity mismatch")
@@ -228,7 +232,7 @@ def deploy(gh, dokploy):
         raise DeployError("Invalid GitHub run identity")
     title = f"github-staging-{run}-{attempt}-{sha}"
     # Atomic, durable lock survives runner cancellation, timeouts and ambiguous
-    # API failures. It is intentionally outside the immutable snapshot ruleset.
+    # API failures. After a trigger, only a known terminal result releases it.
     try:
         gh.create_ref(LOCK_BRANCH, valid_sha(os.environ["GITHUB_SHA"]))
     except HTTPFailure as exc:
@@ -279,12 +283,12 @@ def main():
         if sys.argv[1:] == ["resolve"]:
             resolve(GitHub())
         elif sys.argv[1:] == ["deploy"]:
-            required = ("DOKPLOY_URL", "DOKPLOY_API_KEY", "DOKPLOY_COMPOSE_ID",
+            required = ("DOKPLOY_URL", "STAGING_DEPLOY_TOKEN", "DOKPLOY_COMPOSE_ID",
                         "DOKPLOY_ENVIRONMENT_ID", "STAGING_API_HEALTH_URL", "STAGING_WEB_HEALTH_URL",
                         "STAGING_BACKEND_IMAGE", "STAGING_FRONTEND_IMAGE")
             if any(not os.environ.get(key) for key in required):
                 raise DeployError("Missing staging environment configuration; see platform/STAGING.md")
-            deploy(GitHub(), Dokploy())
+            deploy(GitHub(), StagingGatewayClient())
         else:
             raise DeployError("Usage: deploy_staging.py resolve|deploy")
     except (DeployError, KeyError, TypeError, ValueError) as exc:

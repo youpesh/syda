@@ -29,6 +29,7 @@ class GatewayTests(unittest.TestCase):
         self.config = {"composeId": "staging", "environmentId": "stage-env", "sourceType": "raw",
                        "autoDeploy": False, "composeFile": "trusted fixed compose", "mounts": [],
                        "command": "", "createEnvFile": True, "appName": "fixed-staging",
+                       "composeType": "docker-compose",
                        "env": "STAGING_POSTGRES_PASSWORD=private-db-secret\nSTAGING_AUTH_SECRET_KEY=private-auth-secret"}
         self.rows = []
         self.calls = []
@@ -79,7 +80,8 @@ class GatewayTests(unittest.TestCase):
     def test_fixed_config_and_mounts_are_enforced(self):
         for change in ({"mounts": [{"hostPath": "/"}]}, {"composeFile": "untrusted"},
                        {"environmentId": "production"}, {"autoDeploy": True}, {"command": "other"},
-                       {"createEnvFile": False}, {"appName": "production-volume-prefix"}):
+                       {"createEnvFile": False}, {"appName": "production-volume-prefix"},
+                       {"composeType": "stack"}):
             original = self.config.copy()
             self.config.update(change)
             with self.subTest(change=change), self.assertRaises(gateway.DeployError):
@@ -119,6 +121,14 @@ class GatewayTests(unittest.TestCase):
                 self.gateway.control("compose.deploy", payload)
         self.assertFalse(any(e == "compose.deploy" for e, _ in self.calls))
 
+    def test_completed_deployment_title_cannot_be_replayed(self):
+        self.gateway.control("compose.saveEnvironment", self.selection())
+        self.rows = [{"deploymentId": "old", "title": TITLE, "status": "done", "composeId": "staging"}]
+        with self.assertRaisesRegex(gateway.DeployError, "already been used"):
+            self.gateway.control("compose.deploy", self.trigger())
+        self.assertFalse(self.gateway.state.exists())
+        self.assertFalse(any(endpoint == "compose.deploy" for endpoint, _ in self.calls))
+
     def test_unlisted_control_api_rejected(self):
         with self.assertRaises(gateway.DeployError):
             self.gateway.control("mounts.create", {})
@@ -152,7 +162,33 @@ class GatewayTests(unittest.TestCase):
         body = response.read()
         self.assertEqual(response.status, 200)
         self.assertNotIn(b"private", body)
+        self.assertEqual(json.loads(body)["gateway"], gateway.GATEWAY_IDENTITY)
         connection.close()
+
+    def test_rejected_request_closes_connection_with_unread_body(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.serve())
+        connection.putrequest("POST", "/api/compose.deploy")
+        connection.putheader("Content-Length", "4096")
+        connection.endheaders()
+        response = connection.getresponse()
+        self.assertEqual(response.status, 403)
+        self.assertTrue(response.will_close)
+        response.read()
+        connection.close()
+
+    def test_duplicate_content_lengths_are_rejected(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.serve())
+        connection.putrequest("POST", "/api/compose.deploy")
+        connection.putheader("x-api-key", "test-trigger-token")
+        connection.putheader("Content-Length", "2")
+        connection.putheader("Content-Length", "20")
+        connection.endheaders(b"{}")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 409)
+        self.assertTrue(response.will_close)
+        response.read()
+        connection.close()
+        self.gateway.upstream.assert_not_called()
 
     def test_unknown_api_goes_to_app_without_deployment_token(self):
         received = {}
@@ -174,11 +210,15 @@ class GatewayTests(unittest.TestCase):
         self.addCleanup(app.shutdown)
         self.settings["frontend_url"] = "http://127.0.0.1:" + str(app.server_address[1])
         connection = http.client.HTTPConnection("127.0.0.1", self.serve())
-        connection.request("GET", "/api/mount.create", headers={"x-api-key": "test-trigger-token"})
+        connection.request("GET", "/api/mount.create", headers={
+            "x-api-key": "test-trigger-token", "Proxy-Authorization": "private-proxy-credential",
+            "Connection": "X-Private", "X-Private": "private-hop-header"})
         response = connection.getresponse()
         self.assertEqual(response.read(), b"ok")
         connection.close()
         self.assertFalse(any(key.lower() == "x-api-key" for key in received))
+        self.assertFalse(any(key.lower() == "proxy-authorization" for key in received))
+        self.assertFalse(any(key.lower() == "x-private" for key in received))
         self.gateway.upstream.assert_not_called()
 
 

@@ -31,7 +31,7 @@ class DeploymentTests(unittest.TestCase):
             "DEFAULT_BRANCH": "feat/web-platform", "INPUT_BRANCH": "", "INPUT_PR": "",
             "DEPLOY_SHA": SHA, "STAGING_BACKEND_IMAGE": BACKEND, "STAGING_FRONTEND_IMAGE": FRONTEND,
             "DOKPLOY_URL": "https://example.ngrok-free.app",
-            "DOKPLOY_API_KEY": "test-dokploy-key", "DOKPLOY_COMPOSE_ID": "staging",
+            "STAGING_DEPLOY_TOKEN": "test-staging-token", "DOKPLOY_COMPOSE_ID": "staging",
             "DOKPLOY_ENVIRONMENT_ID": "stage-env",
             "STAGING_API_HEALTH_URL": "https://api.example.test/health",
             "STAGING_WEB_HEALTH_URL": "https://web.example.test/",
@@ -39,13 +39,13 @@ class DeploymentTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.config = {
+            "gateway": deploy.GATEWAY_IDENTITY,
             "composeId": "staging", "environmentId": "stage-env", "sourceType": "raw",
             "composeFile": (Path(__file__).resolve().parents[2] / "platform/docker-compose.staging.yml").read_text(),
-            "autoDeploy": False, "composeStatus": "done", "env": "sensitive-runtime-env",
-            "appName": "keep-volume-identity", "composePath": "existing/compose.yml",
+            "autoDeploy": False, "composeStatus": "done",
         }
         self.gh = Mock(repo="owner/repo")
-        self.dokploy = deploy.Dokploy()
+        self.client = deploy.StagingGatewayClient()
         self.calls = []
 
         def call(endpoint, payload=None):
@@ -61,29 +61,28 @@ class DeploymentTests(unittest.TestCase):
                                    frontendImage=values["STAGING_FRONTEND_IMAGE"])
             return True
 
-        self.dokploy.call = Mock(side_effect=call)
+        self.client.call = Mock(side_effect=call)
 
     def run_deploy(self, status="done"):
         with patch.object(deploy, "wait_for_deployment", return_value=status), \
                 patch.object(deploy, "check_health") as health:
-            deploy.deploy(self.gh, self.dokploy)
+            deploy.deploy(self.gh, self.client)
         return health
 
-    def test_success_preserves_configuration_and_uses_exact_digests(self):
+    def test_success_selects_exact_digests_and_releases_lock(self):
         health = self.run_deploy()
         self.gh.create_ref.assert_called_once_with(deploy.LOCK_BRANCH, CONTROL_SHA)
         self.assertEqual(self.config["backendImage"], BACKEND)
         self.assertEqual(self.config["frontendImage"], FRONTEND)
         self.assertIn(("compose.deploy", {"composeId": "staging", "title": TITLE,
                       "description": f"Exact source commit {SHA}", "freshVolumes": False}), self.calls)
-        self.assertEqual(self.config["env"], "sensitive-runtime-env")
-        self.assertEqual(self.config["appName"], "keep-volume-identity")
-        self.assertEqual(self.config["composePath"], "existing/compose.yml")
+        self.assertIn(("compose.saveEnvironment", {"composeId": "staging", "env":
+                      f"STAGING_BACKEND_IMAGE={BACKEND}\nSTAGING_FRONTEND_IMAGE={FRONTEND}\nSTAGING_SOURCE_SHA={SHA}"}), self.calls)
         health.assert_called_once()
         self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
 
     def test_guard_rejections_never_deploy(self):
-        for change in ({"environmentId": "production"}, {"composeId": "production"},
+        for change in ({"gateway": None}, {"environmentId": "production"}, {"composeId": "production"},
                        {"autoDeploy": True}, {"autoDeploy": None}, {"sourceType": "github"},
                        {"composeFile": "untrusted compose"}, {"composeStatus": "running"}):
             with self.subTest(change=change):
@@ -104,14 +103,14 @@ class DeploymentTests(unittest.TestCase):
         self.gh.create_ref.assert_not_called()
 
     def test_active_deployment_blocks_source_update(self):
-        original = self.dokploy.call.side_effect
+        original = self.client.call.side_effect
 
         def active(endpoint, payload=None):
             if endpoint.startswith("deployment.allByCompose"):
                 return [{"deploymentId": "another", "status": "running"}]
             return original(endpoint, payload)
 
-        self.dokploy.call.side_effect = active
+        self.client.call.side_effect = active
         with self.assertRaisesRegex(deploy.DeployError, "active/unknown"):
             self.run_deploy()
         self.assertFalse(any(endpoint == "compose.saveEnvironment" for endpoint, _ in self.calls))
@@ -120,29 +119,30 @@ class DeploymentTests(unittest.TestCase):
         self.gh.create_ref.side_effect = deploy.HTTPFailure(422)
         with self.assertRaisesRegex(deploy.DeployError, "lock exists"):
             self.run_deploy()
-        self.dokploy.call.assert_not_called()
+        self.client.call.assert_not_called()
 
     def test_terminal_failure_unlocks_without_health(self):
         for status in ("error", "cancelled"):
-            with self.subTest(status=status), patch.object(deploy, "check_health") as health:
+            with self.subTest(status=status), patch.object(deploy, "check_health") as health, \
+                    patch.object(deploy, "wait_for_deployment", return_value=status):
                 with self.assertRaisesRegex(deploy.DeployError, status):
-                    self.run_deploy(status)
+                    deploy.deploy(self.gh, self.client)
                 health.assert_not_called()
         self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
 
     def test_uncertain_trigger_keeps_lock_and_is_not_retried(self):
-        original = self.dokploy.call.side_effect
+        original = self.client.call.side_effect
 
         def fail_trigger(endpoint, payload=None):
             if endpoint == "compose.deploy":
                 raise deploy.HTTPFailure(502)
             return original(endpoint, payload)
 
-        self.dokploy.call.side_effect = fail_trigger
+        self.client.call.side_effect = fail_trigger
         with self.assertRaises(deploy.DeployError):
             self.run_deploy()
         self.assertEqual(sum(call.args[0] == "compose.deploy"
-                             for call in self.dokploy.call.call_args_list), 1)
+                             for call in self.client.call.call_args_list), 1)
         self.assertFalse(any(call.kwargs.get("method") == "DELETE"
                              for call in self.gh.call.call_args_list))
 
@@ -152,7 +152,7 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(failure=type(failure)), \
                     patch.object(deploy, "wait_for_deployment", side_effect=failure):
                 with self.assertRaises(type(failure)):
-                    deploy.deploy(self.gh, self.dokploy)
+                    deploy.deploy(self.gh, self.client)
             self.assertFalse(any(call.kwargs.get("method") == "DELETE"
                                  for call in self.gh.call.call_args_list))
 
@@ -160,7 +160,7 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(deploy, "wait_for_deployment", return_value="done"), \
                 patch.object(deploy, "check_health", side_effect=deploy.DeployError("unhealthy")):
             with self.assertRaisesRegex(deploy.DeployError, "unhealthy"):
-                deploy.deploy(self.gh, self.dokploy)
+                deploy.deploy(self.gh, self.client)
         self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
 
     def test_default_and_selected_branch_resolution(self):
@@ -195,19 +195,19 @@ class DeploymentTests(unittest.TestCase):
 
     def test_poll_matches_only_this_run(self):
         row = {"deploymentId": "new", "title": TITLE, "composeId": "staging", "status": "done"}
-        self.dokploy.history = Mock(side_effect=[
+        self.client.history = Mock(side_effect=[
             [{**row, "deploymentId": "old"}, {**row, "title": "another-run"}],
             [{**row, "status": "running"}], [row]])
         with patch.object(deploy.time, "sleep"):
-            self.assertEqual(deploy.wait_for_deployment(self.dokploy, TITLE, {"old"}), "done")
-        self.assertEqual(self.dokploy.history.call_count, 3)
+            self.assertEqual(deploy.wait_for_deployment(self.client, TITLE, {"old"}), "done")
+        self.assertEqual(self.client.history.call_count, 3)
 
     def test_poll_timeout(self):
-        self.dokploy.history = Mock(return_value=[])
+        self.client.history = Mock(return_value=[])
         with patch.object(deploy.time, "monotonic", side_effect=[0, 0, 1801]), \
                 patch.object(deploy.time, "sleep"):
             with self.assertRaisesRegex(deploy.DeployError, "Timed out"):
-                deploy.wait_for_deployment(self.dokploy, TITLE, set())
+                deploy.wait_for_deployment(self.client, TITLE, set())
 
     def test_health_retries_and_receives_no_credentials(self):
         with patch.object(deploy, "request", side_effect=[
@@ -234,12 +234,12 @@ class DeploymentTests(unittest.TestCase):
             with self.assertRaisesRegex(deploy.DeployError, "health checks failed"):
                 deploy.check_health("https://api.example/health", "https://web.example/")
 
-    def test_dokploy_headers_include_auth_and_ngrok_bypass(self):
-        self.dokploy = deploy.Dokploy()
+    def test_gateway_headers_include_auth_and_ngrok_bypass(self):
+        self.client = deploy.StagingGatewayClient()
         with patch.object(deploy, "request") as request:
-            self.dokploy.one()
+            self.client.one()
         headers = request.call_args.args[1]
-        self.assertEqual(headers["x-api-key"], "test-dokploy-key")
+        self.assertEqual(headers["x-api-key"], "test-staging-token")
         self.assertEqual(headers["ngrok-skip-browser-warning"], "1")
 
     def test_urls_require_https_and_no_embedded_credentials(self):
