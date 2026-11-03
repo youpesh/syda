@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { WorkspaceSessionProvider } from "~/components/studio/workspace-session";
 import {
   isRouteErrorResponse,
   Links,
@@ -70,7 +71,7 @@ export default function App() {
   return (
     <ThemeProvider>
       <QueryClientProvider client={queryClient}>
-        <Outlet />
+        <WorkspaceSessionProvider><Outlet /></WorkspaceSessionProvider>
       </QueryClientProvider>
     </ThemeProvider>
   );

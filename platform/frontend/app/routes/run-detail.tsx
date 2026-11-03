@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import type { Route } from "./+types/run-detail";
 import { AppShell } from "~/components/studio/app-shell";
+import { useWorkspaceSession } from "~/components/studio/workspace-session";
 import { DataPreview } from "~/components/studio/data-preview";
 import { EvaluationReport } from "~/components/studio/evaluation-report";
 import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
@@ -22,13 +23,20 @@ function statusVariant(status: string): "secondary" | "destructive" | "outline" 
 }
 
 export default function RunDetail() {
+  const { activeChatPath, setActiveChatPath } = useWorkspaceSession();
   const { jobId } = useParams();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  const chatId = searchParams.get("chat");
+  const returnChatPath = chatId && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(chatId) ? `/app/${chatId}` : activeChatPath;
   const [job, setJob] = useState<GenerationJob>();
   const [error, setError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [savingScenario, setSavingScenario] = useState(false);
+
+  useEffect(() => {
+    if (returnChatPath !== activeChatPath) setActiveChatPath(returnChatPath);
+  }, [activeChatPath, returnChatPath, setActiveChatPath]);
 
   const refresh = useCallback(async () => {
     try {
@@ -69,7 +77,7 @@ export default function RunDetail() {
 
   return <AppShell title={job?.scenario?.title ?? "Generation run"} subtitle={job ? `Run ${job.jobId}` : "Loading run"} headerActions={job && <div className="flex items-center gap-2">{job.scenarioId ? <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${job.scenarioId}`}>Edit scenario</Link> : <Button disabled={savingScenario} onClick={() => void saveScenario()} size="sm" variant="outline">{savingScenario ? "Saving…" : "Save as scenario"}</Button>}{filesAvailable && <a className={buttonVariants({ size: "sm" })} href={job.downloadUrl ?? `/api/download/${job.jobId}`}>Download dataset</a>}</div>}>
     <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8"><div className="mx-auto max-w-6xl space-y-5">
-      <Link className="text-xs text-muted-foreground hover:underline" to="/history">← Generation history</Link>
+      <Link className="text-xs text-muted-foreground hover:underline" to={`${returnChatPath}?view=runs`}>← Run history</Link>
       {error && <Alert variant="destructive"><AlertTitle>Run unavailable</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
       {actionError && <Alert variant="destructive"><AlertTitle>Could not save scenario</AlertTitle><AlertDescription>{actionError}</AlertDescription></Alert>}
       {!job ? <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">{error ? "" : <><Spinner /> Loading run…</>}</div> : <>
@@ -77,7 +85,7 @@ export default function RunDetail() {
         {active && <Card><CardContent><Progress value={job.progress}><ProgressLabel>{job.currentStage}</ProgressLabel><ProgressValue>{(value) => value}</ProgressValue></Progress></CardContent></Card>}
         {job.status === "failed" && <Alert variant="destructive"><AlertTitle>Generation failed</AlertTitle><AlertDescription>{job.currentStage}</AlertDescription></Alert>}
         {complete && !filesAvailable && <Alert><AlertTitle>Dataset files unavailable</AlertTitle><AlertDescription>The run record and evaluation remain available, but its generated files were not retained by the earlier container setup.</AlertDescription></Alert>}
-        <Tabs value={activeTab} onValueChange={(value) => setSearchParams(value === "overview" ? {} : { tab: String(value) }, { preventScrollReset: true })}>
+        <Tabs value={activeTab} onValueChange={(value) => { const next = new URLSearchParams(searchParams); if (value === "overview") next.delete("tab"); else next.set("tab", String(value)); setSearchParams(next, { preventScrollReset: true }); }}>
           <TabsList variant="line"><TabsTrigger value="overview">Overview</TabsTrigger><TabsTrigger disabled={!filesAvailable} value="data">Generated data</TabsTrigger><TabsTrigger disabled={!complete} value="evaluation">Evaluation</TabsTrigger></TabsList>
           <TabsContent className="pt-3" value="overview"><div className="grid gap-4 lg:grid-cols-2">
             <Card><CardHeader><CardTitle>Run summary</CardTitle><CardDescription>Configuration captured when this run started.</CardDescription></CardHeader><CardContent><dl className="grid gap-3 text-xs sm:grid-cols-2"><div><dt className="text-muted-foreground">Requested instances</dt><dd className="mt-1 font-medium tabular-nums">{job.scenario?.recordCount?.toLocaleString() ?? "—"}</dd></div><div><dt className="text-muted-foreground">Records generated</dt><dd className="mt-1 font-medium tabular-nums">{job.stats?.recordsGenerated?.toLocaleString() ?? "—"}</dd></div><div><dt className="text-muted-foreground">Tables</dt><dd className="mt-1 font-medium tabular-nums">{Object.keys(job.scenario?.schemas ?? {}).length}</dd></div><div><dt className="text-muted-foreground">Duration</dt><dd className="mt-1 font-medium tabular-nums">{job.stats ? `${job.stats.durationSeconds}s` : "—"}</dd></div></dl></CardContent></Card>
