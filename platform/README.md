@@ -1,5 +1,8 @@
 # Syda Platform
 
+For manually deploying a selected branch or PR to Dokploy staging, see
+[Staging deployment setup and instructions](STAGING.md).
+
 An end-to-end web platform and interactive studio built directly into the [Syda](https://github.com/syda-ai/syda) monorepo.
 
 Syda Platform provides an interactive visual studio to define data schemas, configure causal constraints, preview generated synthetic datasets, and run generation workloads with referential integrity.
