@@ -50,7 +50,7 @@ class GatewayTests(unittest.TestCase):
         return {"composeId": "staging", "env": f"STAGING_BACKEND_IMAGE={BACKEND}\nSTAGING_FRONTEND_IMAGE={FRONTEND}\nSTAGING_SOURCE_SHA={SHA}"}
 
     def trigger(self):
-        return {"composeId": "staging", "title": TITLE, "description": "ignored",
+        return {"composeId": "staging", "title": TITLE, "backendImage": BACKEND, "frontendImage": FRONTEND,
                 "freshVolumes": False}
 
     def test_config_hides_runtime_secrets_and_returns_selected_digests(self):
@@ -127,6 +127,16 @@ class GatewayTests(unittest.TestCase):
         with self.assertRaisesRegex(gateway.DeployError, "already been used"):
             self.gateway.control("compose.deploy", self.trigger())
         self.assertFalse(self.gateway.state.exists())
+        self.assertFalse(any(endpoint == "compose.deploy" for endpoint, _ in self.calls))
+
+    def test_delayed_trigger_cannot_deploy_a_different_selection(self):
+        self.gateway.control("compose.saveEnvironment", self.selection())
+        original = self.config["env"]
+        for image in (BACKEND, FRONTEND):
+            self.config["env"] = original.replace(image, image.split("@", 1)[0] + "@sha256:" + "d" * 64)
+            with self.subTest(image=image), self.assertRaises(gateway.DeployError):
+                self.gateway.control("compose.deploy", self.trigger())
+            self.assertFalse(self.gateway.state.exists())
         self.assertFalse(any(endpoint == "compose.deploy" for endpoint, _ in self.calls))
 
     def test_unlisted_control_api_rejected(self):

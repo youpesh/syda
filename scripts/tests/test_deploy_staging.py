@@ -66,20 +66,19 @@ class DeploymentTests(unittest.TestCase):
     def run_deploy(self, status="done"):
         with patch.object(deploy, "wait_for_deployment", return_value=status), \
                 patch.object(deploy, "check_health") as health:
-            deploy.deploy(self.gh, self.client)
+            deploy.deploy(self.client, "owner/repo")
         return health
 
-    def test_success_selects_exact_digests_and_releases_lock(self):
+    def test_success_selects_exact_digests(self):
+        os.environ.pop("GH_TOKEN")  # Deployment must not require a GitHub API credential.
         health = self.run_deploy()
-        self.gh.create_ref.assert_called_once_with(deploy.LOCK_BRANCH, CONTROL_SHA)
         self.assertEqual(self.config["backendImage"], BACKEND)
         self.assertEqual(self.config["frontendImage"], FRONTEND)
         self.assertIn(("compose.deploy", {"composeId": "staging", "title": TITLE,
-                      "description": f"Exact source commit {SHA}", "freshVolumes": False}), self.calls)
+                      "backendImage": BACKEND, "frontendImage": FRONTEND, "freshVolumes": False}), self.calls)
         self.assertIn(("compose.saveEnvironment", {"composeId": "staging", "env":
                       f"STAGING_BACKEND_IMAGE={BACKEND}\nSTAGING_FRONTEND_IMAGE={FRONTEND}\nSTAGING_SOURCE_SHA={SHA}"}), self.calls)
         health.assert_called_once()
-        self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
 
     def test_guard_rejections_never_deploy(self):
         for change in ({"gateway": None}, {"environmentId": "production"}, {"composeId": "production"},
@@ -100,7 +99,7 @@ class DeploymentTests(unittest.TestCase):
                 os.environ["STAGING_BACKEND_IMAGE"] = image
                 with self.assertRaises(deploy.DeployError):
                     self.run_deploy()
-        self.gh.create_ref.assert_not_called()
+        self.client.call.assert_not_called()
 
     def test_active_deployment_blocks_source_update(self):
         original = self.client.call.side_effect
@@ -115,22 +114,15 @@ class DeploymentTests(unittest.TestCase):
             self.run_deploy()
         self.assertFalse(any(endpoint == "compose.saveEnvironment" for endpoint, _ in self.calls))
 
-    def test_existing_lock_blocks_all_dokploy_access(self):
-        self.gh.create_ref.side_effect = deploy.HTTPFailure(422)
-        with self.assertRaisesRegex(deploy.DeployError, "lock exists"):
-            self.run_deploy()
-        self.client.call.assert_not_called()
-
-    def test_terminal_failure_unlocks_without_health(self):
+    def test_terminal_failure_does_not_check_health(self):
         for status in ("error", "cancelled"):
             with self.subTest(status=status), patch.object(deploy, "check_health") as health, \
                     patch.object(deploy, "wait_for_deployment", return_value=status):
                 with self.assertRaisesRegex(deploy.DeployError, status):
-                    deploy.deploy(self.gh, self.client)
+                    deploy.deploy(self.client, "owner/repo")
                 health.assert_not_called()
-        self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
 
-    def test_uncertain_trigger_keeps_lock_and_is_not_retried(self):
+    def test_uncertain_trigger_is_not_retried(self):
         original = self.client.call.side_effect
 
         def fail_trigger(endpoint, payload=None):
@@ -143,25 +135,11 @@ class DeploymentTests(unittest.TestCase):
             self.run_deploy()
         self.assertEqual(sum(call.args[0] == "compose.deploy"
                              for call in self.client.call.call_args_list), 1)
-        self.assertFalse(any(call.kwargs.get("method") == "DELETE"
-                             for call in self.gh.call.call_args_list))
-
-    def test_poll_timeout_or_cancellation_keeps_lock(self):
-        for failure in (deploy.DeployError("timeout"), KeyboardInterrupt()):
-            self.gh.reset_mock()
-            with self.subTest(failure=type(failure)), \
-                    patch.object(deploy, "wait_for_deployment", side_effect=failure):
-                with self.assertRaises(type(failure)):
-                    deploy.deploy(self.gh, self.client)
-            self.assertFalse(any(call.kwargs.get("method") == "DELETE"
-                                 for call in self.gh.call.call_args_list))
-
-    def test_health_failure_after_terminal_result_unlocks(self):
+    def test_health_failure_is_reported(self):
         with patch.object(deploy, "wait_for_deployment", return_value="done"), \
                 patch.object(deploy, "check_health", side_effect=deploy.DeployError("unhealthy")):
             with self.assertRaisesRegex(deploy.DeployError, "unhealthy"):
-                deploy.deploy(self.gh, self.client)
-        self.gh.call.assert_any_call("git/refs/heads/staging-deployment-lock", method="DELETE")
+                deploy.deploy(self.client, "owner/repo")
 
     def test_default_and_selected_branch_resolution(self):
         self.gh.call.return_value = {"commit": {"sha": SHA}}
@@ -188,7 +166,7 @@ class DeploymentTests(unittest.TestCase):
                 deploy.resolve(self.gh)
 
     def test_ambiguous_or_invalid_selection_rejected(self):
-        for branch, pr in (("test", "42"), ("", "1; echo hacked"), ("staging-deployment-lock", "")):
+        for branch, pr in (("test", "42"), ("", "1; echo hacked")):
             os.environ.update(INPUT_BRANCH=branch, INPUT_PR=pr)
             with self.assertRaises(deploy.DeployError):
                 deploy.resolve(self.gh)
@@ -196,10 +174,10 @@ class DeploymentTests(unittest.TestCase):
     def test_poll_matches_only_this_run(self):
         row = {"deploymentId": "new", "title": TITLE, "composeId": "staging", "status": "done"}
         self.client.history = Mock(side_effect=[
-            [{**row, "deploymentId": "old"}, {**row, "title": "another-run"}],
+            [{**row, "title": "another-run"}],
             [{**row, "status": "running"}], [row]])
         with patch.object(deploy.time, "sleep"):
-            self.assertEqual(deploy.wait_for_deployment(self.client, TITLE, {"old"}), "done")
+            self.assertEqual(deploy.wait_for_deployment(self.client, TITLE), "done")
         self.assertEqual(self.client.history.call_count, 3)
 
     def test_poll_timeout(self):
@@ -207,7 +185,7 @@ class DeploymentTests(unittest.TestCase):
         with patch.object(deploy.time, "monotonic", side_effect=[0, 0, 1801]), \
                 patch.object(deploy.time, "sleep"):
             with self.assertRaisesRegex(deploy.DeployError, "Timed out"):
-                deploy.wait_for_deployment(self.client, TITLE, set())
+                deploy.wait_for_deployment(self.client, TITLE)
 
     def test_health_retries_and_receives_no_credentials(self):
         with patch.object(deploy, "request", side_effect=[

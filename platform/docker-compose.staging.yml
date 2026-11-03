@@ -26,7 +26,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs: [/tmp:size=128m,mode=1777]
+    tmpfs: ["/tmp:size=128m,mode=1777"]
     command: [/app/platform/backend/.venv/bin/uvicorn, app.main:app, --host, 0.0.0.0, --port, "8000"]
     environment:
       DATABASE_URL: postgresql://syda_staging:${STAGING_POSTGRES_PASSWORD}@postgres:5432/syda_staging
@@ -51,7 +51,7 @@ services:
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    tmpfs: [/tmp:size=64m,mode=1777]
+    tmpfs: ["/tmp:size=64m,mode=1777"]
     ports: ["127.0.0.1:3011:3000"]
     environment:
       PORT: "3000"

@@ -106,7 +106,7 @@ jobs:
     timeout-minutes: 40
     environment: staging
     permissions:
-      contents: write # Atomic deployment lock, surviving runner cancellation.
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -114,7 +114,6 @@ jobs:
           persist-credentials: false
       - name: Deploy exact commit and verify staging health
         env:
-          GH_TOKEN: ${{ github.token }}
           DEPLOY_SHA: ${{ needs.resolve.outputs.sha }}
           DOKPLOY_URL: ${{ vars.STAGING_DOKPLOY_URL }}
           STAGING_DEPLOY_TOKEN: ${{ secrets.STAGING_DEPLOY_TOKEN }}

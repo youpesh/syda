@@ -98,14 +98,19 @@ class Gateway:
                           "env": merged, "createEnvFile": config.get("createEnvFile", True)})
             return {"success": True}
         if endpoint == "compose.deploy":
-            if set(payload) != {"composeId", "title", "description", "freshVolumes"}:
+            if set(payload) != {"composeId", "title", "backendImage", "frontendImage", "freshVolumes"}:
                 raise DeployError("Invalid deployment request")
             title = payload["title"]
             if not re.fullmatch(r"github-staging-[0-9]+-[0-9]+-[0-9a-f]{40}", title):
                 raise DeployError("Invalid deployment identity")
             config = self.config()
-            sha = self.values(config.get("env")).get("STAGING_SOURCE_SHA")
-            if title.rsplit("-", 1)[-1] != sha or payload["freshVolumes"] is not False:
+            selected = self.values(config.get("env"))
+            sha = selected.get("STAGING_SOURCE_SHA")
+            image_reference(self.settings["repository"], "backend", payload["backendImage"])
+            image_reference(self.settings["repository"], "frontend", payload["frontendImage"])
+            if (title.rsplit("-", 1)[-1] != sha or payload["freshVolumes"] is not False
+                    or payload["backendImage"] != selected.get("STAGING_BACKEND_IMAGE")
+                    or payload["frontendImage"] != selected.get("STAGING_FRONTEND_IMAGE")):
                 raise DeployError("Deployment must match the selected images and preserve volumes")
             history = self.idle()
             if any(row["title"] == title for row in history):

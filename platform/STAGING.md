@@ -72,7 +72,7 @@ control than selecting images and deploying. Instead:
 - GitHub receives an independent random **staging deployment token**. The gateway
   accepts only four API operations: staging config read, filtered staging history,
   selection of two validated GHCR digests plus SHA, and a volume-preserving
-  staging deployment. Arbitrary environment keys, Compose edits, mounts, other
+  staging deployment matching both selected image digests. Arbitrary environment keys, Compose edits, mounts, other
   service IDs, redirects and volume resets are rejected.
 - The gateway verifies the fixed Compose text and absence of extra mounts/custom
   commands before deployment. It merges image selection into Dokploy's existing
@@ -189,17 +189,18 @@ unchanged.
 
 The workflow serializes shared staging through one concurrency group. GitHub can
 supersede pending runs but never cancels an active run for a newer dispatch.
-An atomic `staging-deployment-lock` Git ref survives runner loss/cancellation.
-The gateway separately writes its in-flight record **before** calling Dokploy.
-Neither lock is automatically discarded after an uncertain trigger response.
+The gateway writes its persistent in-flight record **before** calling Dokploy,
+so runner cancellation or loss cannot allow a later run to change images during
+an uncertain deployment. The deploy job needs only read-only repository access;
+it does not receive a GitHub API credential or create branches.
 
 On cancellation, timeout or trigger/network failure, inspect Dokploy history and
 queue for `github-staging-<run>-<attempt>-<sha>`. Wait for completion or explicitly
 cancel and verify there are no remaining queued/running processes. The gateway
-clears its in-flight record only after that exact title becomes terminal. If no
+clears its in-flight record only after that exact title becomes terminal and
+rejects reuse of a completed deployment title. If no
 record exists and the outcome is uncertain, an owner must reconcile the queue
-before manually clearing `/state/inflight.json` and deleting the GitHub
-`staging-deployment-lock` branch. Then start a new dispatch, not an old rerun.
+before manually clearing `/state/inflight.json`. Then start a new dispatch, not an old rerun.
 A terminal build/deploy failure or failed health check fails Actions clearly.
 POST triggers are not retried automatically.
 

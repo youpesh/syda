@@ -15,7 +15,6 @@ import urllib.parse
 import urllib.request
 
 
-LOCK_BRANCH = "staging-deployment-lock"
 GATEWAY_IDENTITY = "syda-staging"
 POLL_SECONDS = 15
 DEPLOY_TIMEOUT = 1800
@@ -47,9 +46,9 @@ def https_url(value, origin=False):
     return value.rstrip("/") if origin else value
 
 
-def request(url, headers, payload=None, method=None, json_response=True):
+def request(url, headers, payload=None, json_response=True):
     data = None if payload is None else json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    req = urllib.request.Request(url, data=data, headers=headers)
     try:
         with urllib.request.build_opener(NoRedirect).open(req, timeout=30) as response:
             body = response.read(4 * 1024 * 1024)
@@ -86,12 +85,8 @@ class GitHub:
             "User-Agent": "syda-staging-deployer",
         }
 
-    def call(self, path, payload=None, method=None):
-        return request(f"{self.base}/repos/{self.repo}/{path}", self.headers, payload, method,
-                       json_response=method != "DELETE")
-
-    def create_ref(self, branch, sha):
-        self.call("git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
+    def call(self, path):
+        return request(f"{self.base}/repos/{self.repo}/{path}", self.headers)
 
 
 def quote(value):
@@ -126,8 +121,6 @@ def resolve(gh):
         sha = valid_sha(source["head"]["sha"])
     else:
         branch = branch or os.environ["DEFAULT_BRANCH"]
-        if branch == LOCK_BRANCH:
-            raise DeployError("Choose a source branch, not a deployment control branch")
         sha = valid_sha(gh.call(f"branches/{quote(branch)}")["commit"]["sha"])
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"sha={sha}\n")
@@ -181,12 +174,11 @@ def image_reference(repo, service, value):
     return value
 
 
-def wait_for_deployment(dokploy, title, previous):
+def wait_for_deployment(dokploy, title):
     deadline = time.monotonic() + DEPLOY_TIMEOUT
     while time.monotonic() < deadline:
         rows = dokploy.history()
-        matches = [row for row in rows if row.get("title") == title
-                   and row.get("deploymentId") not in previous]
+        matches = [row for row in rows if row.get("title") == title]
         if len(matches) > 1:
             raise DeployError("Multiple deployments matched this run; retaining staging lock")
         if matches:
@@ -220,10 +212,10 @@ def check_health(api_url, web_url):
     raise DeployError("Deployment completed but staging API/frontend health checks failed")
 
 
-def deploy(gh, dokploy):
+def deploy(client, repository):
     sha = valid_sha(os.environ["DEPLOY_SHA"])
-    backend = image_reference(gh.repo, "backend", os.environ["STAGING_BACKEND_IMAGE"])
-    frontend = image_reference(gh.repo, "frontend", os.environ["STAGING_FRONTEND_IMAGE"])
+    backend = image_reference(repository, "backend", os.environ["STAGING_BACKEND_IMAGE"])
+    frontend = image_reference(repository, "frontend", os.environ["STAGING_FRONTEND_IMAGE"])
     api_url = https_url(os.environ["STAGING_API_HEALTH_URL"])
     web_url = https_url(os.environ["STAGING_WEB_HEALTH_URL"])
     run = os.environ["GITHUB_RUN_ID"]
@@ -231,51 +223,31 @@ def deploy(gh, dokploy):
     if not re.fullmatch(r"[0-9]+", run) or not re.fullmatch(r"[0-9]+", attempt):
         raise DeployError("Invalid GitHub run identity")
     title = f"github-staging-{run}-{attempt}-{sha}"
-    # Atomic, durable lock survives runner cancellation, timeouts and ambiguous
-    # API failures. After a trigger, only a known terminal result releases it.
-    try:
-        gh.create_ref(LOCK_BRANCH, valid_sha(os.environ["GITHUB_SHA"]))
-    except HTTPFailure as exc:
-        if exc.status == 422:
-            raise DeployError("Staging lock exists; see platform/STAGING.md recovery instructions") from None
-        raise
-    safe_to_unlock = True
-    try:
-        config = dokploy.one()
-        dokploy.check_config(config)
-        history = dokploy.history()
-        if any(row.get("status") not in ("done", "error", "cancelled") for row in history):
-            raise DeployError("Staging has an active/unknown deployment; wait for it to finish")
-        previous = {row["deploymentId"] for row in history}
-        # The staging gateway merges only these three values server-side, keeping
-        # runtime secrets off the runner. It rejects all Compose/mount changes.
-        env = f"STAGING_BACKEND_IMAGE={backend}\nSTAGING_FRONTEND_IMAGE={frontend}\nSTAGING_SOURCE_SHA={sha}"
-        dokploy.call("compose.saveEnvironment", {"composeId": dokploy.compose_id, "env": env})
-        selected = dokploy.one()
-        if (selected.get("sourceCommit") != sha or selected.get("backendImage") != backend
-                or selected.get("frontendImage") != frontend):
-            raise DeployError("Staging gateway did not retain the selected image digests")
-        note(f"Deploying staging commit `{sha}` with immutable backend/frontend image digests.")
-        safe_to_unlock = False  # A failed POST may still have enqueued a deployment.
-        dokploy.call("compose.deploy", {"composeId": dokploy.compose_id, "title": title,
-                                       "description": f"Exact source commit {sha}",
-                                       "freshVolumes": False})
-        status = wait_for_deployment(dokploy, title, previous)
-        safe_to_unlock = True  # This run is definitively terminal.
-        if status != "done":
-            raise DeployError(f"Dokploy staging deployment ended with status: {status}")
-        selected = dokploy.one()
-        if (selected.get("sourceCommit") != sha or selected.get("backendImage") != backend
-                or selected.get("frontendImage") != frontend):
-            raise DeployError("Selected images changed during deployment")
-        check_health(api_url, web_url)
-        note(f"Staging deployment completed for `{sha}`; API and frontend health checks passed.")
-    finally:
-        if safe_to_unlock:
-            gh.call(f"git/refs/heads/{quote(LOCK_BRANCH)}", method="DELETE")
-        else:
-            note("Staging lock retained: deployment outcome is uncertain. An operator must reconcile "
-                 "Dokploy before removing `staging-deployment-lock`; see platform/STAGING.md.")
+    client.check_config(client.one())
+    if any(row.get("status") not in ("done", "error", "cancelled") for row in client.history()):
+        raise DeployError("Staging has an active/unknown deployment; wait for it to finish")
+    # The gateway merges only these values server-side. Runtime secrets remain
+    # private, and its durable lock prevents changes during an in-flight deploy.
+    env = f"STAGING_BACKEND_IMAGE={backend}\nSTAGING_FRONTEND_IMAGE={frontend}\nSTAGING_SOURCE_SHA={sha}"
+    client.call("compose.saveEnvironment", {"composeId": client.compose_id, "env": env})
+    selected = client.one()
+    if (selected.get("sourceCommit") != sha or selected.get("backendImage") != backend
+            or selected.get("frontendImage") != frontend):
+        raise DeployError("Staging gateway did not retain the selected image digests")
+    note(f"Deploying staging commit `{sha}` with immutable backend/frontend image digests.")
+    # Never retry this POST: its response can be lost after Dokploy queues it.
+    client.call("compose.deploy", {"composeId": client.compose_id, "title": title,
+                                  "backendImage": backend, "frontendImage": frontend,
+                                  "freshVolumes": False})
+    status = wait_for_deployment(client, title)
+    if status != "done":
+        raise DeployError(f"Dokploy staging deployment ended with status: {status}")
+    selected = client.one()
+    if (selected.get("sourceCommit") != sha or selected.get("backendImage") != backend
+            or selected.get("frontendImage") != frontend):
+        raise DeployError("Selected images changed during deployment")
+    check_health(api_url, web_url)
+    note(f"Staging deployment completed for `{sha}`; API and frontend health checks passed.")
 
 
 def main():
@@ -288,7 +260,7 @@ def main():
                         "STAGING_BACKEND_IMAGE", "STAGING_FRONTEND_IMAGE")
             if any(not os.environ.get(key) for key in required):
                 raise DeployError("Missing staging environment configuration; see platform/STAGING.md")
-            deploy(GitHub(), StagingGatewayClient())
+            deploy(StagingGatewayClient(), os.environ["GITHUB_REPOSITORY"])
         else:
             raise DeployError("Usage: deploy_staging.py resolve|deploy")
     except (DeployError, KeyError, TypeError, ValueError) as exc:
