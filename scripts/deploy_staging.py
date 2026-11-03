@@ -252,7 +252,7 @@ def deploy(gh, dokploy):
         gh.create_ref(snapshot, sha)
         rules = gh.call(f"rules/branches/{quote(snapshot)}?per_page=100")
         immutable = {rule["type"] for rule in rules
-                     if not rule.get("parameters", {}).get("update_allows_fetch_and_merge", False)}
+                     if not (rule.get("parameters") or {}).get("update_allows_fetch_and_merge", False)}
         if not {"update", "deletion"}.issubset(immutable):
             raise DeployError("Snapshot branch requires active rules restricting updates AND deletions")
         if gh.ref_sha(snapshot) != sha:

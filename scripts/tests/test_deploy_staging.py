@@ -45,7 +45,7 @@ class DeploymentTests(unittest.TestCase):
         }
         self.gh = Mock(repo="owner/repo")
         self.gh.ref_sha.return_value = SHA
-        self.gh.call.return_value = [{"type": "update"}, {"type": "deletion"}]
+        self.gh.call.return_value = [{"type": "update"}, {"type": "deletion", "parameters": None}]
         self.dokploy = deploy.Dokploy()
         self.calls = []
 
