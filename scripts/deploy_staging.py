@@ -132,7 +132,7 @@ def resolve(gh):
         sha = valid_sha(gh.call(f"branches/{quote(branch)}")["commit"]["sha"])
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"sha={sha}\n")
-    note(f"Selected staging commit: `{sha}`. Review this commit before approving staging.")
+    note(f"Selected staging commit: `{sha}`. Manual deployment proceeds without an approval gate.")
 
 
 class Dokploy:

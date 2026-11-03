@@ -23,7 +23,7 @@ are unsuitable for that. This implementation does not create preview environment
 
 The workflow runs only on `workflow_dispatch`, and only when its **Run workflow
 branch selector is the repository default branch**. It resolves the input to a
-full SHA, displays it before staging approval, then creates a unique branch
+full SHA, displays it in the run summary, then creates a unique branch
 `staging-snapshots/<run>-<attempt>-<sha>` at that SHA. Active GitHub rules must
 prohibit all updates and deletions of these snapshots. Dokploy's Git/GitHub clone
 uses a branch name (`git clone --branch … --depth 1`); passing an arbitrary SHA
@@ -36,7 +36,9 @@ runner executes the controller from the workflow's trusted `github.sha`. Selecte
 Dockerfiles and Compose code **do execute on staging**, with access to staging
 runtime secrets and data. Review the resolved SHA accordingly. A PR deploy uses
 its head commit, not GitHub's synthetic merge commit; it does not test integration
-with the base branch. New commits pushed while approval is pending are excluded.
+with the base branch. New commits pushed after source resolution are excluded.
+Any engineer with repository write access can dispatch staging without a separate
+deployment review; public read access does not grant permission to deploy.
 
 ## One-time owner setup: security boundary
 
@@ -73,11 +75,11 @@ Complete these before enabling the workflow or setting the confirmation variable
    No CODEOWNERS identities are invented in this change.
 5. Create the GitHub Environment **`staging`**. Its deployment branch policy must
    allow **only the exact default branch** (currently `feat/web-platform`), not
-   all protected branches or all tags. Add trusted required reviewers, prevent
-   self-review and disallow administrator bypass. Configure reviewer eligibility
-   for the engineers/team permitted to approve staging. Reviewers must inspect
-   both the controller revision and the resolved target SHA. Required reviewers
-   are plan/repository-visibility dependent; this repository is currently public.
+   all protected branches or all tags. Leave required reviewers empty and the
+   wait timer disabled: deployment starts after a manual dispatch without an
+   approval gate. Keep administrator bypass disabled. Repository write access
+   controls who can dispatch; workflow/controller changes still require the
+   default branch's normal code review protections.
 6. Create an **active branch ruleset** matching
    `refs/heads/staging-snapshots/**/*` (or UI pattern `staging-snapshots/**/*`).
    Enable **Restrict updates** and **Restrict deletions**, with an **empty bypass
@@ -92,8 +94,10 @@ Complete these before enabling the workflow or setting the confirmation variable
 Environment secrets do **not** make arbitrary workflow changes safe. An engineer
 who can alter an approved workflow can add a step to exfiltrate any secret that
 job receives, remove its guards, or request broader `GITHUB_TOKEN` permissions.
-The exact-branch environment restriction, reviewed default branch and trusted
-reviewers reduce that risk; the Dokploy-side scope and host isolation enforce the
+The exact-branch environment restriction and reviewed default branch reduce that
+risk; there is no per-deployment reviewer. Treat every repository writer as
+authorized to run selected code with staging runtime secrets and data.
+The Dokploy-side scope and host isolation enforce the
 production boundary even if the staging key is stolen. Repository/environment
 administrators remain trusted. Keep production secrets inaccessible to this
 environment and production workflows protected independently.
@@ -173,8 +177,8 @@ owner acknowledgement, not an automated proof of isolation or credential scope.
 3. Enter a source **branch**, or leave branch blank and enter an open
    same-repository **PR number**. Both blank deploys the current default branch.
    Fork PRs are rejected. Do not use an arbitrary SHA as the branch input.
-4. Review the full resolved SHA in the resolve job summary and the staging job
-   name. An eligible staging reviewer approves that exact commit and controller.
+4. The deployment starts without a review or approval step. The full resolved
+   SHA appears in the resolve job summary and staging job name.
 5. Wait for the deployment and both health checks. A green run means Dokploy
    reported this run's deployment `done` and both liveness checks passed. It does
    not mean a full end-to-end application test passed.
