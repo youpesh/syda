@@ -1,0 +1,88 @@
+name: Validate staging build
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+      upload_artifact:
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - .github/workflows/*staging*.yml
+      - platform/docker-compose.staging.yml
+      - platform/backend/Dockerfile
+      - platform/frontend/Dockerfile
+      - scripts/deploy_staging.py
+      - scripts/staging_gateway.py
+      - scripts/tests/**
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate controller and gateway
+        run: python3 -m unittest discover -s scripts/tests -v
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/deploy-staging.yml .github/workflows/build-staging-images.yml
+      - name: Validate fixed staging Compose
+        env:
+          STAGING_POSTGRES_PASSWORD: validation-only
+          STAGING_AUTH_SECRET_KEY: validation-only
+          STAGING_PUBLIC_URL: https://staging.invalid
+          STAGING_BACKEND_IMAGE: validation-backend
+          STAGING_FRONTEND_IMAGE: validation-frontend
+        run: docker compose -f platform/docker-compose.staging.yml config --quiet
+
+  build:
+    name: Build selected commit without deployment credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
+          path: source
+          persist-credentials: false
+      - name: Build platform images
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha }}
+        run: |
+          docker build --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t syda-staging-backend:build -f source/platform/backend/Dockerfile source
+          docker build --label "org.opencontainers.image.revision=$SOURCE_SHA" --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" -t syda-staging-frontend:build source/platform/frontend
+      - name: Smoke test fixed staging stack on the disposable runner
+        if: github.event_name == 'pull_request'
+        env:
+          STAGING_POSTGRES_PASSWORD: validation-only
+          STAGING_AUTH_SECRET_KEY: validation-only
+          STAGING_PUBLIC_URL: https://staging.invalid
+          STAGING_BACKEND_IMAGE: syda-staging-backend:build
+          STAGING_FRONTEND_IMAGE: syda-staging-frontend:build
+        run: |
+          trap 'smoke_status=$?; if [ "$smoke_status" -ne 0 ]; then docker compose -p staging-ci -f source/platform/docker-compose.staging.yml logs --tail 60; fi; docker compose -p staging-ci -f source/platform/docker-compose.staging.yml down --volumes; exit "$smoke_status"' EXIT
+          docker compose -p staging-ci -f source/platform/docker-compose.staging.yml create
+          docker run --rm --network none --cap-drop ALL --cap-add CHOWN --security-opt no-new-privileges --mount type=volume,source=staging-ci_job_data,target=/jobs --mount type=volume,source=staging-ci_settings_data,target=/settings alpine:3.21 chown 10001:10001 /jobs /settings
+          docker compose -p staging-ci -f source/platform/docker-compose.staging.yml up -d --wait --wait-timeout 120
+          curl -fsS --retry 12 --retry-all-errors --retry-delay 5 --max-time 5 http://127.0.0.1:3011/api/health | python3 -c 'import json,sys; health=json.load(sys.stdin); assert health == {"status":"ok","service":"syda-platform-api"}, health'
+          curl -fsS --max-time 10 http://127.0.0.1:3011/ -o "$RUNNER_TEMP/staging.html"
+          python3 -c 'import os,pathlib; assert b"<html" in pathlib.Path(os.environ["RUNNER_TEMP"], "staging.html").read_bytes().lower()'
+      - name: Save images for manual deployment workflow
+        if: inputs.upload_artifact
+        run: docker save syda-staging-backend:build syda-staging-frontend:build | gzip > "$RUNNER_TEMP/staging-images.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: inputs.upload_artifact
+        with:
+          name: staging-images
+          path: ${{ runner.temp }}/staging-images.tar.gz
+          retention-days: 1
+          compression-level: 0
