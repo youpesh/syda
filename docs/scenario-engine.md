@@ -128,3 +128,54 @@ timestamps are owned by the structural ledger. Fixed step values, path overrides
 and binding targets cannot write to those fields. Referenced parent identities must
 also remain non-null and globally unique so every child foreign key identifies
 exactly one parent row in the same scenario instance.
+
+## Causal validation and rejected datasets
+
+Declare executable checks in `ScenarioDefinition.checks`. Free-text `rules` provide
+generation context; they are not a substitute for executable checks. Use explicit
+paths and overrides when you need specific branch outcomes and rates.
+
+- `allowed_values` checks a field against its configured values.
+- `temporal_order` checks a `before`/`after` pair or a `chain`. Comparisons within
+  one table apply to each record independently. Across tables, ordering applies
+  within each scenario instance: the earlier step's maximum timestamp must not
+  exceed the later step's minimum. Set `strict=True` to forbid equal timestamps.
+- `absence_by_value` forbids a table's records for instances matching the source
+  value, including Boolean and numeric values.
+- `state_machine` / `state_transition` validate declared transitions. Use
+  `previous_field` for row-level transitions, or `order_by` for a status history
+  grouped by scenario instance. Histories check their declared initial and
+  terminal states. If `order_by` is omitted, the step's timestamp field is used
+  when available, otherwise the input row order is used.
+- `semantic_invariant` checks an expression or a condition/assertion pair;
+  `custom_rule` checks an expression. Expressions use a restricted interpreter,
+  not Python `eval`. Evaluation errors are violations, not successful checks.
+
+Malformed non-null timestamps are violations. Temporal comparisons skip null timestamps. When a timestamp must be present,
+declare an additional custom rule such as `not is_none(submitted_at)`. Missing
+tables or columns in declared checks are reported as violations. A table omitted
+by a path remains an empty frame with its schema columns, so an intentionally
+absent step does not require invented records.
+
+Generation runs causal validation automatically after enrichment and structural
+validation. Failed checks raise `ScenarioValidationError` **before saving output**:
+
+```python
+from syda.scenarios import ScenarioValidationError
+
+try:
+    result = engine.generate(scenario, instance_count=200, output_dir="output")
+except ScenarioValidationError as error:
+    for violation in error.violations:
+        print(violation.table, violation.row, violation.rule, violation.error)
+```
+
+`error.result` contains the rejected tables for diagnostics; it is not an accepted
+dataset. To inspect existing data without generating or exporting anything, use
+`ScenarioEngine.validate_causal_workflow(definition, tables)` to obtain check
+results and structured violations.
+
+The platform persists failed evaluations as failed jobs, retains their JSON/HTML
+reports at `/api/evaluation/{job_id}/report`, and blocks dataset previews and
+downloads. Rejected data is not exported as CSV. The run's Evaluation tab remains
+available so users can inspect the rule, table, instance, and reason before retrying.

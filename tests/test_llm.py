@@ -8,8 +8,11 @@ from syda.llm import LLMClient, create_llm_client
 from syda.schemas import ModelConfig
 
 
+from pydantic_ai.models import Model
+
+
 def _mock_model():
-    return MagicMock(name="PydanticAIModel")
+    return MagicMock(spec=Model)
 
 
 class TestLLMClientInit:

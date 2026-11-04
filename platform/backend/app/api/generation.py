@@ -37,6 +37,7 @@ from ..models.scenario import (
     JobStats,
     ScenarioConfiguration,
     CostEstimate,
+    ViolationRecord,
 )
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,7 @@ async def download_evaluation_report(
     job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "complete" or not job.stats:
+    if job.status not in {"complete", "failed"} or not job.stats:
         raise HTTPException(status_code=409, detail="Evaluation report is not ready")
     stats = JobStats.model_validate(job.stats)
     report = {
@@ -255,6 +256,7 @@ async def download_evaluation_report(
         "recordsGenerated": stats.records_generated,
         "pathCounts": stats.path_counts,
         "metrics": [metric.model_dump(by_alias=True) for metric in stats.evaluation_metrics],
+        "violations": [violation.model_dump(by_alias=True) for violation in stats.violations],
     }
     if format == "json":
         return JSONResponse(
@@ -272,10 +274,27 @@ async def download_evaluation_report(
         "</tr>"
         for metric in stats.evaluation_metrics
     )
+    violation_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(v.table)}</td>"
+        f"<td>{html.escape(str(v.row))}</td>"
+        f"<td>{html.escape(v.rule)}</td>"
+        f"<td>{html.escape(v.error)}</td>"
+        "</tr>"
+        for v in stats.violations
+    )
+    violations_section = (
+        f"<h2>Causal & Semantic Rule Violations ({len(stats.violations)})</h2>"
+        f"<table><thead><tr><th>Table</th><th>Row</th><th>Rule</th><th>Error</th></tr></thead><tbody>{violation_rows}</tbody></table>"
+        if stats.violations
+        else "<p><em>No causal or semantic rule violations detected.</em></p>"
+    )
     document = f"""<!doctype html><html><head><meta charset="utf-8"><title>Syda evaluation {html.escape(job_id)}</title>
-<style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}</style>
+<style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%;margin-bottom:24px}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}h2{{margin-top:24px}}</style>
 </head><body><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p>
-<table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table></body></html>"""
+<table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>
+{violations_section}
+</body></html>"""
     return HTMLResponse(
         document,
         headers={"Content-Disposition": f'attachment; filename="evaluation_{job_id}.html"'},

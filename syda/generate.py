@@ -31,7 +31,7 @@ import inspect
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import networkx as nx
-from typing import Dict, List, Optional, Callable, Union, Type, Any, Tuple
+from typing import Dict, List, Optional, Callable, Union, Type, Any, Tuple, cast
 from pydantic import create_model, TypeAdapter, Field
 from .schemas import ModelConfig
 from .llm import create_llm_client, LLMClient
@@ -53,7 +53,7 @@ def _slim(df: "pd.DataFrame", fk_cols: Optional[set], schema: dict) -> "pd.DataF
     if fk_cols:
         keep = list(fk_cols & set(df.columns))
         if keep:
-            return df[keep]
+            return cast(pd.DataFrame, df[keep])
     return pd.DataFrame(columns=list(schema.keys()))
 from .utils import (
     create_empty_dataframe,
@@ -158,7 +158,7 @@ class SyntheticDataGenerator:
             schema_dict = self.schema_loader.load_schema(model_class)
             
             # Determine the table name (either from tablename attribute or class name)  
-            schema_name = model_class.__tablename__
+            schema_name = getattr(model_class, "__tablename__", getattr(model_class, "__name__", str(model_class)))
             schemas[schema_name] = schema_dict
         # print("schemas", schemas)
         # exit(0)
@@ -211,11 +211,10 @@ class SyntheticDataGenerator:
             custom_generators = {}
             
         # Handle single SQLAlchemy model case
-        if not isinstance(sqlalchemy_models, list):
-            sqlalchemy_models = [sqlalchemy_models]
+        models_list: list[Any] = sqlalchemy_models if isinstance(sqlalchemy_models, list) else [sqlalchemy_models]
         
         # Convert SQLAlchemy models to schema format
-        schemas = self._sqlalchemy_models_to_schemas(sqlalchemy_models)
+        schemas = self._sqlalchemy_models_to_schemas(models_list)
         
         # Call generate_for_schemas with the converted schemas
         return self.generate_for_schemas(
@@ -269,7 +268,7 @@ class SyntheticDataGenerator:
 
     def generate_for_schemas(
         self,
-        schemas: Dict[str, Union[Dict[str, str], str]],
+        schemas: Dict[str, Any],
         prompts: Optional[Dict[str, str]] = None,
         sample_sizes: Optional[Dict[str, int]] = None,
         output_dir: Optional[str] = None,
@@ -280,6 +279,7 @@ class SyntheticDataGenerator:
         batch_size: Optional[int] = None,
         cache_dir: Optional[str] = None,
         max_workers: Optional[int] = None,
+        **kwargs: Any,
     ) -> Dict[str, pd.DataFrame]:
         """
         Generate synthetic data for multiple related schemas with automatic 
@@ -653,7 +653,7 @@ class SyntheticDataGenerator:
                 f"instead of {sample_size} for {schema_name}"
             )
         elif len(df) > sample_size:
-            df = df.iloc[:sample_size]
+            df = cast(pd.DataFrame, df.iloc[:sample_size])
 
         table_report.duration_s = time.time() - _tbl_start
         table_report.row_count = len(df)
@@ -670,7 +670,7 @@ class SyntheticDataGenerator:
             is_streamed = True
             print(f"[syda] {schema_name}: {len(df):,} rows written to {file_path}")
             fk_cols = list(fk_exposed.get(schema_name, set()) & set(df.columns))
-            df = df[fk_cols] if fk_cols else pd.DataFrame(columns=list(df.columns))
+            df = cast(pd.DataFrame, df[fk_cols]) if fk_cols else pd.DataFrame(columns=list(df.columns))
 
         return schema_name, df, table_report, is_streamed
 
@@ -983,7 +983,10 @@ class SyntheticDataGenerator:
             in_tok = (getattr(usage, 'input_tokens', None) or 0) if usage else 0
             out_tok = (getattr(usage, 'output_tokens', None) or 0) if usage else 0
 
-            records = [obj.model_dump() for obj in ai_objs]
+            records = [
+                obj.model_dump() if hasattr(obj, "model_dump") else obj
+                for obj in cast(List[Any], ai_objs)
+            ]
             if not records:
                 raise ValueError("No records extracted from LLM response")
 
@@ -1187,7 +1190,7 @@ Every column must appear in exactly one list."""
         )
 
         if ModelRetry is not None:
-            @agent.output_validator
+            @cast(Any, agent).output_validator
             def _validate_code(output: SchemaAnalysis) -> SchemaAnalysis:
                 for col_name, code in output.simple.items():
                     try:
@@ -1225,7 +1228,7 @@ Every column must appear in exactly one list."""
             try:
                 self._wait_for_global_backoff()
                 result = agent.run_sync(analysis_prompt, model_settings=model_settings)
-                analysis = result.output
+                analysis = cast(SchemaAnalysis, result.output)
             except Exception as e:
                 print(
                     f"[syda] Warning: code-gen analysis failed for '{schema_name}' ({e}). "
@@ -1434,7 +1437,7 @@ Every column must appear in exactly one list."""
             max_len = constraints.get('max_length') or constraints.get('length')
             if max_len:
                 df[col_name] = df[col_name].apply(
-                    lambda v, ml=max_len: str(v)[:ml] if isinstance(v, str) and len(str(v)) > ml else v
+                    lambda v, ml=max_len: v[:ml] if isinstance(v, str) and len(v) > ml else v
                 )
 
             col_type = table_schema.get(col_name, 'text')
@@ -1619,7 +1622,7 @@ Every column must appear in exactly one list."""
                     print(f"[syda] Short count ({len(part)}/{sz - remaining + len(part)} rows), "
                           f"topping up {remaining} more rows (attempt {topup_attempts})...")
 
-            chunk = pd.concat(parts, ignore_index=True).iloc[:sz]
+            chunk = cast(pd.DataFrame, pd.concat(parts, ignore_index=True).iloc[:sz])
             chunk = self._enforce_uniqueness(chunk, table_schema, metadata, chunk_offset=offset)
             chunk = self._apply_constraints(chunk, table_schema, metadata)
             chunk = self._apply_type_generators(chunk, table_schema, schema_name=schema_name)
@@ -1654,7 +1657,7 @@ Every column must appear in exactly one list."""
                 if fk_cols_to_keep:
                     keep = list(fk_cols_to_keep & set(chunk.columns))
                     if keep:
-                        fk_parts.append(chunk[keep])
+                        fk_parts.append(cast(pd.DataFrame, chunk[keep]))
             # Return slim DataFrame: FK columns only (enough for child-table generators)
             return pd.concat(fk_parts, ignore_index=True) if fk_parts else pd.DataFrame(columns=list(table_schema.keys()))
 

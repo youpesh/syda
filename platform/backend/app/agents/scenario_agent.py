@@ -1,7 +1,7 @@
 import re
 import asyncio
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, cast
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,18 +29,35 @@ Conversation behavior:
 - Never infer a specific value from vague language such as “smaller” or “faster.” Ask a concise question when the requested change is ambiguous. Only confirm a change after the draft tool succeeds, and use its returned title, table count, and instance count.
 - Chat can design and validate a dataset scenario; it must not start dataset generation. Generation requires the user's explicit action in the interface.
 
+Natural business language translation:
+- Users are business users and domain experts who express requirements in natural, non-technical language (e.g. "Create a loan approval scenario with 50 instances where 20% of loans are rejected and rejected loans don't get disbursed" or "I want an e-commerce order scenario where cancelled orders are never shipped").
+- NEVER expect, demand, or require users to use technical database terminology, SQL notation, or field syntax like 'Underwriting.status', 'Order.status is cancelled', or 'absence_by_value'.
+- Automatically translate high-level business statements to appropriate relational entities, status columns, machine-executable checks, and branching paths:
+  1. Entities & Steps: Determine the logical chronological workflow (e.g., for loans: Applicant -> Application -> Underwriting -> Disbursement -> Repayment; for orders: Customer -> Product -> Order -> Payment -> Shipment; for claims: Patient -> Policy -> Provider -> Diagnosis -> Claim -> Payment).
+  2. Decision Steps & Status Fields: Locate or define the decision-making step (e.g., Underwriting, Assessment, Claim, Order) and ensure it contains a status column with allowed values (e.g. approved, rejected, pending).
+  3. Conditional Absence Rules: When the user indicates that a negative outcome prevents downstream actions (e.g. "rejected loans shouldn't get disbursed", "denied claims don't get paid", "cancelled orders shouldn't ship"), automatically configure the machine check kind='absence_by_value' with source='<DecisionTable>.status', value='rejected' (or 'denied'/'cancelled'), and absent_table='<DownstreamTable>'.
+  4. Metrics & Paths: When the user mentions rates (e.g., "20% rejection rate", "10% cancellation"), set secondary_metric (e.g., {"label": "Rejection rate", "value": "20%"}) and establish corresponding branching paths (e.g. approved path with 80% weight, rejected path with 20% weight omitting the absent table).
+  5. Conversational Style: Communicate using the user's domain terminology in plain English. Summarize the business logic clearly without quoting raw technical syntax like "Underwriting.status".
+
 A scenario consists of:
 1. title: A concise, professional title.
 2. description: A clear description of the business process and constraints.
-3. record_count: Complete lifecycle instances to generate (e.g., 5000, 10000). Default to 10000 unless specified.
-4. secondary_metric: An important domain-specific constraint or ratio (e.g., "Denial rate": "15%", "Fraud rate": "3%", "Care-gap rate": "8%").
-5. workflow: Sequential entity names preserving causal order (e.g., ["Patient", "Visit", "Diagnosis", "Treatment", "Follow-up"]).
-6. paths: Optional weighted branches with name, included workflow steps, and per-step field overrides.
-7. rules: List of temporal, referential, and business constraints (e.g., "Visits occur before diagnoses", "Denied claims cannot be paid").
+3. record_count: Complete lifecycle instances to generate (e.g., 50, 100, 10000). Default to 10000 unless specified.
+4. secondary_metric: An important domain-specific constraint or ratio (e.g., "Rejection rate": "20%", "Denial rate": "15%", "Fraud rate": "3%").
+5. workflow: Sequential entity names preserving causal order (e.g., ["Applicant", "Application", "Underwriting", "Disbursement", "Repayment"]).
+6. paths: Weighted branches with name, included workflow steps, and per-step field overrides. Whenever an absence_by_value rule or conditional outcome (e.g., rejection/denial/cancellation) is present, define the corresponding paths (e.g. an approved/standard path with all steps, and a rejected/cancelled path that omits the absent tables with the matching percentage weight like 0.8 and 0.2).
+7. rules: List of temporal, referential, and business constraints in clear English (e.g., "Applications precede underwriting decisions", "Rejected loans cannot be disbursed").
 8. schemas: Native relational table definitions mapping table name to column schemas with types, primary keys, and __foreign_keys__.
-9. checks: Machine-checkable rules. Use kind='allowed_values' with table, field, and values; kind='temporal_order' with before and after Table.field references; or kind='absence_by_value' with source='Table.field', value, and absent_table to prohibit a later table for matching instances. Encode target rates in path weights/overrides when applicable. Keep checks consistent with workflow paths and schemas. Do not claim a free-text rule is enforced unless it has a matching check or schema/path constraint.
-
-Provide a concise, helpful response message explaining the design choices or updates."""
+9. checks: Machine-checkable rules. Use kind='allowed_values' with table, field, and values; kind='temporal_order' with before and after Table.field references or chain; kind='absence_by_value' with source='Table.field', value, and absent_table; kind='state_machine' with transitions mapping; or kind='semantic_invariant' with condition and assertion. Translate the user's natural descriptions of entities, constraints, and edge cases into these machine-checkable rules. Keep checks consistent with workflow paths and schemas.
+Response formatting requirements:
+- NEVER use markdown formatting syntax in your reply message.
+- Do NOT use markdown headers (no '#', '##', '###', etc.).
+- Do NOT use markdown bold or italics (no '**', '*', '__', or '_').
+- Do NOT use backticks or code fences.
+- Do NOT use markdown bullet markers (no '*', '-', or '+').
+- Write cleanly in natural plain text with clear paragraph spacing.
+- If you summarize workflow steps, tables, or rules, use clean numbered lines (e.g. 1. Patient, 2. Policy) or simple sentences.
+- Make the summary concise, elegant, and effortless for the viewer to read at a glance."""
 
 
 class ScenarioDraftPatch(BaseModel):
@@ -72,6 +89,7 @@ class ScenarioCreationPatch(BaseModel):
     paths: Optional[List[ScenarioPathConfiguration]] = None
     rules: Optional[List[str]] = None
     checks: Optional[List[ScenarioCheck]] = None
+    schemas: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 class ScenarioAgentReply(BaseModel):
@@ -84,6 +102,30 @@ def _run_usage_counts(result: Any) -> tuple[int | None, int | None]:
     usage_method = getattr(result, "usage", None)
     usage = usage_method() if callable(usage_method) else usage_method
     return getattr(usage, "requests", None), getattr(usage, "tool_calls", None)
+
+
+def _clean_agent_message(text: str) -> str:
+    """Strips raw markdown formatting tokens from text for clean, human-readable presentation."""
+    if not text:
+        return ""
+    # Strip markdown headers (e.g., ### Header -> Header:)
+    text = re.sub(r"^#{1,6}\s*(.+?)\s*$", r"\1:", text, flags=re.MULTILINE)
+    text = re.sub(r"\s*#{1,6}\s+", "\n\n", text)
+    # Strip bold and italics: **text**, *text*, __text__, _text_
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*]+)\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    text = re.sub(r"_([^_]+)_", r"\1", text)
+    # Strip backticks: `code` -> code
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Convert markdown bullet points to clean bullet points
+    text = re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"(?<=\n)\s*[-*]\s+", "• ", text)
+    # Strip blockquote markers
+    text = re.sub(r"^\s*>\s*", "", text, flags=re.MULTILINE)
+    # Normalize excessive newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 # Domain profiles for fallback and intelligent templating with native syda schemas
 DOMAIN_TEMPLATES = [
@@ -128,6 +170,8 @@ DOMAIN_TEMPLATES = [
             {"name": "policy_active_before_claim", "kind": "temporal_order", "before": "Policy.start_date", "after": "Claim.claim_date"},
             {"name": "diagnosis_before_claim", "kind": "temporal_order", "before": "Diagnosis.diagnosis_date", "after": "Claim.claim_date"},
             {"name": "claim_before_payment", "kind": "temporal_order", "before": "Claim.claim_date", "after": "Payment.payment_date"},
+            {"name": "claim_status_transitions", "kind": "state_machine", "table": "Claim", "field": "status", "transitions": {"submitted": ["pending", "under review", "approved", "denied"], "pending": ["under review", "approved", "denied"], "under review": ["approved", "denied"], "approved": ["paid"], "denied": [], "paid": []}},
+            {"name": "payment_requires_positive_amount", "kind": "semantic_invariant", "table": "Payment", "condition": "paid_amount is not None", "assertion": "paid_amount > 0"},
         ],
         "schemas": {
             "Patient": {
@@ -271,7 +315,7 @@ DOMAIN_TEMPLATES = [
         },
     },
     {
-        "matches": re.compile(r"fraud|bank|finance|transaction|credit|loan|account", re.IGNORECASE),
+        "matches": re.compile(r"fraud|anti-money|aml|suspicious|alert|financial\s+risk", re.IGNORECASE),
         "title": "Financial transactions & fraud",
         "description": "Banking transactions with anti-money laundering and fraudulent pattern signals.",
         "record_count": 50000,
@@ -304,6 +348,79 @@ DOMAIN_TEMPLATES = [
                 "risk_score": {"type": "float", "constraints": {"min": 0.0, "max": 1.0}},
                 "action_taken": "text",
                 "__foreign_keys__": {"transaction_id": "Transaction.transaction_id"},
+            },
+        },
+    },
+    {
+        "matches": re.compile(r"loan|lending|origination|underwrit|mortgage|borrower|credit\s*app", re.IGNORECASE),
+        "title": "Loan origination & underwriting",
+        "description": "Multi-table lending lifecycle spanning borrower applications, credit underwriting, loan disbursements, and repayments.",
+        "record_count": 10000,
+        "secondary_metric": {"label": "Rejection rate", "value": "20%"},
+        "workflow": ["Applicant", "Application", "Underwriting", "Disbursement", "Repayment"],
+        "paths": [
+            {
+                "name": "approved",
+                "steps": ["Applicant", "Application", "Underwriting", "Disbursement", "Repayment"],
+                "weight": 0.80,
+                "overrides": {"Underwriting": {"status": "approved"}},
+            },
+            {
+                "name": "rejected",
+                "steps": ["Applicant", "Application", "Underwriting"],
+                "weight": 0.20,
+                "overrides": {"Underwriting": {"status": "rejected"}},
+            },
+        ],
+        "rules": [
+            "Applications reference registered applicants",
+            "Underwriting decisions occur after application submission",
+            "Rejected loan applications cannot be disbursed",
+            "Disbursement precedes repayment schedule",
+        ],
+        "checks": [
+            {"name": "underwriting_status_values", "kind": "allowed_values", "table": "Underwriting", "field": "status", "values": ["approved", "rejected", "pending"]},
+            {"name": "rejected_loans_have_no_disbursement", "kind": "absence_by_value", "source": "Underwriting.status", "value": "rejected", "absent_table": "Disbursement"},
+            {"name": "app_before_underwriting", "kind": "temporal_order", "before": "Application.application_date", "after": "Underwriting.decision_date"},
+            {"name": "underwriting_before_disbursement", "kind": "temporal_order", "before": "Underwriting.decision_date", "after": "Disbursement.disbursement_date"},
+        ],
+        "schemas": {
+            "Applicant": {
+                "applicant_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "name": "text",
+                "annual_income": {"type": "float", "constraints": {"min": 10000.0}},
+                "credit_score": {"type": "integer", "constraints": {"min": 300, "max": 850}},
+                "created_at": "date",
+            },
+            "Application": {
+                "application_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "applicant_id": "foreign_key",
+                "loan_amount": {"type": "float", "constraints": {"min": 500.0}},
+                "loan_purpose": "text",
+                "application_date": "date",
+                "__foreign_keys__": {"applicant_id": "Applicant.applicant_id"},
+            },
+            "Underwriting": {
+                "underwriting_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "application_id": "foreign_key",
+                "status": "text",
+                "risk_grade": "text",
+                "decision_date": "date",
+                "__foreign_keys__": {"application_id": "Application.application_id"},
+            },
+            "Disbursement": {
+                "disbursement_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "underwriting_id": "foreign_key",
+                "disbursed_amount": {"type": "float", "constraints": {"min": 0.0}},
+                "disbursement_date": "date",
+                "__foreign_keys__": {"underwriting_id": "Underwriting.underwriting_id"},
+            },
+            "Repayment": {
+                "repayment_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "disbursement_id": "foreign_key",
+                "payment_amount": {"type": "float", "constraints": {"min": 0.0}},
+                "payment_date": "date",
+                "__foreign_keys__": {"disbursement_id": "Disbursement.disbursement_id"},
             },
         },
     },
@@ -343,10 +460,141 @@ DEFAULT_TEMPLATE = {
 }
 
 
+def _auto_reconcile_scenario_candidate(candidate_data: dict[str, Any]) -> dict[str, Any]:
+    """Ensures candidate data conforms to valid relational and machine-check constraints,
+    automatically translating non-technical business concepts into valid schemas and checks.
+    """
+    schemas = candidate_data.setdefault("schemas", {})
+    if not isinstance(schemas, dict):
+        schemas = {}
+        candidate_data["schemas"] = schemas
+
+    workflow = candidate_data.get("workflow") or []
+
+    # 1. Auto-scaffold table schemas for any workflow steps not in the template
+    for step in workflow:
+        if step not in schemas or not isinstance(schemas[step], dict) or not schemas[step]:
+            schemas[step] = {
+                f"{step.lower()}_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "name": "text",
+                "status": "text",
+                "created_at": "datetime",
+            }
+
+    # 2. Reconcile check references with schemas
+    raw_checks = candidate_data.get("checks") or []
+    normalized_checks: list[dict[str, Any]] = []
+    for c in raw_checks:
+        c_dict = c if isinstance(c, dict) else c.model_dump(by_alias=True)
+        kind = c_dict.get("kind")
+
+        if kind == "absence_by_value":
+            source = c_dict.get("source") or ""
+            absent_table = c_dict.get("absent_table") or ""
+            # If source has no dot, attach .status
+            if source and "." not in source:
+                source = f"{source}.status"
+                c_dict["source"] = source
+            if source and "." in source:
+                tbl, col = source.split(".", 1)
+                if tbl in schemas and isinstance(schemas[tbl], dict):
+                    if col not in schemas[tbl]:
+                        schemas[tbl][col] = "text"
+            if absent_table and absent_table not in schemas:
+                schemas[absent_table] = {
+                    f"{absent_table.lower()}_id": {"type": "integer", "constraints": {"primary_key": True}},
+                    "name": "text",
+                    "status": "text",
+                    "created_at": "datetime",
+                }
+
+        elif kind == "allowed_values":
+            tbl = c_dict.get("table") or ""
+            col = c_dict.get("field") or ""
+            if tbl in schemas and isinstance(schemas[tbl], dict) and col:
+                if col not in schemas[tbl]:
+                    schemas[tbl][col] = "text"
+
+        elif kind == "temporal_order":
+            for ref_key in ("before", "after"):
+                ref = c_dict.get(ref_key) or ""
+                if ref:
+                    if "." not in ref:
+                        ref = f"{ref}.created_at"
+                        c_dict[ref_key] = ref
+                    tbl, col = ref.split(".", 1)
+                    if tbl in schemas and isinstance(schemas[tbl], dict):
+                        if col not in schemas[tbl]:
+                            schemas[tbl][col] = "datetime"
+            chain = c_dict.get("chain")
+            if chain and isinstance(chain, list):
+                new_chain = []
+                for item in chain:
+                    if "." not in item:
+                        item = f"{item}.created_at"
+                    tbl, col = item.split(".", 1)
+                    if tbl in schemas and isinstance(schemas[tbl], dict):
+                        if col not in schemas[tbl]:
+                            schemas[tbl][col] = "datetime"
+                    new_chain.append(item)
+                c_dict["chain"] = new_chain
+
+        normalized_checks.append(c_dict)
+
+    # 3. Infer absence_by_value from plain English rules if none declared
+    has_absence_check = any(c.get("kind") == "absence_by_value" for c in normalized_checks)
+    if not has_absence_check and workflow:
+        rules = candidate_data.get("rules") or []
+        for rule in rules:
+            rule_lower = rule.lower()
+            neg_match = re.search(r"\b(reject(?:ed)?|deni(?:ed)?|cancel(?:led)?|declin(?:ed)?|fail(?:ed)?)\b", rule_lower)
+            excl_match = re.search(r"\b(cannot\s+be|can\s+not\s+be|no|not\s+be|never|do\s+not|does\s+not|without)\s+(\w+)", rule_lower)
+            if neg_match and excl_match:
+                neg_word = neg_match.group(1)
+                neg_val = (
+                    "rejected" if "reject" in neg_word
+                    else "denied" if "deni" in neg_word
+                    else "cancelled" if "cancel" in neg_word
+                    else "declined" if "declin" in neg_word
+                    else "failed"
+                )
+                action_word = excl_match.group(2)
+                target_table = next(
+                    (s for s in workflow if s.lower() in action_word or action_word in s.lower() or s.lower().startswith(action_word[:4])),
+                    None
+                )
+                decision_table = None
+                if target_table:
+                    idx = workflow.index(target_table)
+                    if idx > 0:
+                        decision_table = workflow[idx - 1]
+                else:
+                    for s in workflow:
+                        if any(term in s.lower() for term in ("underwrit", "claim", "decision", "assessment", "order", "eval", "review")):
+                            decision_table = s
+                            break
+
+                if target_table and decision_table:
+                    if decision_table in schemas and "status" not in schemas[decision_table]:
+                        schemas[decision_table]["status"] = "text"
+                    normalized_checks.append({
+                        "name": f"{target_table.lower()}_absence_on_{neg_val}",
+                        "kind": "absence_by_value",
+                        "source": f"{decision_table}.status",
+                        "value": neg_val,
+                        "absent_table": target_table,
+                    })
+                    break
+
+    candidate_data["checks"] = normalized_checks
+    candidate_data["schemas"] = schemas
+    return candidate_data
+
+
 def _starter_scenario_for_context(context: str) -> ScenarioConfiguration:
     """Return the closest validated starter so the model only has to describe changes."""
     template = next(
-        (item for item in DOMAIN_TEMPLATES if item["matches"].search(context)),
+        (item for item in DOMAIN_TEMPLATES if cast(re.Pattern, item["matches"]).search(context)),
         DEFAULT_TEMPLATE,
     )
     data = {key: value for key, value in template.items() if key != "matches"}
@@ -354,10 +602,10 @@ def _starter_scenario_for_context(context: str) -> ScenarioConfiguration:
 
 
 def _has_concrete_scenario_subject(prompt: str) -> bool:
-    return any(template["matches"].search(prompt) for template in DOMAIN_TEMPLATES) or bool(
+    return any(cast(re.Pattern, template["matches"]).search(prompt) for template in DOMAIN_TEMPLATES) or bool(
         re.search(
             r"\b(patient|member|customer|user|account|policy|claim|visit|encounter|diagnosis|treatment|"
-            r"order|product|payment|refund|transaction|shipment|appointment|loan|employee|device)\b",
+            r"order|product|payment|refund|transaction|shipment|appointment|loan|borrower|applicant|mortgage|underwrit|employee|device)\b",
             prompt,
             re.IGNORECASE,
         )
@@ -554,7 +802,12 @@ async def compile_scenario_agent(
                 """Apply requested changes to a validated domain starter, then validate and stage the new draft."""
                 candidate_data = _starter_scenario_for_context(conversation_context).model_dump(by_alias=True)
                 changes = patch.model_dump(by_alias=True, exclude_unset=True)
+                if "schemas" in changes and isinstance(changes["schemas"], dict):
+                    merged_schemas = dict(candidate_data.get("schemas", {}))
+                    merged_schemas.update(changes["schemas"])
+                    changes["schemas"] = merged_schemas
                 candidate_data.update(changes)
+                candidate_data = _auto_reconcile_scenario_candidate(candidate_data)
                 try:
                     candidate = ScenarioConfiguration.model_validate(candidate_data)
                 except Exception as error:
@@ -579,7 +832,12 @@ async def compile_scenario_agent(
                 if not changes:
                     return {"valid": False, "errors": ["The update patch is empty."]}
                 merged = current_scenario.model_dump(by_alias=True)
+                if "schemas" in changes and isinstance(changes["schemas"], dict):
+                    merged_schemas = dict(merged.get("schemas", {}))
+                    merged_schemas.update(changes["schemas"])
+                    changes["schemas"] = merged_schemas
                 merged.update(changes)
+                merged = _auto_reconcile_scenario_candidate(merged)
                 try:
                     candidate = ScenarioConfiguration.model_validate(merged)
                 except Exception as error:
@@ -596,7 +854,7 @@ async def compile_scenario_agent(
                     "record_count": validated.record_count,
                 }
 
-            @agent.output_validator
+            @cast(Any, agent).output_validator
             def require_created_draft(reply: ScenarioAgentReply) -> ScenarioAgentReply:
                 if should_attach_scenario and current_scenario is None and staged_candidate["scenario"] is None:
                     raise ModelRetry(
@@ -606,9 +864,10 @@ async def compile_scenario_agent(
                     )
                 return reply
 
-            result = await asyncio.wait_for(
-                agent.run(context_str, usage_limits=UsageLimits(request_limit=4, tool_calls_limit=3)),
-                timeout=30.0,
+            # The agent is not capped at 120 seconds; it runs until completion unless an error occurs.
+            result = await agent.run(
+                context_str,
+                usage_limits=UsageLimits(request_limit=30, tool_calls_limit=25),
             )
             request_count, tool_call_count = _run_usage_counts(result)
             logger.info(
@@ -622,8 +881,9 @@ async def compile_scenario_agent(
                     output if isinstance(output, ScenarioAgentReply)
                     else ScenarioAgentReply.model_validate(output)
                 )
+                clean_msg = _clean_agent_message(reply.message)
                 if not should_attach_scenario:
-                    return ChatResponse(message=reply.message, scenario=None)
+                    return ChatResponse(message=clean_msg, scenario=None)
                 validated_output = staged_candidate["scenario"]
                 if validated_output is None:
                     return ChatResponse(
@@ -634,14 +894,78 @@ async def compile_scenario_agent(
                         ),
                         scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
                     )
-                return ChatResponse(message=reply.message, scenario=validated_output)
+                return ChatResponse(message=clean_msg, scenario=validated_output)
         except Exception as e:
             response = getattr(e, "response", None)
             status_code = getattr(e, "status_code", None) or getattr(response, "status_code", None)
             logger.warning(
-                "Pydantic AI agent call failed (error_type=%s, status_code=%s); no scenario changes were applied.",
+                "Pydantic AI agent call failed (error_type=%s, status_code=%s): %s",
                 type(e).__name__,
                 status_code,
+                e,
+            )
+            error_str = str(e).lower()
+            provider_name = provider.get("name") or provider.get("id") or "AI provider"
+            if isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "timeout" in error_str:
+                return ChatResponse(
+                    message=(
+                        f"The AI model ({provider_name}) took longer than expected to complete its scenario design and timed out. "
+                        "Please try sending your message again."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code == 429 or "spending cap" in error_str or "quota" in error_str or "resource_exhausted" in error_str:
+                spend_msg = ""
+                if "spending cap" in error_str:
+                    spend_msg = " Google AI Studio reports that your project has exceeded its monthly spending cap (visit https://ai.studio/spend to adjust)."
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API returned a quota limit error (429 RESOURCE_EXHAUSTED). "
+                        f"Your API key or project has exceeded its quota or monthly spending cap.{spend_msg} "
+                        "Please update your spending limit in the provider console or choose a different provider/key in Settings."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code in (401, 403):
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API returned an authentication error ({status_code}). "
+                        "Please verify or re-enter your API key in Settings."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code == 404:
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API returned a 404 Not Found error for model '{provider.get('model')}'. "
+                        "This model may be restricted or deprecated for new projects (use gemini-3.5-flash). "
+                        "Please update your model selection in Settings."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if status_code == 503:
+                return ChatResponse(
+                    message=(
+                        f"The {provider_name} API is currently experiencing a temporary high demand spike (503 UNAVAILABLE) on model '{provider.get('model')}'. "
+                        "Please retry in a moment."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            if "usagelimit" in type(e).__name__.lower() or "usage limit" in error_str:
+                return ChatResponse(
+                    message=(
+                        f"I couldn’t create a scenario because the scenario agent exceeded its tool execution budget ({e}). "
+                        "Please try simplifying your prompt or asking for fewer table modifications in a single message."
+                    ),
+                    scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                )
+            clean_err = re.sub(r"https?://\S+", "", str(e)).strip()
+            return ChatResponse(
+                message=(
+                    f"I couldn’t create a scenario because the scenario agent encountered an error ({type(e).__name__}): {clean_err}. "
+                    "Please check your input or model settings and try again."
+                ),
+                scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
             )
 
     return _heuristic_compile_scenario(prompt, current_scenario, conversation_context)

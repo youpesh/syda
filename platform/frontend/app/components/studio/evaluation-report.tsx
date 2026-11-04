@@ -80,6 +80,37 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
             ))}
           </TableBody>
         </Table>
+        {stats.violations && stats.violations.length > 0 && (
+          <div className="flex flex-col gap-2 pt-2 border-t">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-semibold text-destructive">
+                Causal & Semantic Violations ({stats.violations.length})
+              </span>
+            </div>
+            <div className="rounded-md border overflow-x-auto max-h-60 overflow-y-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Table</TableHead>
+                    <TableHead>Row / Instance</TableHead>
+                    <TableHead>Rule</TableHead>
+                    <TableHead>Error</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {stats.violations.map((v, i) => (
+                    <TableRow key={i}>
+                      <TableCell className="font-mono text-xs">{v.table}</TableCell>
+                      <TableCell className="font-mono text-xs">{String(v.row)}</TableCell>
+                      <TableCell className="font-medium text-xs">{v.rule}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground whitespace-normal">{v.error}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        )}
       </CardContent>
       <CardFooter className="flex-wrap justify-end gap-2">
         <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=json`, "_blank")} type="button" variant="outline">
