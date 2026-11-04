@@ -112,3 +112,44 @@ To stop the containers:
 ```bash
 docker compose down
 ```
+
+## Queued dataset generation
+
+Dataset generation runs in a background worker process backed directly by PostgreSQL.
+FastAPI creates a `JobRecord` in `queued` state in the database. The worker claims jobs
+atomically using `FOR UPDATE SKIP LOCKED`, eliminating the need for Redis, Celery, or an
+external dispatcher service. PostgreSQL is the authoritative and exclusive job and queue store.
+
+`docker compose up --build` starts the API, frontend, PostgreSQL, and background worker.
+The worker uses the same backend image and job/settings volumes as the API.
+
+For development, after `uv sync --project platform/backend`, start the worker in a separate terminal:
+
+```bash
+uv run python -m app.worker
+```
+
+All processes must share `DATABASE_URL`, `JOB_DATA_DIR`, and `PROVIDER_ENCRYPTION_KEY`
+(or the existing `data/settings` directory).
+
+The provider, model, and compatible endpoint are captured at submission. API keys are
+loaded by the worker from the owner's encrypted settings at execution time. Key rotation
+before execution takes effect; deleting a required credential fails the job rather than
+switching providers. Provider failures surface as retrying or failed jobs.
+
+Generation attempts have an atomic claim, a heartbeat, and an isolated per-attempt output
+directory. Only the owning attempt can update status or publish downloads.
+A worker whose heartbeat expires is automatically recovered and retried from the beginning,
+up to `GENERATION_MAX_ATTEMPTS` (default 3). Exponential backoff is applied on retryable errors.
+
+Validation:
+
+```bash
+uv run --project platform/backend pytest platform/backend/tests tests/test_scenarios.py
+```
+
+CI runs the full backend and scenario test suite including atomic worker claiming,
+exponential backoff, crash recovery, and attempt fencing. Before production rollout also stop a
+worker during generation, restart the API independently, and verify recovery and
+downloads from the API container. Cleanup of old attempt directories, cancellation,
+priorities, and resuming partial generation are outside this change.
