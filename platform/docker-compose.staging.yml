@@ -19,6 +19,7 @@ services:
 
   backend:
     image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:staging}
+    pull_policy: always
     container_name: syda-staging-backend
     restart: unless-stopped
     environment:
@@ -32,9 +33,32 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:staging}
+    pull_policy: always
+    container_name: syda-staging-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-syda_staging}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-syda_staging}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set a staging auth secret key}
+    volumes:
+      - staging_job_data:/app/platform/backend/data/jobs
+      - staging_settings_data:/app/platform/backend/data/settings
+    stop_grace_period: 65s
+    depends_on:
+      backend:
+        condition: service_healthy
 
   frontend:
     image: ${FRONTEND_IMAGE:-ghcr.io/youpesh/syda-frontend:staging}
+    pull_policy: always
     container_name: syda-staging-frontend
     restart: unless-stopped
     environment:
