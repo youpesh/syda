@@ -1,9 +1,10 @@
 import re
 import asyncio
 import logging
+import json
 from typing import Optional, List, Dict, Any, cast
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, Json, field_validator
 
 from syda.schemas import validate_schema
 from ..models.scenario import ScenarioConfiguration, ScenarioPathConfiguration, ScenarioCheck, SecondaryMetric, ChatResponse
@@ -24,7 +25,8 @@ Conversation behavior:
 - Treat the conversation history and the existing scenario as context. For a follow-up, preserve existing requirements unless the user asks to change them, and explain what changed.
 - Treat the existing scenario supplied in context as canonical; do not fetch it again.
 - The domain starter is a template, not a created or saved scenario. Even when it already matches the request, call create_scenario_draft (an empty patch is allowed) before claiming the new scenario is configured.
-- For a new scenario, call create_scenario_draft with only the fields that need to differ from its domain starter. The tool starts from the closest validated domain template and keeps its table schemas; do not try to emit or rewrite schemas during initial creation. For an existing scenario, call update_scenario_draft with only the fields that should change; the tool merges the patch into the saved draft and validates the complete result.
+- For a new scenario, call create_scenario_draft with only the fields that need to differ from its domain starter. Omit schemas to preserve the starter. If the user requests a different set of tables, supply a COMPLETE replacement schemas map, workflow, paths, and checks with consistent foreign keys. Removed starter tables must not remain as required parents. For an existing scenario, call update_scenario_draft with only the fields that should change; that tool merges table updates into the saved draft.
+- The schemas tool argument is a JSON-encoded STRING. Its decoded value is a table-to-field map, for example {"Patient": {"patient_id": {"type": "integer", "constraints": {"primary_key": true}}, "name": "text"}, "Claim": {"claim_id": {"type": "integer", "constraints": {"primary_key": true}}, "patient_id": "foreign_key", "amount": {"type": "float", "constraints": {"min": 0}}, "__foreign_keys__": {"patient_id": "Patient.patient_id"}}}. Constraints belong INSIDE their field definition. Never use dotted keys such as "patient_id.constraints.primary_key" and never add a "fields" wrapper around a table.
 - If a draft tool returns validation errors, correct the listed fields and call the tool again. Do not treat draft validation errors as a provider failure.
 - Never infer a specific value from vague language such as “smaller” or “faster.” Ask a concise question when the requested change is ambiguous. Only confirm a change after the draft tool succeeds, and use its returned title, table count, and instance count.
 - Chat can design and validate a dataset scenario; it must not start dataset generation. Generation requires the user's explicit action in the interface.
@@ -60,7 +62,22 @@ Response formatting requirements:
 - Make the summary concise, elegant, and effortless for the viewer to read at a glance."""
 
 
-class ScenarioDraftPatch(BaseModel):
+class _SchemaPatch(BaseModel):
+    # Present an unambiguous string input to provider function schemas while
+    # retaining the native Syda dictionary after Pydantic validates the JSON.
+    schemas: Optional[Json[Dict[str, Dict[str, Any]]]] = Field(
+        default=None,
+        description="JSON-encoded table-to-field map. Field definitions and constraints must be nested JSON objects, not dotted keys or flattened strings.",
+    )
+
+    @field_validator("schemas", mode="before")
+    @classmethod
+    def accept_native_schema_map(cls, value: Any) -> Any:
+        # Preserve compatibility for Python callers and existing saved patches.
+        return json.dumps(value) if isinstance(value, dict) else value
+
+
+class ScenarioDraftPatch(_SchemaPatch):
     """A partial scenario update. Unspecified fields stay as they are."""
 
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
@@ -73,11 +90,10 @@ class ScenarioDraftPatch(BaseModel):
     paths: Optional[List[ScenarioPathConfiguration]] = None
     rules: Optional[List[str]] = None
     checks: Optional[List[ScenarioCheck]] = None
-    schemas: Optional[Dict[str, Dict[str, Any]]] = None
 
 
-class ScenarioCreationPatch(BaseModel):
-    """Small initial-draft patch; validated starter schemas stay canonical."""
+class ScenarioCreationPatch(_SchemaPatch):
+    """Initial-draft patch; supplied schemas replace the starter's table set."""
 
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
@@ -89,7 +105,15 @@ class ScenarioCreationPatch(BaseModel):
     paths: Optional[List[ScenarioPathConfiguration]] = None
     rules: Optional[List[str]] = None
     checks: Optional[List[ScenarioCheck]] = None
-    schemas: Optional[Dict[str, Dict[str, Any]]] = None
+    schemas: Optional[Json[Dict[str, Dict[str, Any]]]] = Field(
+        default=None,
+        description=(
+            "JSON-encoded STRING containing complete replacement table schemas, not a merge. Omit to preserve the starter. "
+            "Each table maps field names directly to type strings or nested objects, e.g. "
+            '{"Patient": {"patient_id": {"type": "integer", "constraints": {"primary_key": true}}, "name": "text"}}. '
+            "Do not use dotted field keys or a fields wrapper. Include matching workflow, paths, and checks."
+        ),
+    )
 
 
 class ScenarioAgentReply(BaseModel):
@@ -802,10 +826,6 @@ async def compile_scenario_agent(
                 """Apply requested changes to a validated domain starter, then validate and stage the new draft."""
                 candidate_data = _starter_scenario_for_context(conversation_context).model_dump(by_alias=True)
                 changes = patch.model_dump(by_alias=True, exclude_unset=True)
-                if "schemas" in changes and isinstance(changes["schemas"], dict):
-                    merged_schemas = dict(candidate_data.get("schemas", {}))
-                    merged_schemas.update(changes["schemas"])
-                    changes["schemas"] = merged_schemas
                 candidate_data.update(changes)
                 candidate_data = _auto_reconcile_scenario_candidate(candidate_data)
                 try:

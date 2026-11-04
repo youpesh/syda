@@ -153,3 +153,33 @@ exponential backoff, crash recovery, and attempt fencing. Before production roll
 worker during generation, restart the API independently, and verify recovery and
 downloads from the API container. Cleanup of old attempt directories, cancellation,
 priorities, and resuming partial generation are outside this change.
+
+## Long-running scenario chats
+
+`POST /api/agent/chat` sends an SSE comment immediately and every 15 seconds while
+the model prepares a draft. These keep-alive comments pass through the frontend
+proxy without becoming assistant messages. This avoids an idle connection while
+waiting for model/tool calls; see [Cloudflare's 524 guidance](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)
+and the [SSE comment format](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format).
+
+Navigation or a disconnected stream does not cancel compilation. Its result is
+saved to the conversation and can be recovered by reopening the chat. This work
+runs in the API process, so it does not survive an API process restart. Dataset
+generation uses the separate durable queue described above.
+
+Proxy failures display a short recovery message instead of the intermediary's
+HTML error page. Starting a new chat clears the previous chat's pending UI state.
+When creating a custom scenario, a supplied `schemas` map replaces the starter's
+tables; omitting it preserves the starter. Updating an existing scenario continues
+to merge the supplied table definitions into that scenario.
+The agent tools advertise schema maps as JSON-encoded strings so nested constraints
+have a clear provider input type. They are validated back into native dictionaries;
+saved scenario/API configuration remains an ordinary JSON object.
+
+Chat regression checks:
+
+```bash
+uv run --project platform/backend pytest platform/backend/tests/test_chat_stream.py platform/backend/tests/test_scenario_agent_mocked.py
+cd platform/frontend
+npm run test:chat
+```
