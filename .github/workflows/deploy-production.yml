@@ -3,6 +3,7 @@ name: Deploy Production
 on:
   push:
     branches:
+      - feat/web-platform
       - main
   workflow_dispatch:
 
