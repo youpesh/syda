@@ -145,20 +145,23 @@ class TestSchemaLoader:
         with pytest.raises(ValueError, match="Schema file not found"):
             loader.load_schema("nonexistent_file.json")
             
-    @pytest.mark.skip(reason="SQLAlchemy test requires complex mocking")
     def test_load_schema_sqlalchemy_model(self):
         """Test loading schema from SQLAlchemy model."""
-        # This test is skipped because it requires complex mocking of SQLAlchemy components
-        # and is causing failures. The actual code is tested through other means.
-                
-    @pytest.mark.skip(reason="Method _process_schema_for_llm doesn't exist in SchemaLoader")
-    def test_process_schema_for_llm(self):
-        """Test processing schema for LLM."""
-        # This test is skipped because the _process_schema_for_llm method doesn't exist
-        # in the SchemaLoader class implementation.
-        
-    @pytest.mark.skip(reason="Method _extract_foreign_keys doesn't exist in SchemaLoader")
-    def test_extract_foreign_keys(self):
-        """Test extraction of foreign keys from schema."""
-        # This test is skipped because the _extract_foreign_keys method doesn't exist
-        # in the SchemaLoader class implementation.
+        from sqlalchemy import Column, Integer, String
+        from sqlalchemy.orm import declarative_base
+
+        Base = declarative_base()
+
+        class User(Base):
+            __tablename__ = "users"
+            id = Column(Integer, primary_key=True)
+            name = Column(String(50))
+
+        loader = SchemaLoader()
+        raw_dict = loader._load_sqlalchemy_model(User)
+        assert raw_dict["__table_name__"] == "users"
+
+        schema, metadata, desc, fks, template, depends_on = loader.load_schema(User)
+        assert "id" in schema
+        assert "name" in schema
+        assert metadata["id"]["constraints"]["primary_key"] is True

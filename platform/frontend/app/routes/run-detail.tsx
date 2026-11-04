@@ -18,7 +18,7 @@ import type { GenerationJob } from "~/lib/studio-types";
 export function meta({}: Route.MetaArgs) { return [{ title: "Generation run — Syda" }]; }
 
 function statusVariant(status: string): "secondary" | "destructive" | "outline" {
-  return status === "complete" ? "secondary" : status === "failed" ? "destructive" : "outline";
+  return status === "complete" ? "secondary" : (status === "failed" || status === "cancelled") ? "destructive" : "outline";
 }
 
 export default function RunDetail() {
@@ -29,6 +29,7 @@ export default function RunDetail() {
   const [error, setError] = useState<string>();
   const [actionError, setActionError] = useState<string>();
   const [savingScenario, setSavingScenario] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -49,9 +50,25 @@ export default function RunDetail() {
 
   const complete = job?.status === "complete";
   const filesAvailable = complete && job.filesAvailable;
-  const active = job && !["complete", "failed"].includes(job.status);
+  const active = job && !["complete", "failed", "cancelled"].includes(job.status);
   const requestedTab = searchParams.get("tab");
   const activeTab = requestedTab === "data" || requestedTab === "evaluation" ? requestedTab : "overview";
+
+  const cancelJob = async () => {
+    if (!job?.jobId) return;
+    setCancelling(true);
+    setActionError(undefined);
+    try {
+      const response = await fetch(`/api/jobs/${job.jobId}/cancel`, { method: "POST" });
+      if (!response.ok) {
+        const body = await response.json().catch(() => undefined) as { detail?: string } | undefined;
+        throw new Error(body?.detail || `Could not cancel generation (${response.status}).`);
+      }
+      await refresh();
+    } catch (cancelErr) {
+      setActionError(cancelErr instanceof Error ? cancelErr.message : "Could not cancel generation.");
+    } finally { setCancelling(false); }
+  };
 
   const saveScenario = async () => {
     if (!job?.scenario) return;
@@ -67,15 +84,16 @@ export default function RunDetail() {
     } finally { setSavingScenario(false); }
   };
 
-  return <AppShell title={job?.scenario?.title ?? "Generation run"} subtitle={job ? `Run ${job.jobId}` : "Loading run"} headerActions={job && <div className="flex items-center gap-2">{job.scenarioId ? <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${job.scenarioId}`}>Edit scenario</Link> : <Button disabled={savingScenario} onClick={() => void saveScenario()} size="sm" variant="outline">{savingScenario ? "Saving…" : "Save as scenario"}</Button>}{filesAvailable && <a className={buttonVariants({ size: "sm" })} href={job.downloadUrl ?? `/api/download/${job.jobId}`}>Download dataset</a>}</div>}>
+  return <AppShell title={job?.scenario?.title ?? "Generation run"} subtitle={job ? `Run ${job.jobId}` : "Loading run"} headerActions={job && <div className="flex items-center gap-2">{active && <Button disabled={cancelling} onClick={() => void cancelJob()} size="sm" variant="destructive">{cancelling ? "Cancelling…" : "Cancel run"}</Button>}{job.scenarioId ? <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${job.scenarioId}`}>Edit scenario</Link> : <Button disabled={savingScenario} onClick={() => void saveScenario()} size="sm" variant="outline">{savingScenario ? "Saving…" : "Save as scenario"}</Button>}{filesAvailable && <a className={buttonVariants({ size: "sm" })} href={job.downloadUrl ?? `/api/download/${job.jobId}`}>Download dataset</a>}</div>}>
     <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8"><div className="mx-auto max-w-6xl space-y-5">
       <Link className="text-xs text-muted-foreground hover:underline" to="/history">← Generation history</Link>
       {error && <Alert variant="destructive"><AlertTitle>Run unavailable</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
-      {actionError && <Alert variant="destructive"><AlertTitle>Could not save scenario</AlertTitle><AlertDescription>{actionError}</AlertDescription></Alert>}
+      {actionError && <Alert variant="destructive"><AlertTitle>Action failed</AlertTitle><AlertDescription>{actionError}</AlertDescription></Alert>}
       {!job ? <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">{error ? "" : <><Spinner /> Loading run…</>}</div> : <>
         <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-semibold tracking-tight">{job.scenario?.title ?? `Run ${job.jobId}`}</h1><p className="mt-1 text-sm text-muted-foreground">{job.scenario?.description}</p><p className="mt-1 text-xs text-muted-foreground">Run {job.jobId} · {job.createdAt ? new Date(job.createdAt).toLocaleString() : "Date unavailable"}</p></div><Badge variant={statusVariant(job.status)}>{job.status}</Badge></div>
         {active && <Card><CardContent><Progress value={job.progress}><ProgressLabel>{job.currentStage}</ProgressLabel><ProgressValue>{(value) => value}</ProgressValue></Progress></CardContent></Card>}
         {job.status === "failed" && <Alert variant="destructive"><AlertTitle>Generation failed</AlertTitle><AlertDescription>{job.currentStage}</AlertDescription></Alert>}
+        {job.status === "cancelled" && <Alert variant="destructive"><AlertTitle>Generation cancelled</AlertTitle><AlertDescription>{job.currentStage || "This run was cancelled."}</AlertDescription></Alert>}
         {complete && !filesAvailable && <Alert><AlertTitle>Dataset files unavailable</AlertTitle><AlertDescription>The run record and evaluation remain available, but its generated files were not retained by the earlier container setup.</AlertDescription></Alert>}
         <Tabs value={activeTab} onValueChange={(value) => setSearchParams(value === "overview" ? {} : { tab: String(value) }, { preventScrollReset: true })}>
           <TabsList variant="line"><TabsTrigger value="overview">Overview</TabsTrigger><TabsTrigger disabled={!filesAvailable} value="data">Generated data</TabsTrigger><TabsTrigger disabled={!job.stats} value="evaluation">Evaluation</TabsTrigger></TabsList>

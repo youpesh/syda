@@ -37,11 +37,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
 try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError as exc:
-    raise ImportError(
-        'The MCP extra is not installed. Run: pip install "syda[mcp]"'
-    ) from exc
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:
+    try:
+        from mcp.server.fastmcp import FastMCP
+    except ImportError as exc:
+        raise ImportError(
+            'The MCP extra is not installed. Run: pip install "syda[mcp]"'
+        ) from exc
 
 from dotenv import find_dotenv, load_dotenv
 

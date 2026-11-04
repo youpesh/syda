@@ -20,7 +20,7 @@ from .auth import require_authenticated
 from ..database import get_db
 from ..models.entities import JobRecord, ScenarioRecord
 from ..provider_settings import resolve_provider
-from ..job_queue import DATA_DIR, publish_job, output_directory
+from ..job_queue import DATA_DIR, publish_job, output_directory, cancel_job
 from ..services.generation import (
     _synthesize_relational_tables, _LocalTableGenerator, _scenario_schemas,
     _referential_integrity, _constraint_compliance, _temporal_consistency,
@@ -198,6 +198,24 @@ async def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depen
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return _job_payload(job)
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_generation_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
+):
+    """Cancel an active or queued generation run."""
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status in ("complete", "failed", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel job with status '{job.status}'")
+    cancelled = cancel_job(job_id, user_id=user.id)
+    if not cancelled:
+        raise HTTPException(status_code=400, detail="Could not cancel job")
+    return {"jobId": job_id, "status": "cancelled", "message": "Generation cancelled successfully"}
 
 
 @router.get("/preview/{job_id}")
