@@ -1,4 +1,4 @@
-import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
+import type { SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { RunQualitySummary } from "~/components/studio/run-quality-summary";
 import { createChatFetch } from "~/lib/chat-fetch";
@@ -133,20 +133,18 @@ function PromptComposer({
   value,
   onChange,
   onSubmit,
+  onStop,
   compact = false,
   disabled = false,
   isLoading = false,
-  source, onSource, connections,
 }: {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onStop: () => void;
   compact?: boolean;
   disabled?: boolean;
   isLoading?: boolean;
-  connections: ReturnType<typeof useLiveProfiles>;
-  source: SchemaSource | null;
-  onSource: (source: SchemaSource | null) => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -181,10 +179,9 @@ function PromptComposer({
           <label className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center rounded-full border px-3 text-sm font-medium focus-within:ring-2 focus-within:ring-ring">
             Attach<input className="sr-only" aria-label="Attach schema or sample" disabled={disabled || isLoading} type="file" accept=".csv,.json,.txt" onChange={async e => { const file = e.target.files?.[0]; e.target.value = ""; if (!file) return; setAttachmentError(""); if (file.size > 100000 || !/\.(csv|json|txt)$/i.test(file.name)) { setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB."); return; } try { onChange(value + `\n\nAttached context (${file.name}):\n${await file.text()}`); } catch { setAttachmentError("Could not read this file. Please retry."); } }} />
           </label>
-          <LiveConnections connections={connections} source={source} onSource={onSource} disabled={disabled || isLoading} />
-          <Button aria-label="Send prompt" className="ml-auto shrink-0" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">
+          <Button aria-label={isLoading ? "Stop response" : "Send prompt"} title={isLoading ? "Stop response" : "Send prompt"} className="ml-auto shrink-0" disabled={!isLoading && (!value.trim() || disabled)} size="icon" type={isLoading ? "button" : "submit"} onClick={isLoading ? onStop : undefined}>
           {isLoading ? (
-            <Spinner />
+            <span aria-hidden="true" className="size-3 rounded-[2px] bg-current" />
           ) : (
             <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />
           )}
@@ -454,7 +451,6 @@ export default function Home() {
   conversationIdRef.current = conversationId;
   const [prompt, setPrompt] = useState("");
   const [source, setSource] = useState<SchemaSource | null>(null);
-  const connections = useLiveProfiles();
   const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);
   const [conversationTitle, setConversationTitle] = useState("");
   const [loadedConversationId, setLoadedConversationId] = useState<string>();
@@ -835,7 +831,7 @@ export default function Home() {
               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">
                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.
               </p>
-              <PromptComposer connections={connections} source={source} onSource={setSource} disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
+              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} value={prompt} />
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {promptSuggestions.map((suggestion) => (
                   <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">
@@ -931,12 +927,7 @@ export default function Home() {
             <div className="shrink-0 border-t bg-background px-5 py-4">
               <div className="mx-auto w-full max-w-3xl">
                 <div className="flex items-end gap-2">
-                  <PromptComposer connections={connections} source={source} onSource={setSource} compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
-                  {isThinking && (
-                    <Button onClick={() => { stop(); setIsAwaitingResponse(false); }} type="button" variant="outline">
-                      Stop
-                    </Button>
-                  )}
+                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} value={prompt} />
                 </div>
                 {error && <p className="mt-2 text-xs text-destructive">{error.message}</p>}
               </div>
