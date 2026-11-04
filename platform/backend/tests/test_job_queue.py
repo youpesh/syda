@@ -78,6 +78,7 @@ def test_dispatch_sends_only_job_id_and_recovers_unpublished_rows(queue_db, monk
     job_queue.reconcile_jobs()
     assert published[0]['args'] == [job_id]
     assert published[0]['retry'] is False
+    assert published[0]['expires'] == job_queue.DELIVERY_WINDOW_SECONDS
     assert job_queue.publish_job(job_id) is False
     assert len(published) == 1
 
@@ -191,3 +192,80 @@ def test_concurrent_deliveries_only_claim_one_attempt(queue_db):
     with ThreadPoolExecutor(max_workers=2) as pool:
         claims=list(pool.map(job_queue.claim_job,[job_id,job_id]))
     assert sum(value is not None for value in claims)==1
+
+
+def test_confirmed_publish_sets_delivery_window_and_prevents_duplicate_reconcile(queue_db, monkeypatch):
+    job_id = add_job(queue_db)
+    published = []
+    monkeypatch.setitem(sys.modules, 'app.tasks.generation', SimpleNamespace(generate_dataset=SimpleNamespace(apply_async=lambda **kw: published.append(kw))))
+    assert job_queue.publish_job(job_id) is True
+    assert len(published) == 1
+    assert published[0]['expires'] == job_queue.DELIVERY_WINDOW_SECONDS
+
+    with queue_db() as db:
+        job = db.get(JobRecord, job_id)
+        assert job.status == 'queued'
+        time_diff = (job.next_dispatch_at.replace(tzinfo=job_queue.timezone.utc) if job.next_dispatch_at.tzinfo is None else job.next_dispatch_at) - job_queue.now()
+        assert time_diff.total_seconds() > 3000
+
+    # Running reconcile_jobs() should NOT republish while within delivery window
+    job_queue.reconcile_jobs()
+    assert len(published) == 1
+
+
+def test_failed_publish_sets_short_retry_window(queue_db, monkeypatch):
+    job_id = add_job(queue_db)
+    def fail_dispatch(**kw):
+        raise ConnectionError("broker unreachable")
+    monkeypatch.setitem(sys.modules, 'app.tasks.generation', SimpleNamespace(generate_dataset=SimpleNamespace(apply_async=fail_dispatch)))
+    assert job_queue.publish_job(job_id) is False
+
+    with queue_db() as db:
+        job = db.get(JobRecord, job_id)
+        assert job.status == 'queued'
+        time_diff = (job.next_dispatch_at.replace(tzinfo=job_queue.timezone.utc) if job.next_dispatch_at.tzinfo is None else job.next_dispatch_at) - job_queue.now()
+        # Should be scheduled for prompt retry (<= DISPATCH_RETRY_SECONDS + 5)
+        assert time_diff.total_seconds() <= job_queue.DISPATCH_RETRY_SECONDS + 5
+
+
+def test_delivery_window_expiry_allows_replacement_dispatch_if_unclaimed(queue_db, monkeypatch):
+    job_id = add_job(queue_db)
+    published = []
+    monkeypatch.setitem(sys.modules, 'app.tasks.generation', SimpleNamespace(generate_dataset=SimpleNamespace(apply_async=lambda **kw: published.append(kw))))
+    assert job_queue.publish_job(job_id) is True
+    assert len(published) == 1
+
+    # Simulate delivery window expiring without a worker claiming the job
+    with queue_db() as db:
+        job = db.get(JobRecord, job_id)
+        job.next_dispatch_at = job_queue.now() - timedelta(seconds=1)
+        db.commit()
+
+    # Reconciler should recover and publish a replacement
+    job_queue.reconcile_jobs()
+    assert len(published) == 2
+    assert published[1]['args'] == [job_id]
+    assert published[1]['expires'] == job_queue.DELIVERY_WINDOW_SECONDS
+
+
+def test_claimed_job_ignores_late_publish_delivery_window(queue_db, monkeypatch):
+    job_id = add_job(queue_db)
+    def claim_during_dispatch(**kw):
+        job_queue.claim_job(job_id)
+    monkeypatch.setitem(sys.modules, 'app.tasks.generation', SimpleNamespace(generate_dataset=SimpleNamespace(apply_async=claim_during_dispatch)))
+    assert job_queue.publish_job(job_id) is True
+    with queue_db() as db:
+        job = db.get(JobRecord, job_id)
+        assert job.status == 'generating'
+        assert job.attempt_token is not None
+
+
+def test_concurrent_publish_only_triggers_one_broker_delivery(queue_db, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    job_id = add_job(queue_db)
+    published = []
+    monkeypatch.setitem(sys.modules, 'app.tasks.generation', SimpleNamespace(generate_dataset=SimpleNamespace(apply_async=lambda **kw: published.append(kw))))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = list(pool.map(job_queue.publish_job, [job_id, job_id, job_id]))
+    assert sum(results) == 1
+    assert len(published) == 1

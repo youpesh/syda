@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 ACTIVE = ("generating", "validating", "evaluating")
 MAX_ATTEMPTS = max(1, int(os.getenv("GENERATION_MAX_ATTEMPTS", "3")))
 LEASE_SECONDS = max(30, int(os.getenv("GENERATION_LEASE_SECONDS", "120")))
+DELIVERY_WINDOW_SECONDS = max(60, int(os.getenv("GENERATION_DELIVERY_WINDOW_SECONDS", "3600")))
+DISPATCH_RETRY_SECONDS = max(5, int(os.getenv("GENERATION_DISPATCH_RETRY_SECONDS", "30")))
 DATA_DIR = Path(os.getenv("JOB_DATA_DIR", "data/jobs"))
 
 
@@ -38,13 +40,22 @@ def publish_job(job_id, *, db=None):
         reserved = db.query(JobRecord).filter(
             JobRecord.id == job_id, JobRecord.status == "queued",
             or_(JobRecord.next_dispatch_at.is_(None), JobRecord.next_dispatch_at <= timestamp),
-        ).update({JobRecord.next_dispatch_at: timestamp + timedelta(seconds=30)}, synchronize_session=False)
+        ).update({JobRecord.next_dispatch_at: timestamp + timedelta(seconds=DISPATCH_RETRY_SECONDS)}, synchronize_session=False)
         db.commit()
         if not reserved:
             return False
         try:
             from .tasks.generation import generate_dataset
-            generate_dataset.apply_async(args=[job_id], task_id=str(uuid.uuid4()), retry=False)
+            generate_dataset.apply_async(
+                args=[job_id],
+                task_id=str(uuid.uuid4()),
+                retry=False,
+                expires=DELIVERY_WINDOW_SECONDS,
+            )
+            db.query(JobRecord).filter(
+                JobRecord.id == job_id, JobRecord.status == "queued",
+            ).update({JobRecord.next_dispatch_at: now() + timedelta(seconds=DELIVERY_WINDOW_SECONDS)}, synchronize_session=False)
+            db.commit()
             return True
         except Exception as error:
             # Never log broker URLs or provider credentials from exception strings.
