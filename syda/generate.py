@@ -663,6 +663,21 @@ class SyntheticDataGenerator:
         df = self.generator_manager.apply_custom_generators(
             df, schema_name, schema_custom_generators, parent_dfs=results)
 
+        # Resolve self-referencing foreign keys (e.g. Employee.manager_id -> Employee.id)
+        for fk_col, (p_schema, p_col) in extracted_foreign_keys.get(schema_name, {}).items():
+            if p_schema == schema_name and p_col in df.columns and fk_col in df.columns:
+                pks = df[p_col].dropna().tolist()
+                if pks:
+                    col_constraints = metadata.get(fk_col, {}).get("constraints", {})
+                    is_not_null = bool(col_constraints.get("not_null") or col_constraints.get("primary_key"))
+                    self_fk_vals = []
+                    for idx in range(len(df)):
+                        if idx == 0 or (idx < max(1, len(df) // 10) and random.random() < 0.4):
+                            self_fk_vals.append(pks[0] if is_not_null else None)
+                        else:
+                            self_fk_vals.append(random.choice(pks[:idx]))
+                    df[fk_col] = self_fk_vals
+
         if output_dir and not is_streamed and not is_template:
             file_path = os.path.join(output_dir, f"{schema_name.lower()}.{ext}")
             os.makedirs(output_dir, exist_ok=True)

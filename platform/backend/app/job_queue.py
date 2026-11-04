@@ -97,6 +97,25 @@ def claim_next_job():
         return None
 
 
+def cancel_job(job_id, user_id=None):
+    """Cancel a queued or active generation job."""
+    with database.SessionLocal() as db:
+        query = db.query(JobRecord).filter(
+            JobRecord.id == job_id,
+            JobRecord.status.in_(("queued", *ACTIVE)),
+        )
+        if user_id is not None:
+            query = query.filter(JobRecord.user_id == user_id)
+        changed = query.update({
+            JobRecord.status: "cancelled",
+            JobRecord.current_stage: "Generation cancelled by user",
+            JobRecord.updated_at: now(),
+            JobRecord.attempt_token: None,
+        }, synchronize_session=False)
+        db.commit()
+        return bool(changed)
+
+
 def notify_job_queued(db=None):
     """Signal workers via PostgreSQL LISTEN/NOTIFY for zero-latency wakeup."""
     own_session = db is None

@@ -54,9 +54,11 @@ class ForeignKeyHandler:
         if schema_name not in extracted_foreign_keys:
             return
             
-        # Group foreign keys by parent table
+        # Group foreign keys by parent table (excluding self-referential keys, which resolve post-generation)
         fk_by_parent = {}
         for fk_column, (parent_schema, parent_column) in extracted_foreign_keys[schema_name].items():
+            if parent_schema == schema_name:
+                continue
             if parent_schema not in fk_by_parent:
                 fk_by_parent[parent_schema] = []
             fk_by_parent[parent_schema].append((fk_column, parent_column))
@@ -274,10 +276,10 @@ class DependencyHandler:
                     if explicit_deps not in all_dependencies[schema_name]:
                         all_dependencies[schema_name].append(explicit_deps)
         
-        # Add foreign key dependencies
+        # Add foreign key dependencies (excluding self-referential keys to allow tree/hierarchical schemas)
         for schema_name, fk_columns in foreign_keys.items():
             for fk_column, (parent_schema, parent_column) in fk_columns.items():
-                if parent_schema not in all_dependencies[schema_name]:
+                if parent_schema != schema_name and parent_schema not in all_dependencies[schema_name]:
                     all_dependencies[schema_name].append(parent_schema)
         
         return all_dependencies

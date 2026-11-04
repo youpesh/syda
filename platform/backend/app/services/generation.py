@@ -61,7 +61,12 @@ def _synthesize_relational_tables(
                         if candidate in dfs:
                             parent_table = candidate
 
-                    if parent_table and parent_table in dfs and not dfs[parent_table].empty:
+                    if parent_table == table_name:
+                        if i == 1 or (i <= max(2, n_rows // 10) and random.random() < 0.4):
+                            row[col_name] = None
+                        else:
+                            row[col_name] = random.randint(1, i - 1)
+                    elif parent_table and parent_table in dfs and not dfs[parent_table].empty:
                         parent_df = dfs[parent_table]
                         parent_pk_col = [c for c in parent_df.columns if c.endswith("_id") or "id" in c]
                         if parent_pk_col:

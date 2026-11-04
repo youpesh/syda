@@ -1,5 +1,6 @@
 """Tests for the Syda MCP server tools."""
 
+import os
 import pytest
 from unittest.mock import MagicMock, patch
 import pandas as pd
@@ -676,11 +677,13 @@ class TestInferSchemaFromDb:
             "DB_PASSWORD": "secret",
             "DB_PORT": "5432",
         }
-        with patch.dict("os.environ", env), \
-             patch("syda.DatabaseSchemaLoader") as MockLoader:
-            MockLoader.return_value.load_schemas.return_value = mock_schemas
-            from syda.mcp_server import infer_schema_from_db
-            result = infer_schema_from_db()
+        with patch.dict("os.environ", env):
+            os.environ.pop("DATABASE_URL", None)
+            os.environ.pop("SYDA_DB_URL", None)
+            with patch("syda.DatabaseSchemaLoader") as MockLoader:
+                MockLoader.return_value.load_schemas.return_value = mock_schemas
+                from syda.mcp_server import infer_schema_from_db
+                result = infer_schema_from_db()
         assert result["ok"] is True
         # Confirm the constructed URL contains host and db name
         call_args = MockLoader.call_args[0][0]
@@ -700,11 +703,13 @@ class TestInferSchemaFromDb:
             "DB_PASSWORD": "p@ss:w/rd%25",
             "DB_PORT": "5432",
         }
-        with patch.dict("os.environ", env), \
-             patch("syda.DatabaseSchemaLoader") as MockLoader:
-            MockLoader.return_value.load_schemas.return_value = mock_schemas
-            from syda.mcp_server import infer_schema_from_db
-            result = infer_schema_from_db()
+        with patch.dict("os.environ", env):
+            os.environ.pop("DATABASE_URL", None)
+            os.environ.pop("SYDA_DB_URL", None)
+            with patch("syda.DatabaseSchemaLoader") as MockLoader:
+                MockLoader.return_value.load_schemas.return_value = mock_schemas
+                from syda.mcp_server import infer_schema_from_db
+                result = infer_schema_from_db()
         assert result["ok"] is True
         call_args = MockLoader.call_args[0][0]
         # The raw password must not appear unescaped in the URL...

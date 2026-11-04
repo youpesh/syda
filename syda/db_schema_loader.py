@@ -113,12 +113,17 @@ class DatabaseSchemaLoader:
     def _fk_insertion_order(self, table_names: List[str]) -> List[str]:
         """Topologically sort tables so parent tables are inserted before children."""
         table_set = set(table_names)
+        existing_tables = set(self._inspector.get_table_names())
         deps: Dict[str, set] = {t: set() for t in table_names}
         for table in table_names:
-            for fk in self._inspector.get_foreign_keys(table):
-                ref = fk["referred_table"]
-                if ref in table_set:
-                    deps[table].add(ref)
+            if table in existing_tables:
+                try:
+                    for fk in self._inspector.get_foreign_keys(table):
+                        ref = fk["referred_table"]
+                        if ref in table_set:
+                            deps[table].add(ref)
+                except Exception:
+                    pass
 
         order: List[str] = []
         visited: set = set()

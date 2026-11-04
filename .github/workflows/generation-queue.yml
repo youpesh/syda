@@ -1,16 +1,16 @@
-name: Generation queue
+name: CI & Generation Queue
 on:
   pull_request:
     paths:
-      - 'platform/backend/**'
+      - 'platform/**'
       - 'syda/**'
-      - 'platform/docker-compose.yml'
+      - 'tests/**'
       - '.github/workflows/generation-queue.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  queue:
+  backend-and-core:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -36,5 +36,26 @@ jobs:
         run: uv sync --project platform/backend --extra test
       - name: Dependency lock changes
         run: git diff -- platform/backend/uv.lock
-      - name: Backend, scenario, and queue worker tests
-        run: uv run --project platform/backend pytest platform/backend/tests tests/test_scenarios.py
+      - name: Backend and core tests
+        run: uv run --project platform/backend pytest tests/ platform/backend/tests/
+
+  frontend-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install dependencies
+        run: |
+          cd platform/frontend
+          npm ci
+      - name: Frontend typecheck
+        run: |
+          cd platform/frontend
+          npm run typecheck
+      - name: Frontend production build
+        run: |
+          cd platform/frontend
+          npm run build

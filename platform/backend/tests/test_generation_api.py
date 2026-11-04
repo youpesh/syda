@@ -451,3 +451,24 @@ def test_deleting_chat_removes_its_draft_and_preserves_saved_scenario(monkeypatc
         assert client.get(f"/api/conversations/{conversation_id}").status_code == 404
         assert all(item["id"] != conversation_id for item in client.get("/api/conversations").json())
         assert client.get(f"/api/scenarios/{scenario_id}").status_code == 200
+
+
+def test_cancel_generation_job(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        # Do not run synchronously, leave in queued state
+        monkeypatch.setattr(generation, "publish_job", lambda job_id, **kw: True)
+        job = client.post("/api/generate", json={"scenario": _scenario()})
+        assert job.status_code == 200
+        job_id = job.json()["jobId"]
+
+        cancel_resp = client.post(f"/api/jobs/{job_id}/cancel")
+        assert cancel_resp.status_code == 200
+        assert cancel_resp.json()["status"] == "cancelled"
+
+        status = client.get(f"/api/jobs/{job_id}").json()
+        assert status["status"] == "cancelled"
+        assert "cancelled" in status["currentStage"].lower()
+
+        # Cannot cancel an already cancelled job
+        repeat = client.post(f"/api/jobs/{job_id}/cancel")
+        assert repeat.status_code == 400
