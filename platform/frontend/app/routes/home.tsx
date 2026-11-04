@@ -482,7 +482,8 @@ export default function Home() {
   const { clearError, error, messages, sendMessage, setMessages, status, stop } = useChat<SydaMessage>({
     transport: chatTransport,
   });
-  const isThinking = status === "submitted" || status === "streaming";
+  const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
+  const isThinking = status === "submitted" || status === "streaming" || isAwaitingResponse;
 
   useEffect(() => {
     const returnState = location.state as {
@@ -593,6 +594,8 @@ export default function Home() {
       .then((conversation) => {
         if (!active) return;
         const restoredMessages = [...conversation.messages] as SydaMessage[];
+        const lastMsg = restoredMessages.length > 0 ? restoredMessages[restoredMessages.length - 1] : null;
+        setIsAwaitingResponse(lastMsg?.role === "user");
         if (conversation.scenarioDraft) {
           let assistantIndex = -1;
           for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
@@ -630,6 +633,56 @@ export default function Home() {
       .finally(() => { if (active) setConversationLoading(false); });
     return () => { active = false; };
   }, [conversationId, navigate, setMessages, stop]);
+
+  useEffect(() => {
+    if (!conversationId || !isAwaitingResponse) return;
+    let active = true;
+    const interval = setInterval(() => {
+      fetch(`/api/conversations/${conversationId}`)
+        .then(async (response) => {
+          if (!response.ok) return;
+          const conversation = await response.json() as SavedConversation;
+          if (!active) return;
+          const restoredMessages = [...conversation.messages] as SydaMessage[];
+          const lastMsg = restoredMessages.length > 0 ? restoredMessages[restoredMessages.length - 1] : null;
+          if (lastMsg?.role === "assistant") {
+            setIsAwaitingResponse(false);
+            if (conversation.scenarioDraft) {
+              let assistantIndex = -1;
+              for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
+                if (restoredMessages[index].role === "assistant") {
+                  assistantIndex = index;
+                  break;
+                }
+              }
+              const assistantMessage = assistantIndex >= 0
+                ? restoredMessages[assistantIndex]
+                : { id: crypto.randomUUID(), role: "assistant" as const, parts: [] };
+              const scenarioPart = { type: "data-scenario" as const, id: "scenario", data: conversation.scenarioDraft };
+              const parts = assistantMessage.parts.filter((part) => part.type !== "data-scenario") as SydaMessage["parts"];
+              parts.push(scenarioPart as SydaMessage["parts"][number]);
+              const restoredAssistant = { ...assistantMessage, parts } as SydaMessage;
+              if (assistantIndex >= 0) restoredMessages[assistantIndex] = restoredAssistant;
+              else restoredMessages.push(restoredAssistant);
+            }
+            setMessages(restoredMessages);
+            setChatRuns(conversation.runs ?? []);
+            persistedSnapshotRef.current = JSON.stringify({
+              title: conversation.title,
+              messages: restoredMessages,
+              runs: conversation.runs ?? [],
+              scenarioDraft: conversation.scenarioDraft ?? undefined,
+            });
+            window.dispatchEvent(new Event("syda:conversations-changed"));
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [conversationId, isAwaitingResponse, setMessages]);
 
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId || status === "streaming") return;
@@ -849,7 +902,7 @@ export default function Home() {
                         </MessageScrollerItem>
                       );
                     })}
-                    {status === "submitted" && (
+                    {(status === "submitted" || isAwaitingResponse) && (
                       <MessageScrollerItem messageId="thinking-indicator" scrollAnchor>
                           <Message align="start">
                           <MessageAvatar className="self-start bg-primary text-primary-foreground">
@@ -878,7 +931,7 @@ export default function Home() {
                 <div className="flex items-end gap-2">
                   <PromptComposer connections={connections} source={source} onSource={setSource} compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
                   {isThinking && (
-                    <Button onClick={() => stop()} type="button" variant="outline">
+                    <Button onClick={() => { stop(); setIsAwaitingResponse(false); }} type="button" variant="outline">
                       Stop
                     </Button>
                   )}
