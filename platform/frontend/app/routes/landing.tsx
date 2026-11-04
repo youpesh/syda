@@ -1,102 +1,256 @@
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
-import { HugeiconsIcon } from "@hugeicons/react";
-import { AiMagicIcon, ArrowRight02Icon, CheckmarkCircle02Icon } from "@hugeicons/core-free-icons";
+import { ArrowRight, Check, Database, GitBranch, Menu, Plus, X } from "lucide-react";
 
 import type { Route } from "./+types/landing";
-import { Badge } from "~/components/ui/badge";
 import { buttonVariants } from "~/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "~/components/ui/card";
 import { ThemeToggle } from "~/components/ui/theme-toggle";
 
 export function meta({}: Route.MetaArgs) {
   return [
-    { title: "Syda — Connected synthetic test data" },
-    { name: "description", content: "Describe your data and business rules. Syda generates linked synthetic test datasets and checks that their relationships hold." },
+    { title: "Syda — Synthetic data. Real-world logic." },
+    { name: "description", content: "Generate linked synthetic test datasets from your business rules. Design scenarios, inspect relationships, and export CSV or JSON without using customer records." },
   ];
 }
 
-const steps = [
-  { number: "01", title: "Describe the system", copy: "Start with your entities, lifecycle, rules, and edge cases. Syda turns the brief into an editable scenario." },
-  { number: "02", title: "Shape the data", copy: "Refine schemas, relationships, paths, and constraints before a single record is generated." },
-  { number: "03", title: "Generate and inspect", copy: "Create linked datasets, review quality checks, and export the results for your team." },
+// A curated synthetic example. Every child key resolves to a record in this sample.
+const patients = [
+  { patient_id: "PT-00421", age: 34, care_path: "Routine follow-up" },
+  { patient_id: "PT-00422", age: 67, care_path: "Escalated care" },
+  { patient_id: "PT-00423", age: 42, care_path: "Routine follow-up" },
+];
+const visits = [
+  { visit_id: "VS-01934", patient_id: "PT-00421", visit_date: "2026-10-12", type: "Consultation" },
+  { visit_id: "VS-01935", patient_id: "PT-00422", visit_date: "2026-10-13", type: "Consultation" },
+  { visit_id: "VS-01936", patient_id: "PT-00423", visit_date: "2026-10-14", type: "Consultation" },
+  { visit_id: "VS-01937", patient_id: "PT-00421", visit_date: "2026-10-26", type: "Follow-up" },
+  { visit_id: "VS-01938", patient_id: "PT-00422", visit_date: "2026-10-20", type: "Specialist" },
+];
+const diagnoses = [
+  { diagnosis_id: "DX-00831", visit_id: "VS-01934", diagnosis: "Seasonal allergy" },
+  { diagnosis_id: "DX-00832", visit_id: "VS-01935", diagnosis: "Hypertension" },
+  { diagnosis_id: "DX-00833", visit_id: "VS-01936", diagnosis: "Migraine" },
+];
+const treatments = [
+  { treatment_id: "TX-00611", diagnosis_id: "DX-00831", treatment: "Allergy management" },
+  { treatment_id: "TX-00612", diagnosis_id: "DX-00832", treatment: "Specialist referral" },
+  { treatment_id: "TX-00613", diagnosis_id: "DX-00833", treatment: "Migraine management" },
+];
+const sample = { patients, visits, diagnoses, treatments };
+const checks = [
+  { label: "Patient references", pass: visits.every((v) => patients.some((p) => p.patient_id === v.patient_id)) },
+  { label: "Visit references", pass: diagnoses.every((d) => visits.some((v) => v.visit_id === d.visit_id)) },
+  { label: "Diagnosis references", pass: treatments.every((t) => diagnoses.some((d) => d.diagnosis_id === t.diagnosis_id)) },
+  { label: "Unique record IDs", pass: Object.values(sample).every((rows) => new Set(rows.map((row) => Object.values(row)[0])).size === rows.length) },
 ];
 
-export default function Landing() {
-  return <main className="min-h-svh bg-background text-foreground">
-    <header className="mx-auto flex w-full max-w-7xl items-center justify-between gap-6 px-5 py-5 sm:px-8">
-      <Link className="flex items-center gap-2.5" to="/" aria-label="Syda home">
-        <span className="flex size-8 items-center justify-center rounded-md bg-primary text-primary-foreground"><HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} /></span>
-        <span className="text-lg font-semibold tracking-tight">Syda</span>
-      </Link>
-      <nav className="hidden items-center gap-7 text-sm text-muted-foreground md:flex" aria-label="Main navigation">
-        <a className="transition-colors hover:text-foreground" href="#workflow">How it works</a>
-        <a className="transition-colors hover:text-foreground" href="#built-for">Built for complex data</a>
-      </nav>
-      <div className="flex items-center gap-2">
-        <ThemeToggle />
-        <Link className={buttonVariants({ variant: "ghost" })} to="/login">Log in</Link>
-        <Link className={buttonVariants({})} to="/register">Get started <HugeiconsIcon data-icon="inline-end" icon={ArrowRight02Icon} strokeWidth={2} /></Link>
+type DemoRecord = {
+  id: string;
+  kind: "Patient" | "Visit" | "Diagnosis" | "Treatment";
+  title: string;
+  detail?: string;
+  parentId?: string;
+  parentKind?: string;
+  fields: { label: string; value: string; reference?: string }[];
+};
+type RecordEdge = { from: string; to: string; path: string };
+
+function formatVisitDate(date: string) {
+  return new Intl.DateTimeFormat("en", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(date));
+}
+
+function DatasetDemo() {
+  const [patientId, setPatientId] = useState(patients[0].patient_id);
+  const [selectedId, setSelectedId] = useState(visits[0].visit_id);
+  const mapRef = useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = useState<RecordEdge[]>([]);
+  const patient = patients.find((p) => p.patient_id === patientId)!;
+  const linkedVisits = visits.filter((v) => v.patient_id === patientId);
+  const linkedDiagnoses = diagnoses.filter((d) => linkedVisits.some((v) => v.visit_id === d.visit_id));
+  const linkedTreatments = treatments.filter((t) => linkedDiagnoses.some((d) => d.diagnosis_id === t.diagnosis_id));
+  const records: DemoRecord[] = [
+    { id: patient.patient_id, kind: "Patient", title: patient.patient_id, detail: `Age ${patient.age}`, fields: [{ label: "Patient ID", value: patient.patient_id }, { label: "Age", value: String(patient.age) }, { label: "Care path", value: patient.care_path }] },
+    ...linkedVisits.map((v): DemoRecord => ({ id: v.visit_id, kind: "Visit", title: v.type, detail: formatVisitDate(v.visit_date), parentId: v.patient_id, parentKind: "Patient", fields: [{ label: "Visit ID", value: v.visit_id }, { label: "Patient", value: v.patient_id, reference: v.patient_id }, { label: "Date", value: formatVisitDate(v.visit_date) }, { label: "Visit type", value: v.type }] })),
+    ...linkedDiagnoses.map((d): DemoRecord => ({ id: d.diagnosis_id, kind: "Diagnosis", title: d.diagnosis, parentId: d.visit_id, parentKind: "Visit", fields: [{ label: "Diagnosis ID", value: d.diagnosis_id }, { label: "Visit", value: d.visit_id, reference: d.visit_id }, { label: "Diagnosis", value: d.diagnosis }] })),
+    ...linkedTreatments.map((t): DemoRecord => ({ id: t.treatment_id, kind: "Treatment", title: t.treatment, parentId: t.diagnosis_id, parentKind: "Diagnosis", fields: [{ label: "Treatment ID", value: t.treatment_id }, { label: "Diagnosis", value: t.diagnosis_id, reference: t.diagnosis_id }, { label: "Treatment", value: t.treatment }] })),
+  ];
+  const selected = records.find((record) => record.id === selectedId) ?? records[0];
+  const selectRecord = (id: string) => {
+    setSelectedId(id);
+    if (window.matchMedia("(max-width: 760px)").matches) {
+      const inspector = document.getElementById("record-inspector");
+      inspector?.focus({ preventScroll: true });
+      inspector?.scrollIntoView({ block: "start" });
+    }
+  };
+  const linkCount = records.filter((record) => record.parentId).length;
+  const referencesResolve = records.every((record) => !record.parentId || records.some((parent) => parent.id === record.parentId));
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    // Connect actual record endpoints, including both visits and their true parents.
+    const draw = () => {
+      const bounds = map.getBoundingClientRect();
+      const next: RecordEdge[] = [];
+      map.querySelectorAll<HTMLElement>("[data-parent-id]").forEach((child) => {
+        const parentId = child.dataset.parentId;
+        const parent = [...map.querySelectorAll<HTMLElement>("[data-record-id]")].find((node) => node.dataset.recordId === parentId);
+        if (!parent || !parentId) return;
+        const a = parent.getBoundingClientRect();
+        const b = child.getBoundingClientRect();
+        const x1 = a.right - bounds.left, y1 = a.top + a.height / 2 - bounds.top;
+        const x2 = b.left - bounds.left, y2 = b.top + b.height / 2 - bounds.top;
+        const middle = (x1 + x2) / 2;
+        next.push({ from: parentId, to: child.dataset.recordId!, path: `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}` });
+      });
+      setEdges(next);
+    };
+    draw();
+    if (!("ResizeObserver" in window)) return;
+    const observer = new ResizeObserver(draw);
+    observer.observe(map);
+    map.querySelectorAll("[data-record-id]").forEach((node) => observer.observe(node));
+    return () => observer.disconnect();
+  }, [patientId]);
+
+  return <div className="dataset-demo" data-ui>
+    <div className="dataset-toolbar">
+      <div className="dataset-identity"><GitBranch aria-hidden="true" /><div><strong>Patient care</strong><span>Interactive synthetic scenario</span></div></div>
+      <div className="dataset-patient-picker"><label htmlFor="sample-patient">Patient</label><select id="sample-patient" value={patientId} onChange={(event) => {
+        const nextPatient = event.target.value;
+        setPatientId(nextPatient);
+        setSelectedId(visits.find((visit) => visit.patient_id === nextPatient)?.visit_id ?? nextPatient);
+      }}>{patients.map((p) => <option key={p.patient_id}>{p.patient_id}</option>)}</select></div>
+    </div>
+    <div className="record-workbench">
+      <div className="record-map" ref={mapRef} data-illustration role="group" aria-label={`Connected records for ${patientId}`}>
+        <svg className="record-map-links" aria-hidden="true">{edges.map((edge) => <path key={`${edge.from}-${edge.to}`} d={edge.path} data-active={selected.id === edge.from || selected.id === edge.to} />)}</svg>
+        {(["Patient", "Visit", "Diagnosis", "Treatment"] as const).map((kind) => <div className="record-column" key={kind}>
+          <div className="record-column-title">{kind === "Visit" ? "Visits" : kind}</div>
+          <div className="record-node-stack">{records.filter((record) => record.kind === kind).map((record) => <button type="button" className="record-node" key={record.id} data-record-id={record.id} data-parent-id={record.parentId} aria-pressed={selected.id === record.id} aria-label={`Inspect ${record.kind.toLowerCase()} ${record.id}: ${record.title}`} aria-controls="record-inspector" onClick={() => selectRecord(record.id)}>
+            <strong>{record.title}</strong>
+            {record.kind !== "Patient" && <span>{record.id}</span>}
+            {record.detail && <span>{record.detail}</span>}
+            {record.parentId && <span className="record-mobile-parent">{record.parentKind} · {record.parentId}</span>}
+          </button>)}</div>
+        </div>)}
       </div>
+      <aside className="record-inspector" id="record-inspector" tabIndex={-1} aria-label="Selected record details" aria-live="polite" aria-atomic="true">
+        <div className="record-inspector-heading"><span>Record details</span><Database aria-hidden="true" /></div>
+        <h3>{selected.kind}</h3>
+        <dl>{selected.fields.map((field) => <div key={field.label}><dt>{field.label}</dt><dd>{field.reference ? <button type="button" className="record-reference" onClick={() => selectRecord(field.reference!)} aria-label={`Inspect linked ${field.label.toLowerCase()} ${field.value}`}>{field.value}<ArrowRight aria-hidden="true" /></button> : field.value}</dd></div>)}</dl>
+        <p className="record-inspector-note">{selected.parentId ? `This ${selected.kind.toLowerCase()} belongs to ${selected.parentId}.` : `${linkedVisits.length} ${linkedVisits.length === 1 ? "visit is" : "visits are"} linked to this patient.`}</p>
+      </aside>
+    </div>
+    <div className="dataset-status"><span>{patient.care_path}<span aria-hidden="true"> · </span>{records.length} records<span aria-hidden="true"> · </span>{linkCount} links</span><span><Check aria-hidden="true" />{referencesResolve ? "All references resolve" : "Check references"}</span></div>
+  </div>;
+}
+
+const questions = [
+  ["Does this use customer records?", "You can start with a description of your system and its business rules. The generated records are synthetic, so you do not need to upload real customer records to build a scenario."],
+  ["Can I edit the scenario?", "Yes. Review and refine the tables, fields, relationships, workflow paths, and constraints before you generate the dataset."],
+  ["What makes the data connected?", "Records are generated with relationships across tables. A visit references a patient, a diagnosis references a visit, and a treatment references a diagnosis, keeping the scenario's context intact."],
+  ["How do I check the output?", "Preview the generated tables, inspect quality checks, and review the evaluation report before using your data. Your rules stay visible throughout the workflow."],
+  ["What can I export?", "Download generated tables as CSV or JSON. You can also export the evaluation report as JSON or HTML for review."],
+  ["Is this demo live generation?", "This page uses a small, curated synthetic patient-care sample to demonstrate linked records. Create a workspace to design your own scenario and run generation."],
+];
+
+function MobileNavigation() {
+  const menuRef = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const dismissOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !menuRef.current?.contains(event.target)) {
+        menuRef.current?.removeAttribute("open");
+      }
+    };
+    const dismissWithEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && menuRef.current?.open) {
+        menuRef.current.open = false;
+        menuRef.current.querySelector("summary")?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", dismissOutside);
+    document.addEventListener("keydown", dismissWithEscape);
+    return () => {
+      document.removeEventListener("pointerdown", dismissOutside);
+      document.removeEventListener("keydown", dismissWithEscape);
+    };
+  }, []);
+
+  return <details className="landing-mobile-menu" ref={menuRef}>
+    <summary aria-label="Navigation menu"><Menu className="menu-open-icon" aria-hidden="true" /><X className="menu-close-icon" aria-hidden="true" /></summary>
+    <nav aria-label="Mobile navigation" onClick={() => menuRef.current?.removeAttribute("open")}>
+      <a href="#dataset">Explore the data</a>
+      <a href="#workflow">How it works</a>
+      <a href="#built-for">Built for complex data</a>
+      <Link to="/login">Log in</Link>
+      <Link className={buttonVariants()} to="/register">Create workspace <ArrowRight data-icon="inline-end" /></Link>
+    </nav>
+  </details>;
+}
+
+export default function Landing() {
+  const pageRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!("IntersectionObserver" in window)) return;
+    const observer = new IntersectionObserver((entries) => entries.forEach((entry) => {
+      if (entry.isIntersecting) { entry.target.classList.add("is-visible"); observer.unobserve(entry.target); }
+    }), { threshold: 0.12 });
+    pageRef.current?.querySelectorAll("[data-reveal], [data-illustration]").forEach((element) => observer.observe(element));
+    return () => observer.disconnect();
+  }, []);
+
+  return <main className="syda-landing" ref={pageRef}>
+    <a className="landing-skip" href="#main-content">Skip to content</a>
+    <header className="landing-header">
+      <Link className="landing-wordmark" to="/" aria-label="Syda home"><span className="syda-mark" aria-hidden="true"><i /><i /><i /></span>syda</Link>
+      <nav aria-label="Main navigation"><a href="#dataset">Explore the data</a><a href="#workflow">How it works</a><a href="#built-for">Built for complex data</a></nav>
+      <div className="landing-account"><ThemeToggle /><Link to="/login">Log in</Link><Link className={buttonVariants()} to="/register">Create workspace <ArrowRight data-icon="inline-end" /></Link><MobileNavigation /></div>
     </header>
 
-    <section className="mx-auto grid w-full max-w-7xl items-center gap-12 px-5 pb-20 pt-10 sm:px-8 lg:grid-cols-[0.9fr_1.1fr] lg:gap-16 lg:pb-28 lg:pt-16">
-      <div className="flex flex-col items-start gap-6">
-        <Badge variant="secondary" className="rounded-full px-3 py-1">Synthetic test data for connected systems</Badge>
-        <h1 className="max-w-2xl text-5xl leading-[1.04] font-semibold tracking-[-0.055em] sm:text-6xl lg:text-7xl">Generate test data that <span className="text-primary">stays connected.</span></h1>
-        <p className="max-w-xl text-base leading-7 text-muted-foreground sm:text-lg">Describe your data and business rules. Syda creates linked synthetic datasets, checks that the relationships hold, and lets you export the results—without using real customer records.</p>
-        <div className="flex flex-wrap items-center gap-3">
-          <Link className={buttonVariants({ size: "lg" })} to="/register">Create your workspace <HugeiconsIcon data-icon="inline-end" icon={ArrowRight02Icon} strokeWidth={2} /></Link>
-          <a className={buttonVariants({ variant: "outline", size: "lg" })} href="#workflow">See how it works</a>
-        </div>
-        <p className="text-xs text-muted-foreground">Start with a description. Review the data before you use it.</p>
-      </div>
-
-      <div className="relative mx-auto w-full max-w-2xl">
-        <div className="absolute -inset-5 -z-10 rounded-[2rem] bg-primary/10 blur-2xl" />
-        <Card className="overflow-hidden border-border/80 bg-card shadow-xl shadow-primary/5">
-          <CardHeader className="flex flex-row items-start justify-between gap-4 border-b bg-muted/20 px-5 py-4">
-            <div className="flex flex-col gap-1"><p className="text-xs text-muted-foreground">Example output</p><CardTitle className="text-base">Patient care data</CardTitle></div>
-            <Badge className="rounded-full" variant="secondary">Illustrative example</Badge>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-5 p-5 sm:p-6">
-            <div className="grid grid-cols-4 gap-2 sm:gap-3">
-              {["Patient", "Visit", "Diagnosis", "Treatment"].map((step, index) => <div className="relative flex min-h-20 flex-col justify-between rounded-2xl border bg-background p-2.5 sm:p-3" key={step}>
-                <span className="text-[10px] text-muted-foreground">0{index + 1}</span><span className="text-xs font-medium sm:text-sm">{step}</span>
-                {index < 3 && <span className="absolute top-1/2 -right-2 z-10 hidden h-px w-2 bg-border sm:block" />}
-              </div>)}
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Badge variant="outline">5,000 patients</Badge><Badge variant="outline">4 connected tables</Badge><Badge variant="outline">3 care paths</Badge>
-            </div>
-            <div className="overflow-hidden rounded-2xl border">
-              <div className="flex items-center justify-between border-b bg-muted/30 px-3 py-2.5"><span className="text-xs font-medium">Sample rows</span><span className="text-[10px] text-muted-foreground">Patient and visit IDs stay linked</span></div>
-              <div className="grid grid-cols-[1fr_1fr_1.1fr] gap-2 px-3 py-2 text-[10px] font-medium text-muted-foreground"><span>patient_id</span><span>visit_id</span><span>care_path</span></div>
-              {[ ["PT-00421", "VS-01934", "Routine follow-up"], ["PT-00422", "VS-01935", "Escalated care"], ["PT-00423", "VS-01936", "Routine follow-up"] ].map((row) => <div className="grid grid-cols-[1fr_1fr_1.1fr] gap-2 border-t px-3 py-2 text-[10px] sm:text-xs" key={row[0]}>{row.map((cell) => <span className="truncate" key={cell}>{cell}</span>)}</div>)}
-            </div>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground"><HugeiconsIcon icon={CheckmarkCircle02Icon} strokeWidth={2} /><span>Linked records, ready to review and export.</span></div>
-          </CardContent>
-        </Card>
+    <section className="landing-hero landing-frame" id="main-content" aria-labelledby="hero-title">
+      <picture className="hero-art">
+        <source media="(max-width: 1100px)" srcSet="/images/syda-connected-records.webp" />
+        <img src="/images/syda-connected-records-wide.webp" width="1774" height="887" fetchPriority="high" alt="Paper records for a patient, visit, diagnosis, and treatment connected by one green thread, with each record referencing the one before it." />
+      </picture>
+      <div className="hero-copy">
+        <h1 id="hero-title"><span><span>Synthetic data.</span></span><span><span>Real-world logic.</span></span></h1>
+        <p>Describe the world your data lives in. Syda generates connected records that follow its rules, without using customer data.</p>
+        <div className="hero-actions"><Link className={buttonVariants({ size: "lg" })} to="/register">Build your first dataset <ArrowRight data-icon="inline-end" /></Link><a className="landing-text-link" href="#dataset">See it in action <ArrowRight aria-hidden="true" /></a></div>
       </div>
     </section>
 
-    <section className="border-y bg-muted/20" id="built-for">
-      <div className="mx-auto grid max-w-7xl gap-3 px-5 py-7 sm:grid-cols-3 sm:px-8">
-        {[ ["Connected", "Relationships stay intact across every generated table."], ["Controlled", "Define the paths, proportions, and business rules yourself."], ["Inspectable", "Review previews and quality checks before using your data."] ].map(([title, copy]) => <div className="flex flex-col gap-1 px-1 py-2 sm:px-4" key={title}><p className="text-sm font-medium">{title}</p><p className="text-xs leading-5 text-muted-foreground">{copy}</p></div>)}
+    <section className="landing-demo landing-frame" id="dataset" aria-labelledby="dataset-title">
+      <div className="dataset-copy" data-reveal>
+        <h2 id="dataset-title">Follow the connections.</h2>
+        <p>A patient has visits. A visit has a diagnosis. A diagnosis has a treatment. The meaning lives in how they connect.</p>
+        <p>Select a record to inspect its fields and follow its links. Switch patients to explore a different care path.</p>
+      </div>
+      <DatasetDemo />
+    </section>
+
+    <section className="landing-workflow landing-frame" id="workflow" aria-labelledby="workflow-title">
+      <div className="section-intro" data-reveal><h2 id="workflow-title">From brief<br />to dataset.</h2><p>Real systems have relationships, decisions, and exceptions. Your test data should, too.</p></div>
+      <div className="workflow-exchanges" id="built-for">
+        <article className="workflow-exchange">
+          <div className="exchange-copy" data-reveal><h3>Describe the system.</h3><p>Start with the entities, lifecycle, and edge cases. Syda turns your brief into an editable scenario.</p></div>
+          <div className="brief-fragment" data-ui data-reveal><div className="fragment-heading"><span>Your scenario</span><GitBranch aria-hidden="true" /></div><p>“Create patient care data with visits, diagnoses, and treatments. Include routine follow-ups and escalated care.”</p><div className="schema-response"><span>Patient</span><span>Visit</span><span>Diagnosis</span><span>Treatment</span></div><span className="fragment-caption">Four entities, linked by their IDs.</span></div>
+        </article>
+        <article className="workflow-exchange">
+          <div className="exchange-copy" data-reveal><h3>Keep the logic.</h3><p>Refine schemas, paths, and constraints before generating. Define how records behave together, beyond individual fields.</p></div>
+          <div className="rules-fragment" data-ui data-reveal><div className="fragment-heading"><span>Scenario constraints</span><span>Patient care</span></div><ul><li><span>Every visit belongs to a patient</span><span>Relationship</span></li><li><span>Follow-ups happen after the first visit</span><span>Sequence</span></li><li><span>Escalated care includes a specialist visit</span><span>Care path</span></li></ul></div>
+        </article>
+        <article className="workflow-exchange">
+          <div className="exchange-copy" data-reveal><h3>Inspect. Then export.</h3><p>Preview your tables and review quality checks. Export CSV or JSON when the data is ready for your tests.</p></div>
+          <div className="export-fragment" data-ui data-reveal><div className="fragment-heading"><span>Sample relationship checks</span><span>{checks.filter((check) => check.pass).length} / {checks.length} passed</span></div><ul>{checks.map((check) => <li key={check.label}><span>{check.label}</span><span><Check aria-hidden="true" />{check.pass ? "Passed" : "Failed"}</span></li>)}</ul></div>
+        </article>
       </div>
     </section>
 
-    <section className="mx-auto flex w-full max-w-7xl flex-col gap-10 px-5 py-20 sm:px-8 lg:py-28" id="workflow">
-      <div className="max-w-2xl"><p className="text-sm font-medium text-primary">A clear path from brief to dataset</p><h2 className="mt-3 text-3xl font-semibold tracking-[-0.04em] sm:text-4xl">Keep the meaning in your data.</h2><p className="mt-3 text-sm leading-6 text-muted-foreground sm:text-base">Syda keeps the logic visible, so generated records make sense together—not just one row at a time.</p></div>
-      <div className="grid gap-4 md:grid-cols-3">{steps.map((step) => <Card className="bg-background" key={step.number}><CardContent className="flex flex-col gap-7 p-5 sm:p-6"><span className="text-sm font-medium text-primary">{step.number}</span><div className="flex flex-col gap-2"><h3 className="text-lg font-semibold tracking-tight">{step.title}</h3><p className="text-sm leading-6 text-muted-foreground">{step.copy}</p></div></CardContent></Card>)}</div>
-    </section>
+    <section className="landing-faq landing-frame" aria-labelledby="faq-title"><h2 id="faq-title" data-reveal>Before <br />you build.</h2><div className="faq-list">{questions.map(([question, answer]) => <details name="landing-faq" key={question} data-reveal><summary>{question}<Plus aria-hidden="true" /></summary><p>{answer}</p></details>)}</div></section>
 
-    <section className="px-5 pb-20 sm:px-8 lg:pb-28">
-      <div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-6 rounded-4xl bg-primary px-6 py-8 text-primary-foreground sm:flex-row sm:items-center sm:px-10 sm:py-10">
-        <div className="flex flex-col gap-2"><h2 className="text-2xl font-semibold tracking-tight">Build data you can trust to behave.</h2><p className="text-sm text-primary-foreground/75">Start designing your first synthetic scenario.</p></div>
-        <Link className={buttonVariants({ variant: "secondary", size: "lg" })} to="/register">Get started <HugeiconsIcon data-icon="inline-end" icon={ArrowRight02Icon} strokeWidth={2} /></Link>
-      </div>
-    </section>
-
-    <footer className="border-t"><div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-5 py-6 text-xs text-muted-foreground sm:px-8"><span>© {new Date().getFullYear()} Syda</span><span>Synthetic data, built around real workflows.</span></div></footer>
+    <section className="landing-cta landing-frame" aria-labelledby="cta-title"><div data-reveal><h2 id="cta-title">Give your tests context.</h2><p>Start designing your first synthetic scenario.</p></div><Link className={buttonVariants({ size: "lg" })} to="/register" data-reveal>Create your workspace <ArrowRight data-icon="inline-end" /></Link></section>
+    <footer className="landing-footer landing-frame"><Link className="landing-wordmark" to="/">syda</Link><p>Synthetic data. Connected by design.</p><span>© {new Date().getFullYear()} Syda</span></footer>
   </main>;
 }
