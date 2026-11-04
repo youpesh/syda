@@ -1,4 +1,5 @@
 import unittest
+import pytest
 from unittest.mock import patch
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError
@@ -85,3 +86,75 @@ class ConnectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
  unittest.main()
+
+
+# Exercise the production CSV shape against an existing constrained destination.
+def test_export_strips_run_metadata_and_preserves_declared_table_name(tmp_path, monkeypatch):
+ from unittest.mock import MagicMock
+ from app.models.entities import JobRecord
+ import pandas as pd
+ db, user = MagicMock(), MagicMock()
+ job = JobRecord(id='metadata-job', status='complete', scenario={'schemas': {
+  'Patient': {'patient_id': 'integer', 'name': 'text'},
+ }})
+ db.query.return_value.filter.return_value.first.return_value = job
+ directory = tmp_path / job.id
+ directory.mkdir()
+ pd.DataFrame({'patient_id': [1], 'name': ['Synthetic'],
+               'scenario_instance_id': ['instance-1'], 'scenario_path': ['paid']}).to_csv(directory / 'patient.csv', index=False)
+ engine = create_engine(f'sqlite:///{tmp_path / "destination.db"}')
+ with engine.begin() as conn:
+  conn.exec_driver_sql('CREATE TABLE "Patient" (patient_id INTEGER PRIMARY KEY, name TEXT NOT NULL)')
+ monkeypatch.setattr(c, 'DATA_DIR', tmp_path)
+ monkeypatch.setattr(c, 'connection_engine', lambda *args, **kwargs: engine)
+ req = c.ConnectionExportRequest(dialect='PostgreSQL', host='localhost', port=5432,
+  database='test', username='user', password='test-only', jobId=job.id)
+ result = c.export_connection(req, db=db, user=user)
+ assert result['tablesExported'] == ['Patient']
+ with engine.connect() as conn:
+  rows = conn.exec_driver_sql('SELECT patient_id, name FROM "Patient"').all()
+ assert rows == [(1, 'Synthetic')]
+
+
+def test_export_preserves_explicitly_declared_provenance_field(tmp_path, monkeypatch):
+ from unittest.mock import MagicMock
+ from app.models.entities import JobRecord
+ import pandas as pd
+ db, user = MagicMock(), MagicMock()
+ job = JobRecord(id='declared-field-job', status='complete', scenario={'schemas': {
+  'Event': {'id': 'integer', 'scenario_path': 'text'},
+ }})
+ db.query.return_value.filter.return_value.first.return_value = job
+ directory = tmp_path / job.id
+ directory.mkdir()
+ pd.DataFrame({'id': [1], 'scenario_path': ['business-field'],
+               'scenario_instance_id': ['instance-1']}).to_csv(directory / 'event.csv', index=False)
+ engine = create_engine(f'sqlite:///{tmp_path / "declared.db"}')
+ monkeypatch.setattr(c, 'DATA_DIR', tmp_path)
+ monkeypatch.setattr(c, 'connection_engine', lambda *args, **kwargs: engine)
+ req = c.ConnectionExportRequest(dialect='PostgreSQL', host='localhost', port=5432,
+  database='test', username='user', password='test-only', jobId=job.id)
+ c.export_connection(req, db=db, user=user)
+ with engine.connect() as conn:
+  assert conn.exec_driver_sql('SELECT scenario_path FROM "Event"').scalar() == 'business-field'
+
+
+@pytest.mark.parametrize('error_type', ['sqlalchemy', 'pandas'])
+def test_export_database_failures_do_not_expose_sql_or_row_values(tmp_path, monkeypatch, error_type):
+ from unittest.mock import MagicMock
+ from app.models.entities import JobRecord
+ import pandas as pd
+ db, user = MagicMock(), MagicMock()
+ db.query.return_value.filter.return_value.first.return_value = JobRecord(id='error-job', status='complete', scenario={})
+ directory = tmp_path / 'error-job'
+ directory.mkdir()
+ pd.DataFrame({'id': [1]}).to_csv(directory / 'items.csv', index=False)
+ monkeypatch.setattr(c, 'DATA_DIR', tmp_path)
+ monkeypatch.setattr(c, 'connection_engine', lambda *a, **kw: MagicMock())
+ error = pd.errors.DatabaseError('private-row-value') if error_type == 'pandas' else OperationalError('private-sql', {}, Exception('private-row-value'))
+ with patch.object(c.DatabaseSchemaLoader, 'write_to_database', side_effect=error):
+  with pytest.raises(HTTPException) as caught:
+   c.export_connection(c.ConnectionExportRequest(dialect='PostgreSQL', host='localhost', port=5432,
+    database='test', username='user', password='test-only', jobId='error-job'), db=db, user=user)
+ assert caught.value.status_code == 400
+ assert 'private' not in caught.value.detail

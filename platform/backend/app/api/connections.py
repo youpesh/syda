@@ -54,7 +54,7 @@ def inspect_connection(request: ConnectionRequest):
         return {"schemas": schemas, "tableCount": len(schemas)}
     except (ImportError, ModuleNotFoundError):
         raise HTTPException(503, f"The {request.dialect} driver is not installed on the server. Ask the administrator to install the matching database driver, then retry.") from None
-    except SQLAlchemyError:
+    except (SQLAlchemyError, pd.errors.DatabaseError):
         # Driver exceptions can contain connection strings and credentials.
         raise HTTPException(400, "Could not read the database schema. Check the host, port, database, credentials, network access, and schema permissions, then retry.") from None
     finally:
@@ -79,12 +79,19 @@ def export_connection(
         raise HTTPException(404, "Generated dataset files are unavailable")
 
     data = {}
+    schemas = (job.scenario or {}).get("schemas", {})
+    schema_names = {name.lower(): name for name in schemas}
     for csv_file in csv_files:
-        table_name = csv_file.stem
+        table_name = schema_names.get(csv_file.stem.lower(), csv_file.stem)
         if request.table_filter and table_name.lower() not in [t.lower() for t in request.table_filter]:
             continue
         try:
-            data[table_name] = pd.read_csv(csv_file)
+            frame = pd.read_csv(csv_file)
+            declared_fields = schemas.get(table_name, {})
+            # Provenance belongs to the run, not the destination schema.
+            internal_columns = [name for name in ("scenario_instance_id", "scenario_path")
+                                if name not in declared_fields]
+            data[table_name] = frame.drop(columns=internal_columns, errors="ignore")
         except Exception as e:
             raise HTTPException(500, f"Failed to load table '{table_name}': {e}") from e
 
@@ -104,8 +111,10 @@ def export_connection(
         }
     except (ImportError, ModuleNotFoundError):
         raise HTTPException(503, f"The {request.dialect} driver is not installed on the server. Ask the administrator to install the matching database driver, then retry.") from None
-    except SQLAlchemyError as error:
-        raise HTTPException(400, f"Could not export dataset to database: {error}") from None
+    except (SQLAlchemyError, pd.errors.DatabaseError):
+        raise HTTPException(400, "Could not export dataset. Check target columns, constraints, and database permissions.") from None
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from None
     finally:
         if engine is not None:
             engine.dispose()
