@@ -1,0 +1,81 @@
+# Dokploy Production Docker Compose Stack
+# Official production environment with Cloudflare Tunnel public ingress (https://mlgate.ai)
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: syda-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-syda}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d syda"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:latest}
+    pull_policy: always
+    container_name: syda-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-syda}
+      CORS_ORIGINS: "https://mlgate.ai,https://www.mlgate.ai"
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Configure a secure production auth secret key}
+      COOKIE_SECURE: "true"
+    volumes:
+      - job_data:/app/platform/backend/data/jobs
+      - settings_data:/app/platform/backend/data/settings
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:latest}
+    pull_policy: always
+    container_name: syda-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-syda}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Configure a secure production auth secret key}
+    volumes:
+      - job_data:/app/platform/backend/data/jobs
+      - settings_data:/app/platform/backend/data/settings
+    stop_grace_period: 65s
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/youpesh/syda-frontend:latest}
+    pull_policy: always
+    container_name: syda-frontend
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: syda-production-tunnel
+    restart: unless-stopped
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN:?Set production Cloudflare tunnel token}
+    depends_on:
+      - frontend
+
+volumes:
+  postgres_data:
+  job_data:
+  settings_data:

@@ -8,6 +8,7 @@ import { Button, buttonVariants } from "~/components/ui/button";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "~/components/ui/field";
 import { Input } from "~/components/ui/input";
 import { Spinner } from "~/components/ui/spinner";
+import { ThemeToggle } from "~/components/ui/theme-toggle";
 
 async function responseError(response: Response, fallback: string) {
   const result = await response.json().catch(() => ({}));
@@ -77,7 +78,10 @@ export function AuthPage({ mode }: { mode: "login" | "register" }) {
     <section className="flex min-h-svh flex-col px-5 py-6 sm:px-8 lg:px-12">
       <div className="flex items-center justify-between gap-4 lg:justify-end">
         <Link className="flex items-center gap-2 font-semibold lg:hidden" to="/"><span className="flex size-7 items-center justify-center rounded bg-primary text-primary-foreground"><HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} /></span>Syda</Link>
-        <Link className={buttonVariants({ variant: "ghost", size: "sm" })} to="/"><HugeiconsIcon data-icon="inline-start" icon={ArrowLeft01Icon} strokeWidth={2} /> Back to home</Link>
+        <div className="flex items-center gap-2">
+          <ThemeToggle />
+          <Link className={buttonVariants({ variant: "ghost", size: "sm" })} to="/"><HugeiconsIcon data-icon="inline-start" icon={ArrowLeft01Icon} strokeWidth={2} /> Back to home</Link>
+        </div>
       </div>
 
       <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center py-12">

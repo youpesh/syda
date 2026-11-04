@@ -1,0 +1,81 @@
+# Dokploy Staging Docker Compose Stack
+# Isolated staging environment with Cloudflare Tunnel public ingress (https://staging.mlgate.ai)
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: syda-staging-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-syda_staging}
+      POSTGRES_USER: ${POSTGRES_USER:-syda_staging}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a staging database password}
+    volumes:
+      - staging_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-syda_staging} -d ${POSTGRES_DB:-syda_staging}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:staging}
+    pull_policy: always
+    container_name: syda-staging-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-syda_staging}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-syda_staging}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set a staging auth secret key}
+      CORS_ORIGINS: "http://localhost:3000,https://staging.mlgate.ai"
+      COOKIE_SECURE: "true"
+    volumes:
+      - staging_job_data:/app/platform/backend/data/jobs
+      - staging_settings_data:/app/platform/backend/data/settings
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:staging}
+    pull_policy: always
+    container_name: syda-staging-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-syda_staging}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-syda_staging}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set a staging auth secret key}
+    volumes:
+      - staging_job_data:/app/platform/backend/data/jobs
+      - staging_settings_data:/app/platform/backend/data/settings
+    stop_grace_period: 65s
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/youpesh/syda-frontend:staging}
+    pull_policy: always
+    container_name: syda-staging-frontend
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: syda-staging-tunnel
+    restart: unless-stopped
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN:?Set Cloudflare tunnel token}
+    depends_on:
+      - frontend
+
+volumes:
+  staging_postgres_data:
+  staging_job_data:
+  staging_settings_data:

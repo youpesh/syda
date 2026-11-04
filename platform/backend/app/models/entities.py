@@ -27,6 +27,14 @@ class JobRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
+    provider_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    attempt_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    output_attempt: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_dispatch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     def to_dict(self):
         return {
             "jobId": self.id,

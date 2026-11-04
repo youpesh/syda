@@ -417,7 +417,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
     };
   }, [run.jobId]);
 
-  const status = job?.status ?? "generating";
+  const status = job?.status ?? "queued";
   const complete = status === "complete";
   const failed = status === "failed";
 
@@ -483,7 +483,8 @@ export default function Home() {
   const { clearError, error, messages, sendMessage, setMessages, status, stop } = useChat<SydaMessage>({
     transport: chatTransport,
   });
-  const isThinking = status === "submitted" || status === "streaming";
+  const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
+  const isThinking = status === "submitted" || status === "streaming" || isAwaitingResponse;
 
   useEffect(() => {
     const returnState = location.state as {
@@ -594,6 +595,8 @@ export default function Home() {
       .then((conversation) => {
         if (!active) return;
         const restoredMessages = [...conversation.messages] as SydaMessage[];
+        const lastMsg = restoredMessages.length > 0 ? restoredMessages[restoredMessages.length - 1] : null;
+        setIsAwaitingResponse(lastMsg?.role === "user");
         if (conversation.scenarioDraft) {
           let assistantIndex = -1;
           for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
@@ -631,6 +634,56 @@ export default function Home() {
       .finally(() => { if (active) setConversationLoading(false); });
     return () => { active = false; };
   }, [conversationId, navigate, setMessages, stop]);
+
+  useEffect(() => {
+    if (!conversationId || !isAwaitingResponse) return;
+    let active = true;
+    const interval = setInterval(() => {
+      fetch(`/api/conversations/${conversationId}`)
+        .then(async (response) => {
+          if (!response.ok) return;
+          const conversation = await response.json() as SavedConversation;
+          if (!active) return;
+          const restoredMessages = [...conversation.messages] as SydaMessage[];
+          const lastMsg = restoredMessages.length > 0 ? restoredMessages[restoredMessages.length - 1] : null;
+          if (lastMsg?.role === "assistant") {
+            setIsAwaitingResponse(false);
+            if (conversation.scenarioDraft) {
+              let assistantIndex = -1;
+              for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
+                if (restoredMessages[index].role === "assistant") {
+                  assistantIndex = index;
+                  break;
+                }
+              }
+              const assistantMessage = assistantIndex >= 0
+                ? restoredMessages[assistantIndex]
+                : { id: crypto.randomUUID(), role: "assistant" as const, parts: [] };
+              const scenarioPart = { type: "data-scenario" as const, id: "scenario", data: conversation.scenarioDraft };
+              const parts = assistantMessage.parts.filter((part) => part.type !== "data-scenario") as SydaMessage["parts"];
+              parts.push(scenarioPart as SydaMessage["parts"][number]);
+              const restoredAssistant = { ...assistantMessage, parts } as SydaMessage;
+              if (assistantIndex >= 0) restoredMessages[assistantIndex] = restoredAssistant;
+              else restoredMessages.push(restoredAssistant);
+            }
+            setMessages(restoredMessages);
+            setChatRuns(conversation.runs ?? []);
+            persistedSnapshotRef.current = JSON.stringify({
+              title: conversation.title,
+              messages: restoredMessages,
+              runs: conversation.runs ?? [],
+              scenarioDraft: conversation.scenarioDraft ?? undefined,
+            });
+            window.dispatchEvent(new Event("syda:conversations-changed"));
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [conversationId, isAwaitingResponse, setMessages]);
 
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId || status === "streaming") return;
@@ -768,7 +821,7 @@ export default function Home() {
           <main className="flex min-h-0 flex-1 items-center justify-center gap-2 text-sm text-muted-foreground"><Spinner /> Loading chat history…</main>
         ) : !messages.length ? (
           <main className="relative flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-5 py-12">
-            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_38%,oklch(0.96_0.025_265),transparent_38%)]" />
+            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_38%,oklch(0.96_0.025_265),transparent_38%)] dark:bg-[radial-gradient(circle_at_50%_38%,oklch(0.24_0.03_265),transparent_42%)]" />
             <div className="relative flex w-full max-w-2xl flex-col items-center">
               <div className="mb-5 flex size-10 items-center justify-center border bg-card shadow-sm">
                 <HugeiconsIcon icon={SparklesIcon} strokeWidth={1.8} />
@@ -847,7 +900,7 @@ export default function Home() {
                         </MessageScrollerItem>
                       );
                     })}
-                    {status === "submitted" && (
+                    {(status === "submitted" || isAwaitingResponse) && (
                       <MessageScrollerItem messageId="thinking-indicator" scrollAnchor>
                           <Message align="start">
                           <MessageAvatar className="self-start bg-primary text-primary-foreground">
@@ -876,7 +929,7 @@ export default function Home() {
                 <div className="flex items-end gap-2">
                   <PromptComposer connections={connections} source={source} onSource={setSource} compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
                   {isThinking && (
-                    <Button onClick={() => stop()} type="button" variant="outline">
+                    <Button onClick={() => { stop(); setIsAwaitingResponse(false); }} type="button" variant="outline">
                       Stop
                     </Button>
                   )}

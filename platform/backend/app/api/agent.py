@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, TypeGuard
 
@@ -11,7 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .auth import require_authenticated
-from ..database import get_db
+from ..database import SessionLocal, get_db
 from ..models.entities import ChatConversation
 from ..models.scenario import ChatRequest, ChatResponse, ScenarioConfiguration
 from ..models.user import User
@@ -168,6 +169,10 @@ async def chat_with_agent(
         )
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        # Persist the user message right away so it is immediately visible in history
+        conversation.messages = messages
+        conversation.updated_at = datetime.now(timezone.utc)
+        db.commit()
 
     current_scenario = None
     if conversation and conversation.scenario_draft:
@@ -188,21 +193,73 @@ async def chat_with_agent(
             conversation.updated_at = datetime.now(timezone.utc)
             db.commit()
 
+    conv_id = conversation.id if conversation else None
+    user_id = user.id
+
+    async def run_compilation_and_persist():
+        response = await compile_scenario_agent(
+            prompt=prompt,
+            current_scenario=current_scenario,
+            history=history,
+            provider_selection=provider_selection,
+        )
+        if conv_id:
+            try:
+                with SessionLocal() as session:
+                    target_conv = (
+                        session.query(ChatConversation)
+                        .filter(
+                            ChatConversation.id == conv_id,
+                            ChatConversation.user_id == user_id,
+                        )
+                        .first()
+                    )
+                    if target_conv:
+                        if response.scenario and _scenario_is_valid_draft(response.scenario):
+                            serialized_draft = response.scenario.model_dump(by_alias=True)
+                            if target_conv.scenario_draft != serialized_draft:
+                                target_conv.scenario_draft = serialized_draft
+                                target_conv.draft_version = (target_conv.draft_version or 0) + 1
+
+                        assistant_parts: list[dict[str, Any]] = [
+                            {"type": "text", "text": response.message, "state": "done"}
+                        ]
+                        if response.scenario is not None:
+                            assistant_parts.append({
+                                "type": "data-scenario",
+                                "id": "scenario",
+                                "data": response.scenario.model_dump(by_alias=True),
+                            })
+                        assistant_msg = {
+                            "id": f"asst-{uuid.uuid4().hex[:12]}",
+                            "role": "assistant",
+                            "parts": assistant_parts,
+                        }
+                        cur_messages = list(target_conv.messages or messages)
+                        already_present = any(
+                            m.get("role") == "assistant"
+                            and any(
+                                p.get("text") == response.message
+                                for p in m.get("parts", [])
+                                if isinstance(p, dict) and p.get("type") == "text"
+                            )
+                            for m in cur_messages
+                        )
+                        if not already_present:
+                            cur_messages.append(assistant_msg)
+                        target_conv.messages = cur_messages
+                        target_conv.updated_at = datetime.now(timezone.utc)
+                        session.commit()
+            except Exception as persist_err:
+                logger.error("Failed to persist assistant turn for %s: %s", conv_id, persist_err)
+        return response
+
+    # Launch background compilation so it completes and persists even if client navigates away
+    compilation_task = asyncio.create_task(run_compilation_and_persist())
+
     async def stream():
         try:
-            response = await compile_scenario_agent(
-                prompt=prompt,
-                current_scenario=current_scenario,
-                history=history,
-                provider_selection=provider_selection,
-            )
-            if conversation and response.scenario and _scenario_is_valid_draft(response.scenario):
-                serialized_draft = response.scenario.model_dump(by_alias=True)
-                if conversation.scenario_draft != serialized_draft:
-                    conversation.scenario_draft = serialized_draft
-                    conversation.draft_version = (conversation.draft_version or 0) + 1
-                    conversation.updated_at = datetime.now(timezone.utc)
-                    db.commit()
+            response = await asyncio.shield(compilation_task)
             text_id = "scenario-response"
             yield _sse({"type": "start"})
             yield _sse({"type": "text-start", "id": text_id})
