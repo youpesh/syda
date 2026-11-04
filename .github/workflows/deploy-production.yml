@@ -1,0 +1,92 @@
+name: Deploy Production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: dokploy-production
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build & Push Production Images to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Downcase Repository Name for Image Tags
+        id: repo_name
+        run: echo "REPO_LOWER=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & Push Backend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: platform/backend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-backend:latest
+            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build & Push Frontend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: platform/frontend
+          file: platform/frontend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-frontend:latest
+            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Trigger Dokploy Production Deployment
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Connect to Tailscale Network
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          tags: ${{ secrets.TS_OAUTH_CLIENT_ID != '' && 'tag:ci' || '' }}
+
+      - name: Trigger Dokploy Production Redeploy
+        run: |
+          echo "Triggering Dokploy Production Deploy Webhook..."
+          curl -sS -f -X POST "${{ secrets.DOKPLOY_PRODUCTION_DEPLOY_WEBHOOK_URL }}"
+          echo "Production webhook triggered successfully!"
+
+      - name: Add Deployment Summary
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ### 🚀 Production Deployment Successful
+
+          * **Triggered by:** @${{ github.actor }}
+          * **Commit:** `${{ github.sha }}`
+          * **Live Production URL:** [https://mlgate.ai](https://mlgate.ai)
+
+          Dokploy has received the signal to pull the latest production images from GHCR and reload containers.
+          EOF
