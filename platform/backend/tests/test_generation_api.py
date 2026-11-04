@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import database
+from app import database, job_queue, job_runner
 from app.api import generation
 from app.main import app
 from app.models.entities import JobRecord
@@ -62,8 +62,11 @@ def _client(monkeypatch, tmp_path) -> TestClient:
     testing_session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", testing_session)
-    monkeypatch.setattr(generation, "SessionLocal", testing_session)
     monkeypatch.setattr(generation, "DATA_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(job_runner, "DATA_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(job_queue, "DATA_DIR", tmp_path / "jobs")
+    # Exercise real worker execution synchronously; broker transport has a separate test.
+    monkeypatch.setattr(generation, "publish_job", lambda job_id, **kw: job_runner.execute_job(job_id))
     for key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     app.dependency_overrides.clear()
@@ -271,6 +274,9 @@ def test_generation_returns_actionable_error_when_database_is_unavailable(
     monkeypatch, tmp_path
 ):
     class FailingSession:
+        def get(self, *args):
+            raise SQLAlchemyError("database unavailable")
+
         def add(self, _record):
             return None
 

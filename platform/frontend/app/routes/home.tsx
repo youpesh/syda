@@ -416,7 +416,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
     };
   }, [run.jobId]);
 
-  const status = job?.status ?? "generating";
+  const status = job?.status ?? "queued";
   const complete = status === "complete";
   const failed = status === "failed";
 
