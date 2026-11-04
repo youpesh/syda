@@ -1,6 +1,7 @@
 import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { RunQualitySummary } from "~/components/studio/run-quality-summary";
+import { createChatFetch } from "~/lib/chat-fetch";
 import {
   useEffect,
   useMemo,
@@ -469,6 +470,7 @@ export default function Home() {
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const chatTransport = useMemo(() => new DefaultChatTransport<SydaMessage>({
     api: "/api/agent/chat",
+    fetch: createChatFetch(),
     prepareSendMessagesRequest: ({ body, id, messages, trigger, messageId }) => ({
       body: {
         ...body,
@@ -537,6 +539,7 @@ export default function Home() {
     }
 
     stop();
+    setIsAwaitingResponse(false);
     setConversationError(undefined);
     if (!conversationId) {
       setConversationLoading(false);
@@ -752,6 +755,7 @@ export default function Home() {
   const startNewScenario = () => {
     setSource(null);
     stop();
+    setIsAwaitingResponse(false);
     setPrompt("");
     setMessages([]);
     setChatRuns([]);

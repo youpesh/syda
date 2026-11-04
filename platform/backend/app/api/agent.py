@@ -21,6 +21,16 @@ from ..provider_settings import resolve_provider
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 logger = logging.getLogger(__name__)
+CHAT_HEARTBEAT_SECONDS = 15
+# Keep background work alive after its HTTP stream disconnects. Tasks are removed
+# on completion; navigating away must not cancel draft persistence.
+_compilation_tasks: set[asyncio.Task] = set()
+
+
+def _compilation_finished(task: asyncio.Task) -> None:
+    _compilation_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Background scenario compilation failed", exc_info=task.exception())
 
 class ChatStreamRequest(BaseModel):
     """The AI SDK UIMessage request shape sent by useChat or standard chat clients."""
@@ -256,10 +266,25 @@ async def chat_with_agent(
 
     # Launch background compilation so it completes and persists even if client navigates away
     compilation_task = asyncio.create_task(run_compilation_and_persist())
+    _compilation_tasks.add(compilation_task)
+    compilation_task.add_done_callback(_compilation_finished)
 
     async def stream():
         try:
-            response = await asyncio.shield(compilation_task)
+            # Flush the response immediately, then keep it active while the model
+            # works. SSE comments are ignored by the AI SDK's event parser.
+            yield ": keep-alive\n\n"
+            while not compilation_task.done():
+                if await request.is_disconnected():
+                    return
+                done, _ = await asyncio.wait(
+                    {compilation_task}, timeout=CHAT_HEARTBEAT_SECONDS,
+                )
+                if not done:
+                    yield ": keep-alive\n\n"
+            if await request.is_disconnected():
+                return
+            response = compilation_task.result()
             text_id = "scenario-response"
             yield _sse({"type": "start"})
             yield _sse({"type": "text-start", "id": text_id})

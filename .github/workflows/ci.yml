@@ -7,6 +7,23 @@ on:
     branches: [ main, "feat/**" ]
 
 jobs:
+  test-frontend:
+    name: Frontend chat transport
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: platform/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run test:chat
+      - run: npm run typecheck
+
   test-core:
     name: Core Tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest

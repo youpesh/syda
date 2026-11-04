@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from pydantic_ai import Agent
 from pydantic_ai.models.test import TestModel
@@ -6,9 +7,20 @@ from pydantic_ai.models.test import TestModel
 from app.agents.scenario_agent import (
     DOMAIN_TEMPLATES,
     ScenarioAgentReply,
+    ScenarioCreationPatch,
     compile_scenario_agent,
 )
 from app.models.scenario import ScenarioConfiguration
+
+
+def test_creation_schema_input_preserves_nested_json_and_native_compatibility():
+    schemas = {"Patient": {"patient_id": {"type": "integer", "constraints": {"primary_key": True}}}}
+    for supplied in (schemas, json.dumps(schemas)):
+        patch = ScenarioCreationPatch(schemas=supplied)
+        assert patch.model_dump(exclude_unset=True)["schemas"] == schemas
+    advertised = ScenarioCreationPatch.model_json_schema()["properties"]["schemas"]
+    assert any(branch.get("type") == "string" for branch in advertised["anyOf"])
+    assert not any(branch.get("type") == "object" for branch in advertised["anyOf"])
 
 
 class _ScenarioToolTestModel(TestModel):
@@ -90,6 +102,51 @@ def test_agent_updates_only_requested_field_and_preserves_checks(monkeypatch):
     assert response.scenario.record_count == 250
     assert response.scenario.checks == current.checks
     assert response.scenario.schemas == current.schemas
+    assert model.request_count == 2
+
+
+def test_initial_custom_schema_replaces_starter_tables(monkeypatch):
+    patch = {
+        "title": "Three-table claims", "recordCount": 8,
+        "workflow": ["Patient", "Claim", "Payment"],
+        "schemas": {
+            "Patient": {
+                "patient_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "name": "text", "enrolled_at": "date",
+            },
+            "Claim": {
+                "claim_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "patient_id": "foreign_key", "status": "text", "claim_date": "date",
+                "__foreign_keys__": {"patient_id": "Patient.patient_id"},
+            },
+            "Payment": {
+                "payment_id": {"type": "integer", "constraints": {"primary_key": True}},
+                "claim_id": "foreign_key", "paid_amount": {"type": "float", "constraints": {"min": 1}},
+                "payment_date": "date", "__foreign_keys__": {"claim_id": "Claim.claim_id"},
+            },
+        },
+        "paths": [
+            {"name": "paid", "steps": ["Patient", "Claim", "Payment"], "weight": 0.5,
+             "overrides": {"Claim": {"status": "paid"}}},
+            {"name": "denied", "steps": ["Patient", "Claim"], "weight": 0.25,
+             "overrides": {"Claim": {"status": "denied"}}},
+            {"name": "pending", "steps": ["Patient", "Claim"], "weight": 0.25,
+             "overrides": {"Claim": {"status": "pending"}}},
+        ],
+        "checks": [{"name": "paid_positive", "kind": "semantic_invariant", "table": "Payment",
+                    "expression": "paid_amount > 0"}],
+    }
+    model = _ScenarioToolTestModel(tool_name="create_scenario_draft", tool_args=patch,
+                                  final_message="Created three tables and three paths.")
+    _fake_llm(monkeypatch, model)
+    response = asyncio.run(compile_scenario_agent(
+        prompt="Create 8 insurance claims using only Patient, Claim, and Payment",
+        provider_selection={"agent_model": True, "id": "gemini", "model": "mock", "key": "test"},
+    ))
+    assert response.scenario is not None
+    assert set(response.scenario.schemas) == {"Patient", "Claim", "Payment"}
+    assert response.scenario.workflow == ["Patient", "Claim", "Payment"]
+    assert len(response.scenario.paths) == 3
     assert model.request_count == 2
 
 
