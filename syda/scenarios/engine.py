@@ -68,27 +68,45 @@ class TableGenerator(Protocol):
     ) -> Dict[str, pd.DataFrame]: ...
 
 
+def _is_missing(value: Any) -> bool:
+    """Check scalar nulls without treating a collection as a Boolean array."""
+    return value is None or (
+        pd.api.types.is_scalar(value) and bool(pd.isna(value))
+    )
+
+
+class ScenarioValidationError(ValueError):
+    """Generation failed causal validation; the rejected result is diagnostic only."""
+
+    def __init__(self, result: ScenarioGenerationResult):
+        self.result = result
+        self.violations = result.violations
+        super().__init__(
+            f"Scenario failed causal validation with {len(self.violations)} violation(s)."
+        )
+
+
 class _RestrictedExpressionEvaluator(ast.NodeVisitor):
     """Safely evaluates expressions for semantic invariants and custom rules without using eval().
     Prevents arbitrary code execution and restricts syntax to safe comparisons, logic, and arithmetic.
     """
 
     ALLOWED_BUILTINS: Dict[str, Callable[..., Any]] = {
-        "abs": lambda x: abs(x) if x is not None and not pd.isna(x) else None,
-        "min": lambda *args: min([x for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args) if x is not None and not pd.isna(x)]) if any(x is not None and not pd.isna(x) for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args)) else None,
-        "max": lambda *args: max([x for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args) if x is not None and not pd.isna(x)]) if any(x is not None and not pd.isna(x) for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args)) else None,
-        "round": lambda x, n=0: round(x, n) if x is not None and not pd.isna(x) else None,
-        "len": lambda x: len(x) if x is not None and not pd.isna(x) else 0,
-        "str": lambda x: "" if x is None or pd.isna(x) else str(x),
-        "int": lambda x: int(x) if x is not None and not pd.isna(x) else 0,
-        "float": lambda x: float(x) if x is not None and not pd.isna(x) else 0.0,
+        "abs": lambda x: abs(x) if not _is_missing(x) else None,
+        "min": lambda *args: min([x for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args) if not _is_missing(x)]) if any(not _is_missing(x) for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args)) else None,
+        "max": lambda *args: max([x for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args) if not _is_missing(x)]) if any(not _is_missing(x) for x in (args[0] if len(args) == 1 and isinstance(args[0], (list, tuple, set)) else args)) else None,
+        "round": lambda x, n=0: round(x, n) if not _is_missing(x) else None,
+        "len": lambda x: len(x) if not _is_missing(x) else 0,
+        "str": lambda x: "" if _is_missing(x) else str(x),
+        "int": lambda x: int(x) if not _is_missing(x) else 0,
+        "float": lambda x: float(x) if not _is_missing(x) else 0.0,
         "bool": bool,
         "any": any,
         "all": all,
-        "lower": lambda x: str(x).lower() if x is not None and not pd.isna(x) else "",
-        "upper": lambda x: str(x).upper() if x is not None and not pd.isna(x) else "",
-        "strip": lambda x: str(x).strip() if x is not None and not pd.isna(x) else "",
-        "is_none": lambda x: x is None or pd.isna(x),
+        "lower": lambda x: str(x).lower() if not _is_missing(x) else "",
+        "upper": lambda x: str(x).upper() if not _is_missing(x) else "",
+        "strip": lambda x: str(x).strip() if not _is_missing(x) else "",
+        "is_none": lambda x: _is_missing(x),
     }
 
     SAFE_METHODS = {
@@ -506,6 +524,16 @@ class ScenarioEngine:
         self._validate_result(definition, plan, tables)
         _, violations = self.validate_causal_workflow(definition, tables)
 
+        result = ScenarioGenerationResult(
+            tables=tables,
+            instanceCount=plan.instance_count,
+            instanceIds=plan.instance_ids,
+            pathCounts=plan.path_counts,
+            violations=violations,
+        )
+        if violations:
+            raise ScenarioValidationError(result)
+
         if output_dir:
             Path(output_dir).mkdir(parents=True, exist_ok=True)
             populated_tables = {
@@ -513,13 +541,7 @@ class ScenarioEngine:
             }
             save_dataframes(populated_tables, str(output_dir), format=output_format)
 
-        return ScenarioGenerationResult(
-            tables=tables,
-            instanceCount=plan.instance_count,
-            instanceIds=plan.instance_ids,
-            pathCounts=plan.path_counts,
-            violations=violations,
-        )
+        return result
 
     def plan(
         self,
@@ -938,6 +960,33 @@ class ScenarioEngine:
 
             # 2. TEMPORAL ORDER (chain or pairwise before/after)
             elif check.kind == "temporal_order":
+                # A non-null but malformed date must not silently disappear from
+                # comparisons after conversion to NaT. Nulls remain optional;
+                # a separate presence rule can require them for a given path.
+                references = check.chain or [check.before, check.after]
+                for reference in dict.fromkeys(references):
+                    if not reference:
+                        continue
+                    table, field = (
+                        _split_reference(reference) if "." in reference
+                        else (check.table or "", reference)
+                    )
+                    real_table, frame = _resolve_table(table)
+                    column = _resolve_col(frame, field)
+                    if frame is None or column is None:
+                        continue
+                    for idx, row in frame.iterrows():
+                        value = row[column]
+                        if not _is_missing(value) and (
+                            not pd.api.types.is_scalar(value)
+                            or pd.isna(pd.to_datetime(value, errors="coerce", utc=True))
+                        ):
+                            violations_list.append({
+                                "table": real_table or table,
+                                "row": row.get(instance_field, idx),
+                                "rule": check.name,
+                                "error": f"Invalid timestamp in '{table}.{field}': {value!r}.",
+                            })
                 if check.chain:
                     resolved_chain: List[Tuple[str, str]] = []
                     for ref in check.chain:
@@ -1393,7 +1442,7 @@ class ScenarioEngine:
                         row_dict = {}
                         for k, v in row.items():
                             col_str = str(k)
-                            row_dict[col_str] = None if pd.isna(v) else v
+                            row_dict[col_str] = None if _is_missing(v) else v
                         row_dict["row"] = row_dict
                         row_dict["record"] = row_dict
 
@@ -1520,7 +1569,7 @@ class ScenarioEngine:
                         row_dict = {}
                         for k, v in row.items():
                             col_str = str(k)
-                            row_dict[col_str] = None if pd.isna(v) else v
+                            row_dict[col_str] = None if _is_missing(v) else v
                         row_dict["row"] = row_dict
                         row_dict["record"] = row_dict
                         if table_name:

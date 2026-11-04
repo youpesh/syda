@@ -18,8 +18,71 @@ from syda.scenarios import (
     ScenarioDefinition,
     ScenarioEngine,
     ScenarioStep,
+    ScenarioValidationError,
     ViolationReport,
 )
+
+
+@pytest.mark.parametrize("expression", [
+    "len(['submitted', 'paid']) == 2",
+    "len(status.split(',')) == 2",
+    "len([]) == 0",
+    "len(None) == 0",
+    "str(['paid', 'denied']) == \"['paid', 'denied']\"",
+])
+def test_collection_helpers_in_custom_rules(expression):
+    definition = ScenarioDefinition(
+        name="Collection rules", schemas=_base_schemas(),
+        steps=[ScenarioStep(name="Claim", table="Claim")],
+        checks=[ScenarioCheck(name="collection", kind="custom_rule", table="Claim",
+                              expression=expression)],
+    )
+    _, violations = ScenarioEngine.validate_causal_workflow(definition, {
+        "Claim": pd.DataFrame([{"scenario_instance_id": "c1", "status": "submitted,paid"}]),
+    })
+    assert violations == []
+
+
+def test_generate_rejects_causal_failure_before_saving(tmp_path):
+    # Fully planned fields avoid calling any provider while exercising real generation.
+    definition = ScenarioDefinition(
+        name="Rejected claim",
+        schemas={"Claim": {
+            "id": {"type": "integer", "constraints": {"primary_key": True}},
+            "status": "text", "payment_amount": "float",
+        }},
+        steps=[ScenarioStep(name="Claim", table="Claim",
+                            values={"status": "paid", "payment_amount": 0})],
+        checks=[ScenarioCheck(name="positive_payment", kind="semantic_invariant",
+                              table="Claim", condition="status == 'paid'",
+                              assertion="payment_amount > 0")],
+    )
+    with pytest.raises(ScenarioValidationError) as caught:
+        ScenarioEngine(DummyTableGenerator()).generate(definition, 1, output_dir=tmp_path)
+    assert caught.value.violations[0].rule == "positive_payment"
+    assert caught.value.result.tables["Claim"].iloc[0]["payment_amount"] == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", ["pair", "chain"])
+@pytest.mark.parametrize("value,invalid", [("not-a-date", True), (None, False)])
+def test_temporal_rules_distinguish_invalid_dates_from_optional_nulls(kind, value, invalid):
+    order = (
+        {"before": "Claim.claim_date", "after": "Claim.payment_date"}
+        if kind == "pair" else {"chain": ["Claim.claim_date", "Claim.payment_date"]}
+    )
+    definition = ScenarioDefinition(
+        name="Timestamp validation", schemas=_base_schemas(),
+        steps=[ScenarioStep(name="Claim", table="Claim")],
+        checks=[ScenarioCheck(name="payment_after_claim", kind="temporal_order", **order)],
+    )
+    _, violations = ScenarioEngine.validate_causal_workflow(definition, {
+        "Claim": pd.DataFrame([{"scenario_instance_id": "c1", "claim_date": "2026-01-01",
+                                "payment_date": value}]),
+    })
+    assert bool(violations) == invalid
+    if invalid:
+        assert "Invalid timestamp" in violations[0].error
 
 
 def _base_schemas():
@@ -1405,7 +1468,3 @@ def test_evaluator_safe_methods_and_null_resilience():
     assert evaluator.eval("'orange' not in items") is True
     assert evaluator.eval("null_val in [1, 2]") is False
     assert evaluator.eval("5 in null_val") is False  # Does not crash when RHS is None or not iterable
-
-
-
-

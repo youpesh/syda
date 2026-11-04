@@ -2,6 +2,7 @@ import csv
 import io
 import uuid
 import zipfile
+import pytest
 
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
@@ -26,6 +27,45 @@ _TEST_USER = User(
     is_verified=True,
     display_name="Syda Test",
 )
+
+
+@pytest.mark.parametrize("amount,expected_status", [(0, "failed"), (25, "complete")])
+def test_worker_enforces_causal_gate_and_retains_report(monkeypatch, tmp_path, amount, expected_status):
+    scenario = _scenario(record_count=3, paths=[{
+        "name": "paid", "steps": ["Parent", "Child"], "weight": 1,
+        "overrides": {"Parent": {"status": "paid", "amount": amount}},
+    }])
+    scenario["schemas"]["Parent"].update({"status": "text", "amount": "float"})
+    scenario["checks"] = [{
+        "name": "positive_payment<script>", "kind": "semantic_invariant", "table": "Parent",
+        "condition": "status == 'paid'", "assertion": "amount > 0",
+    }]
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+        assert job["status"] == expected_status
+        report = client.get(f"/api/evaluation/{job_id}/report")
+        assert report.status_code == 200
+        html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
+        assert html_report.status_code == 200
+        if expected_status == "failed":
+            assert job["stats"]["evaluationResult"] == "fail"
+            assert job["downloadUrl"] is None
+            assert not client.get(f"/api/jobs/{job_id}").json()["filesAvailable"]
+            assert report.json()["violations"][0]["rule"] == "positive_payment<script>"
+            assert "positive_payment&lt;script&gt;" in html_report.text
+            assert "positive_payment<script>" not in html_report.text
+            assert client.get(f"/api/download/{job_id}").status_code == 409
+            assert client.get(f"/api/preview/{job_id}").status_code == 409
+            assert not list((tmp_path / "jobs").rglob("*.csv"))
+            with database.SessionLocal() as db:
+                assert db.get(JobRecord, job_id).attempt_count == 1
+        else:
+            assert report.json()["violations"] == []
+            assert job["stats"]["evaluationResult"] == "partial"
+            assert client.get(f"/api/download/{job_id}").status_code == 200
 
 
 def _scenario(record_count: int = 11, paths: list[dict] | None = None) -> dict:
@@ -206,6 +246,26 @@ def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):
             parent_instance_by_id[row["parent_id"]] == row["scenario_instance_id"]
             for row in child_rows
         )
+
+
+def test_intentionally_absent_table_does_not_reject_valid_path(monkeypatch, tmp_path):
+    scenario = _scenario(record_count=3, paths=[{
+        "name": "cancelled", "steps": ["Parent"], "weight": 1,
+        "overrides": {"Parent": {"name": "cancelled"}},
+    }])
+    scenario["checks"] = [{
+        "name": "cancelled_has_no_child", "kind": "absence_by_value",
+        "source": "Parent.name", "value": "cancelled", "absent_table": "Child",
+    }]
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+        assert job["status"] == "complete"
+        assert job["stats"]["tableRowCounts"] == {"Parent": 3, "Child": 0}
+        assert job["stats"]["violations"] == []
+        assert client.get(f"/api/download/{job_id}").status_code == 200
 
 
 def test_generation_estimate_discloses_offline_fallback(monkeypatch, tmp_path):

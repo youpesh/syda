@@ -247,7 +247,7 @@ async def download_evaluation_report(
     job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.status != "complete" or not job.stats:
+    if job.status not in {"complete", "failed"} or not job.stats:
         raise HTTPException(status_code=409, detail="Evaluation report is not ready")
     stats = JobStats.model_validate(job.stats)
     report = {

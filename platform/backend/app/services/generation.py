@@ -9,7 +9,7 @@ import pandas as pd
 from syda.schemas import validate_schema, ModelConfig
 from syda.generate import SyntheticDataGenerator
 from syda.output import save_dataframes
-from syda.scenarios import ScenarioEngine
+from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
 from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, ViolationRecord
 logger = logging.getLogger(__name__)
@@ -225,8 +225,10 @@ def _temporal_consistency(
 
     for child_table, child_schema in schemas.items():
         child_df = dfs.get(child_table)
-        child_dates = temporal_columns(child_schema)
-        if child_df is None or not child_dates:
+        if child_df is None:
+            continue
+        child_dates = [c for c in temporal_columns(child_schema) if c in child_df]
+        if not child_dates:
             continue
         for child_fk, target in child_schema.get("__foreign_keys__", {}).items():
             if not isinstance(target, str) or "." not in target or child_fk not in child_df:
@@ -234,8 +236,10 @@ def _temporal_consistency(
             parent_table, parent_pk = target.split(".", 1)
             parent_schema = schemas.get(parent_table, {})
             parent_df = dfs.get(parent_table)
-            parent_dates = temporal_columns(parent_schema)
-            if parent_df is None or parent_pk not in parent_df or not parent_dates:
+            if parent_df is None or parent_pk not in parent_df:
+                continue
+            parent_dates = [c for c in temporal_columns(parent_schema) if c in parent_df]
+            if not parent_dates:
                 continue
             child_date = child_dates[0]
             parent_date = parent_dates[-1]
@@ -266,14 +270,27 @@ def _evaluation_metrics(
 ) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
-    causal_value, causal_violations, causal_checked = _temporal_consistency(dfs, schemas)
-    executable_checks = ScenarioEngine.evaluate_checks(
-        _scenario_definition(scenario, schemas), dfs
+    definition = _scenario_definition(scenario, schemas)
+    executable_checks = ScenarioEngine.evaluate_checks(definition, dfs)
+    # Use the same temporal/FSM rules as core validation. Choosing arbitrary date
+    # columns by schema order can contradict an explicitly declared workflow.
+    causal_names = {
+        check.name for check in [*definition.checks, *ScenarioEngine.infer_causal_checks(definition)]
+        if check.kind in {"temporal_order", "state_transition", "state_machine"}
+    }
+    causal_checks = [item for item in executable_checks if item["name"] in causal_names]
+    causal_checked = len(causal_checks)
+    causal_violations = sum(item["violations"] for item in causal_checks)
+    causal_value = (
+        f"{100 * sum(item['violations'] == 0 for item in causal_checks) / causal_checked:.1f}%"
+        if causal_checked else "Not evaluated"
     )
     check_violations = sum(item["violations"] for item in executable_checks)
     checked_rules = len(executable_checks)
-    missing_steps = [step for step in scenario.workflow if step not in dfs or dfs[step].empty]
-    coverage_value = f"{100 * (len(scenario.workflow) - len(missing_steps)) / max(1, len(scenario.workflow)):.1f}%"
+    expected_counts = ScenarioEngine.summarize(definition, scenario.record_count).table_row_counts
+    expected_tables = [table for table, count in expected_counts.items() if count > 0]
+    missing_steps = [table for table in expected_tables if table not in dfs or dfs[table].empty]
+    coverage_value = f"{100 * (len(expected_tables) - len(missing_steps)) / max(1, len(expected_tables)):.1f}%"
 
     violation_records: list[ViolationRecord] = []
     for check_item in executable_checks:
@@ -316,7 +333,7 @@ def _evaluation_metrics(
             label="Causal consistency",
             status=measured_status(causal_violations, causal_checked),
             value=causal_value,
-            detail="Checks temporal ordering between related parent and child records.",
+            detail="Checks declared and inferred temporal ordering and state-transition rules.",
             violations=causal_violations,
         ),
         EvaluationMetric(
@@ -324,7 +341,7 @@ def _evaluation_metrics(
             label="Scenario coverage",
             status=binary_status(not missing_steps),
             value=coverage_value,
-            detail="Checks that every declared workflow step produced records.",
+            detail="Checks that every table required by the allocated scenario paths produced records.",
             violations=len(missing_steps),
         ),
         EvaluationMetric(
@@ -418,32 +435,25 @@ def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[
     if provider["id"] != "offline":
         model_cfg = ModelConfig(provider=provider["id"], model_name=provider["model"], batch_size=10, extra_kwargs={"api_key": provider["key"], **({"base_url": provider["base_url"]} if provider.get("base_url") else {})})
         generator = SyntheticDataGenerator(model_config=model_cfg)
+    else:
+        generator = _LocalTableGenerator()
+    try:
         result = ScenarioEngine(generator).generate(
             definition,
             scenario.record_count,
             progress_callback=report_generation_progress,
         )
-        dfs = result.tables
-        path_counts = result.path_counts
+    except ScenarioValidationError as error:
+        result = error.result
+    dfs = result.tables
+    path_counts = result.path_counts
 
-    if not dfs:
-        result = ScenarioEngine(_LocalTableGenerator()).generate(
-            definition,
-            scenario.record_count,
-            progress_callback=report_generation_progress,
-        )
-        dfs = result.tables
-        path_counts = result.path_counts
-
-    # Stage 3: Validate referential integrity & save output
+    # Stage 3: Evaluate before publishing any dataset files
     update_job(job_id, {
         "status": "evaluating",
         "progress": 85,
-        "current_stage": "Verifying foreign-key constraints and writing multi-table datasets",
+        "current_stage": "Evaluating causal rules and relational constraints",
     })
-
-    # Save generated DataFrames using syda.output.save_dataframes
-    save_dataframes({name: df for name, df in dfs.items() if not df.empty}, str(job_dir), format="csv")
 
     elapsed = round(time.time() - t0, 1)
     total_records = sum(len(df) for df in dfs.values())
@@ -465,6 +475,21 @@ def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[
         evaluationMetrics=metrics,
         evaluationResult=evaluation_result,
         violations=violation_records,
+    )
+
+    if evaluation_result == "fail":
+        update_job(job_id, {
+            "status": "failed",
+            "progress": 100,
+            "current_stage": "Dataset rejected by validation; review the evaluation report",
+            "stats": stats.model_dump(by_alias=True),
+            "download_url": None,
+        })
+        return
+
+    save_dataframes(
+        {name: df for name, df in dfs.items() if not df.empty},
+        str(job_dir), format="csv",
     )
 
     update_job(job_id, {

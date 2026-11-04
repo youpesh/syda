@@ -156,3 +156,44 @@ def test_job_stats_serializes_violations():
     assert len(dumped["violations"]) == 1
     assert dumped["violations"][0]["table"] == "Claim"
     assert dumped["violations"][0]["rule"] == "paid_claim_has_positive_payment"
+
+
+def test_causal_metric_uses_declared_order_instead_of_arbitrary_date_columns():
+    scenario = ScenarioConfiguration.model_validate({
+        "title": "Shipment before order closure", "description": "A valid order lifecycle",
+        "recordCount": 1, "secondaryMetric": {"label": "Tables", "value": "2"},
+        "workflow": ["Order", "Shipment"], "rules": [],
+        "schemas": {
+            "Order": {
+                "id": {"type": "integer", "constraints": {"primary_key": True}},
+                "created_at": "date", "closed_at": "date",
+            },
+            "Shipment": {
+                "id": {"type": "integer", "constraints": {"primary_key": True}},
+                "order_id": "foreign_key", "shipped_at": "date",
+                "__foreign_keys__": {"order_id": "Order.id"},
+            },
+        },
+        "checks": [{"name": "created_before_shipment", "kind": "temporal_order",
+                    "before": "Order.created_at", "after": "Shipment.shipped_at"}],
+    })
+    tables = {
+        "Order": pd.DataFrame([{"scenario_instance_id": "o1", "id": 1,
+                                "created_at": "2026-01-01", "closed_at": "2026-01-10"}]),
+        "Shipment": pd.DataFrame([{"scenario_instance_id": "o1", "id": 1,
+                                   "order_id": 1, "shipped_at": "2026-01-05"}]),
+    }
+    metrics, result, _, violations = _evaluation_metrics(
+        tables, scenario.schemas, scenario, return_details=True,
+    )
+    assert result == "partial"
+    assert violations == []
+    assert next(m for m in metrics if m.key == "causal_consistency").status == "pass"
+
+    tables["Shipment"].loc[0, "shipped_at"] = "2025-12-31"
+    metrics, result, _, violations = _evaluation_metrics(
+        tables, scenario.schemas, scenario, return_details=True,
+    )
+    assert result == "fail"
+    assert violations
+    assert next(m for m in metrics if m.key == "causal_consistency").status == "fail"

@@ -65,4 +65,3 @@ jobs:
       - name: Run Backend Pytest
         run: |
           pytest platform/backend/tests/ -v
-

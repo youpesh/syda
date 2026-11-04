@@ -437,7 +437,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
             <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data`}>Browse full dataset</Link>
           </div>
         </div>
-        {complete && <RunQualitySummary stats={job?.stats} scenario={run.scenario} />}
+        {(complete || failed) && job?.stats && <RunQualitySummary stats={job.stats} scenario={run.scenario} />}
         {failed && <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${run.scenarioId}`}>Review scenario and retry</Link>}
         {complete && job?.filesAvailable && <DataPreview compact complete jobId={run.jobId} showDownloads={false} />}
       </CardContent>
