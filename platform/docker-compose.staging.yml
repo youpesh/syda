@@ -1,68 +1,57 @@
-# Install as a separate Dokploy RAW Compose service. Never use this as an
-# override for production. Only the two image references change during deploys.
+# Dokploy Staging Docker Compose Stack
+# Isolated staging environment with Cloudflare Tunnel public ingress (https://staging.mlgate.ai)
 services:
   postgres:
     image: postgres:16-alpine
+    container_name: syda-staging-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_DB: syda_staging
-      POSTGRES_USER: syda_staging
-      POSTGRES_PASSWORD: ${STAGING_POSTGRES_PASSWORD:?Configure a staging-only password}
+      POSTGRES_DB: ${POSTGRES_DB:-syda_staging}
+      POSTGRES_USER: ${POSTGRES_USER:-syda_staging}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a staging database password}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - staging_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: [CMD-SHELL, pg_isready -U syda_staging -d syda_staging]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-syda_staging} -d ${POSTGRES_DB:-syda_staging}"]
       interval: 5s
       timeout: 5s
-      retries: 10
-    security_opt: [no-new-privileges:true]
-    mem_limit: 512m
-    cpus: 0.5
+      retries: 5
 
   backend:
-    image: ${STAGING_BACKEND_IMAGE:?Supply a backend image digest}
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:staging}
+    container_name: syda-staging-backend
     restart: unless-stopped
-    user: "10001:10001"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    tmpfs: ["/tmp:size=128m,mode=1777"]
-    command: [/app/platform/backend/.venv/bin/uvicorn, app.main:app, --host, 0.0.0.0, --port, "8000"]
     environment:
-      DATABASE_URL: postgresql://syda_staging:${STAGING_POSTGRES_PASSWORD}@postgres:5432/syda_staging
-      AUTH_SECRET_KEY: ${STAGING_AUTH_SECRET_KEY:?Configure a staging-only auth key}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-syda_staging}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-syda_staging}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?Set a staging auth secret key}
+      CORS_ORIGINS: "http://localhost:3000,https://staging.mlgate.ai"
       COOKIE_SECURE: "true"
-      CORS_ORIGINS: ${STAGING_PUBLIC_URL:?Configure staging public URL}
-      HOME: /tmp
     volumes:
-      - job_data:/app/platform/backend/data/jobs
-      - settings_data:/app/platform/backend/data/settings
+      - staging_job_data:/app/platform/backend/data/jobs
+      - staging_settings_data:/app/platform/backend/data/settings
     depends_on:
       postgres:
         condition: service_healthy
-    mem_limit: 1536m
-    cpus: 1
-    pids_limit: 256
 
   frontend:
-    image: ${STAGING_FRONTEND_IMAGE:?Supply a frontend image digest}
+    image: ${FRONTEND_IMAGE:-ghcr.io/youpesh/syda-frontend:staging}
+    container_name: syda-staging-frontend
     restart: unless-stopped
-    user: "1000:1000"
-    read_only: true
-    cap_drop: [ALL]
-    security_opt: [no-new-privileges:true]
-    tmpfs: ["/tmp:size=64m,mode=1777"]
-    ports: ["127.0.0.1:3011:3000"]
     environment:
-      PORT: "3000"
+      PORT: 3000
       BACKEND_URL: http://backend:8000
-      HOME: /tmp
-    depends_on: [backend]
-    mem_limit: 512m
-    cpus: 0.5
-    pids_limit: 128
+    depends_on:
+      - backend
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: syda-staging-tunnel
+    restart: unless-stopped
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN:?Set Cloudflare tunnel token}
+    depends_on:
+      - frontend
 
 volumes:
-  postgres_data:
-  job_data:
-  settings_data:
+  staging_postgres_data:
+  staging_job_data:
+  staging_settings_data:

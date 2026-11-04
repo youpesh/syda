@@ -1,238 +1,105 @@
-# Manual staging deployments
+# Staging Environment Setup & Deployment
 
-## Architecture
+This document describes the official, standard architecture for deploying Syda Platform to the **Staging** environment using **Dokploy**, **Tailscale**, **Cloudflare Tunnels**, and **GitHub Actions**.
 
-Production remains the existing `syda-stack` raw Compose service in Dokploy
-v0.30.6, on the same machine as the new staging stack. Production's Compose,
-containers, data, domains and ngrok tunnel are not changed. Its current ngrok
-endpoint forwards to the production frontend, not Dokploy.
+---
 
-Staging is a separate Dokploy project/environment/service, with its own database,
-volumes, auth secret and network. GitHub-hosted runners build the selected commit;
-Dokploy only pulls the finished images and starts containers. This avoids builds
-competing with production for CPU/memory and reuses the repository's existing
-backend/frontend Dockerfiles. The root Dockerfile builds docs, not the platform.
+## Architecture Overview
 
-The workflow has four jobs:
+```
+                      ┌───────────────────────────────────────────────┐
+                      │              PUBLIC USERS / TESTERS           │
+                      └──────────────────────┬────────────────────────┘
+                                             │ HTTPS
+                                             ▼
+                                  https://staging.mlgate.ai
+                                             │
+                                    [Cloudflare Edge]
+                                             │ (Encrypted Tunnel)
+                                             ▼
+┌─────────────────────────────────────── Dokploy Host ───────────────────────────────────────┐
+│                                                                                            │
+│   ┌──────────────────────────────── Staging Stack ─────────────────────────────────────┐   │
+│   │                                                                                    │   │
+│   │   [cloudflared] ──(internal http)──► [frontend:3000] ──► [backend:8000]            │   │
+│   │                                                               │                    │   │
+│   │                                                               ▼                    │   │
+│   │                                                       [postgres:5432]              │   │
+│   └────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                            │
+│   [Dokploy Management Panel] (Port 3000, private on Tailnet)                               │
+│       ▲                                                                                    │
+└───────┼────────────────────────────────────────────────────────────────────────────────────┘
+        │
+        │ Webhook POST (via Tailscale WireGuard)
+        │
+┌───────┴──────────────────────────────┐
+│        GitHub Actions CI/CD          │
+│  - Builds & pushes images to GHCR    │
+│  - Connects to Tailscale             │
+│  - Triggers Dokploy Deploy Webhook   │
+└──────────────────────────────────────┘
+```
 
-1. **Resolve:** runs trusted controller code from the protected repository default
-   branch, resolving a branch or open
-   same-repository PR to a full commit SHA.
-2. **Build:** checks out only that SHA, builds both images without deployment
-   credentials or registry write access, and uploads a one-day image artifact.
-   No selected repository script runs outside Docker's build sandbox.
-3. **Publish:** on a fresh runner, loads the artifact and pushes it to GHCR using
-   the short-lived `GITHUB_TOKEN`. It does not execute either image. Unique tags
-   contain the SHA/run/attempt; the deployment receives immutable SHA256 digests.
-4. **Deploy:** on another fresh runner, executes only trusted controller code.
-   It selects the two digests, triggers staging through a restricted gateway,
-   polls this run's Dokploy deployment record, and checks API/frontend health.
+### Key Highlights
+1. **Public Ingress via Cloudflare Tunnel (`cloudflared`)**:
+   - The application is publicly accessible at `https://staging.mlgate.ai`.
+   - External users do **not** need Tailscale, VPN, or special accounts.
+   - Zero ports (neither 80, 443, nor 3000) are opened on your router or host firewall.
+   - Cloudflare provides free edge SSL termination and DDoS protection.
+2. **Dokploy Native Multi-Environment**:
+   - Inside Dokploy, Staging is a first-class environment within the `syda` project.
+   - It runs completely isolated with its own Docker Compose stack, database, volumes, and passwords.
+3. **CI/CD via GitHub Actions + Deploy Webhook**:
+   - Runs manually on demand (`workflow_dispatch`) from any branch.
+   - Builds production images on GitHub runners and pushes them to GitHub Container Registry (GHCR).
+   - Connects to your private Tailscale network using the official `tailscale/github-action`.
+   - Triggers Dokploy's native deployment webhook to pull images and update containers.
 
-The deployment workflow has **no push, PR or merge triggers**. A separate
-build-only PR check validates the controller/gateway and Docker images with a
-read-only token, no package publishing and no deployment credentials. Its build
-job is reused by the manual workflow. Repository writers can manually
-select a branch or PR without deployment approvals. The GitHub `staging`
-Environment permits only the exact default branch, has no required reviewers or
-wait timer, and disallows admin bypass. Normal reviews for changes to the default
-branch remain enforced. Public read access does not grant deployment permission.
+---
 
-PRs deploy their head SHA, not GitHub's synthetic merge commit. Fork PRs are
-rejected. Later branch pushes do not change a previously resolved selection.
-Every selection replaces one shared staging environment; separate PR databases,
-domains or per-PR stacks are not provisioned.
+## Initial Setup Guide
 
-## Shared-host security boundary
+### 1. Cloudflare DNS (One-time)
+A Cloudflare Tunnel named `syda-staging` has already been created. Add a CNAME record in your Cloudflare dashboard for `mlgate.ai`:
+* **Type:** `CNAME`
+* **Name:** `staging` (or `staging.mlgate.ai`)
+* **Target:** `b4f2d2d8-37f7-42ee-b1da-10340c2a19a1.cfargotunnel.com`
+* **Proxy Status:** `Proxied` (Orange Cloud ON)
 
-The staging service uses the **fixed, owner-installed**
-`platform/docker-compose.staging.yml`. It has no builds, host filesystem mounts,
-Docker socket, privileged containers or production credentials. App containers
-run without root/capabilities, with read-only root filesystems, temporary writable
-storage and resource limits. Staging jobs/settings volumes must be initialized
-with UID/GID 10001 ownership. PostgreSQL uses a separate staging-only password.
+### 2. Dokploy Staging Service Setup
+1. Log into your Dokploy dashboard.
+2. Select your `syda` project (or create one).
+3. Create an environment named **`staging`**.
+4. Click **Create Service** → **Compose**.
+5. Set Name: `syda-staging`.
+6. Under **Source Type**, select **Raw** (or Git pointing to `platform/docker-compose.staging.yml`).
+7. Paste the contents of `platform/docker-compose.staging.yml`.
+8. In the **Environment** tab, set the required variables:
+   ```env
+   POSTGRES_PASSWORD=<generate-a-secure-random-password>
+   AUTH_SECRET_KEY=<generate-a-secure-64-char-hex-key>
+   CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoiYjIxN2RjYzMxODY0ZjM5NGFkZWRlYTQ3N2Y2ODkxZmIiLCJ0IjoiYjRmMmQyZDgtMzdmNy00MmVlLWIxZGEtMTAzNDBjMmExOWExIiwicyI6Ik5kZjczdisyS1l4bER6cG9JRjZUeGN6Vm9FKzB2VWkydmtNeUxReEhNejQ9In0=
+   ```
+9. Under **Deployments**, copy the **Deploy Webhook URL**.
 
-A selected PR's Dockerfile runs on a disposable GitHub runner, never the server.
-Its Compose file is not used. Selected application code does run in staging and
-can read/modify staging data and any staging runtime credentials; all repository
-writers must be trusted with those. Shared containers still share a kernel and
-host resources. This is not VM isolation: a container/kernel escape or host-wide
-outage can affect production. Resource limits reduce contention but do not remove
-that shared-host risk.
+### 3. GitHub Secrets Configuration
+In your GitHub repository, navigate to **Settings → Secrets and variables → Actions**:
+Create the `staging` Environment (or set as repository secrets):
 
-A tiny standard-library gateway (`scripts/staging_gateway.py`) is necessary on
-this Dokploy edition because its base member role also permits mount management.
-Putting a normal member key directly in Actions would give the workflow more
-control than selecting images and deploying. Instead:
+| Secret Name | Description |
+|---|---|
+| `DOKPLOY_STAGING_DEPLOY_WEBHOOK_URL` | The Deploy Webhook URL copied from Dokploy |
+| `TS_OAUTH_CLIENT_ID` | Tailscale OAuth Client ID (with `auth_keys` permission and `tag:ci`) |
+| `TS_OAUTH_SECRET` | Tailscale OAuth Client Secret |
 
-- The real Dokploy key belongs to a dedicated non-admin automation account whose
-  allowlist contains only the staging project, environment and service. It has
-  no service-creation, Docker, SSH-key, Git-provider or production access.
-- That key stays in a private server-side configuration file and is **never**
-  stored in GitHub, passed to a build, or returned by the gateway.
-- GitHub receives an independent random **staging deployment token**. The gateway
-  accepts only four API operations: staging config read, filtered staging history,
-  selection of two validated GHCR digests plus SHA, and a volume-preserving
-  staging deployment matching both selected image digests. Arbitrary environment keys, Compose edits, mounts, other
-  service IDs, redirects and volume resets are rejected.
-- The gateway verifies the fixed Compose text and absence of extra mounts/custom
-  commands before deployment. It merges image selection into Dokploy's existing
-  staging environment server-side, keeping runtime secrets off Actions runners.
-- It listens on loopback and forwards other HTTP requests to the staging frontend;
-  the real Dokploy UI/API is not publicly proxied. It does not have Docker socket
-  or host filesystem administration access.
+---
 
-GitHub Environments alone do not stop someone who can alter approved workflow
-code from exfiltrating available secrets or requesting a broader repository
-`GITHUB_TOKEN`. Protect the default branch and review **all** workflows/controller
-changes. The constrained gateway token provides the production boundary even if
-that token is stolen. Keep production deployment credentials and production image
-packages inaccessible to this workflow. Repository/server administrators remain
-trusted. If a Dokploy key is pasted into chat, revoke it in Dokploy; do not use it
-as the permanent GitHub deployment credential.
+## Triggering a Deployment
 
-## One-time setup
+1. Go to **Actions → Deploy Staging**.
+2. Click **Run workflow**.
+3. Select the branch to deploy (defaults to `main`).
+4. Click **Run workflow**.
 
-1. Merge the workflow/controller through the default branch's normal code review.
-   GitHub must have this dispatched workflow on its default branch before the
-   first full manual Actions run.
-2. Create a separate Dokploy project `syda-staging`, environment `staging`, and raw
-   Compose service with a stable app/project name. Install the fixed staging
-   Compose file exactly. Disable **Auto Deploy** and configure no deployment
-   webhooks, preview triggers or external deployment automation for this service.
-   Do not convert, repoint, recreate or redeploy production to install staging.
-3. Set `createEnvFile=true` and staging-only values in Dokploy:
-   `STAGING_POSTGRES_PASSWORD`, `STAGING_AUTH_SECRET_KEY`, `STAGING_PUBLIC_URL`,
-   `STAGING_BACKEND_IMAGE`, `STAGING_FRONTEND_IMAGE`, and `STAGING_SOURCE_SHA`.
-   Use fresh generated database/auth secrets, not production copies. The controller
-   changes only the image references and source SHA. Provider credentials, if
-   required for functional testing, must also be staging-only.
-4. Give the dedicated automation account access only to this new project,
-   environment and Compose service. Enable API access, disable service/project/
-   environment creation/deletion, Docker, SSH keys, Git providers and Traefik-file
-   access. Verify production `compose.one` is denied and staging `compose.update`
-   is denied. Default member mount permissions are the reason its API key remains
-   private behind the gateway. Verify the gateway token also rejects production
-   IDs, arbitrary Compose/mount APIs and extra environment keys. Configure an
-   appropriate API-key request limit (installed defaults were only 10/day, too
-   small for polling); the gateway key uses 120 requests per minute.
-5. Run the gateway from reviewed controller code, under an unprivileged identity,
-   with no capabilities, a read-only root filesystem and no Docker socket.
-   `settings.json` is private (0600), containing `dokploy_url` (loopback API),
-   `dokploy_api_key`, `deploy_token`, `compose_id`, `environment_id`,
-   `compose_template` (exact fixed file contents), `app_name` (stable volume prefix), `repository`, `frontend_url`
-   (`http://127.0.0.1:3011`) and `public_host` (public staging hostname/port).
-   Start it with `python3 staging_gateway.py /config/settings.json /state`;
-   give it a private writable `/state` directory for its durable deployment lock.
-6. Expose only the loopback gateway at `127.0.0.1:3012` using the dedicated
-   staging ngrok account/domain. Keep the production tunnel unchanged. Do not
-   share a production hostname with unreviewed staging code; browser sessions
-   must remain on separate origins. Keep the staging agent running with automatic
-   restart and request inspection disabled. Store its authtoken in a private
-   server configuration file, not GitHub or the repository. Do not point this
-   tunnel at the real Dokploy UI/API.
-7. GHCR image names are `ghcr.io/<owner>/<repo>-staging-backend` and
-   `ghcr.io/<owner>/<repo>-staging-frontend`. Grant this repository's Actions access
-   to those staging-only packages. Either make just these packages public, or
-   configure a read-only registry credential server-side for Dokploy pulls. The
-   publishing job uses `GITHUB_TOKEN`; no long-lived registry write credential is
-   needed. Image artifacts and packages consume GitHub storage; retention is one
-   day for intermediate image artifacts. For initial package creation, dispatch
-   once with **Deploy after publishing** disabled. This tests the runner build
-   and creates the packages without touching staging. Configure package visibility
-   or server pull credentials, then dispatch with deployment enabled.
-8. Initialize only the **new staging** job/settings volumes with UID/GID 10001
-   ownership. Leave production volumes untouched. Keep the staging Compose app
-   name stable so deploys retain the same database and volumes. PostgreSQL is not
-   published; only the staging frontend binds to `127.0.0.1:3011`.
-
-## GitHub Environment values
-
-Configure these under **Settings → Environments → staging**:
-
-| Kind | Name | Value |
-| --- | --- | --- |
-| Secret | `STAGING_DEPLOY_TOKEN` | Random gateway token; **not** a Dokploy API key |
-| Variable | `STAGING_DOKPLOY_URL` | Gateway HTTPS origin, without `/api`, credentials or query |
-| Variable | `STAGING_DOKPLOY_COMPOSE_ID` | New staging Compose ID |
-| Variable | `STAGING_DOKPLOY_ENVIRONMENT_ID` | New staging Dokploy environment ID |
-| Variable | `STAGING_API_HEALTH_URL` | Gateway HTTPS origin + `/api/health` |
-| Variable | `STAGING_WEB_HEALTH_URL` | Gateway HTTPS origin + `/` |
-
-The image digests and selected SHA are job outputs, not user-entered deployment
-parameters. No production or Dokploy admin credential belongs in GitHub. The
-controller verifies the gateway identity before selecting images, so configuring
-the real Dokploy API URL directly is rejected.
-
-## Deploy and test
-
-Open **Actions → Deploy staging → Run workflow**. Keep the workflow branch
-selector on the **default branch**. Enter a source branch, or leave branch blank
-and enter an open same-repository PR number. Both blank selects the default
-branch. The run builds, publishes and deploys without an approval step.
-
-A green run means the correlated Dokploy deployment reported `done`, the API
-returned `status: ok` and `service: syda-platform-api`, and the frontend returned
-an application page. Health checks do not receive deployment credentials. They
-are liveness checks, not a full provider/database workflow or browser test.
-The API probe uses `/api/health`; the current production frontend's `/health`
-returned 404 during inspection. Full functional testing needs staging provider
-configuration and application exercises after the first successful deployment.
-
-A fixed staging branch is supported by entering that branch each time. For a
-rollback, select a branch pointing at the previous commit and dispatch again;
-there is no automatic data/migration rollback. No deployments happen when a PR
-is opened, updated or merged. The separate read-only PR check only validates
-builds for deployment-related changes. Existing docs/production behavior stays
-unchanged.
-
-## Failures and recovery
-
-The workflow serializes shared staging through one concurrency group. GitHub can
-supersede pending runs but never cancels an active run for a newer dispatch.
-The gateway writes its persistent in-flight record **before** calling Dokploy,
-so runner cancellation or loss cannot allow a later run to change images during
-an uncertain deployment. The deploy job needs only read-only repository access;
-it does not receive a GitHub API credential or create branches.
-
-On cancellation, timeout or trigger/network failure, inspect Dokploy history and
-queue for `github-staging-<run>-<attempt>-<sha>`. Wait for completion or explicitly
-cancel and verify there are no remaining queued/running processes. The gateway
-clears its in-flight record only after that exact title becomes terminal and
-rejects reuse of a completed deployment title. If no
-record exists and the outcome is uncertain, an owner must reconcile the queue
-before manually clearing `/state/inflight.json`. Then start a new dispatch, not an old rerun.
-A terminal build/deploy failure or failed health check fails Actions clearly.
-POST triggers are not retried automatically.
-
-The gateway/runner omit API response bodies and credentials from logs. Inspect
-Dokploy logs privately for build/runtime errors. `freshVolumes` is always false;
-no workflow operation deletes/recreates the service, resets volumes, or modifies
-production. Staging application code can still change staging data.
-
-Requests to the staging ngrok ingress send
-`ngrok-skip-browser-warning: 1`; API responses must be JSON, HTTPS is verified,
-and redirects are rejected. Free ngrok quotas/tunnel downtime can fail a run.
-Polling uses one request every 15 seconds for up to 30 minutes, followed by up to
-3 minutes for health checks. No ngrok authtoken is needed in GitHub.
-
-## Validation and references
-
-Run `python3 -m unittest discover -s scripts/tests -v`,
-`actionlint .github/workflows/deploy-staging.yml .github/workflows/build-staging-images.yml`, and `docker compose -f
-platform/docker-compose.staging.yml config --quiet` with dummy required values.
-The controller/gateway tests exercise API/state failures, HTTP framing and
-credential/target rejection. The read-only PR check also starts the fixed stack
-on a disposable GitHub runner with dummy secrets, verifies API/frontend health,
-and removes its temporary containers/volumes. This is a CI runtime smoke test,
-not evidence of a successful deployment on the staging server.
-
-Contracts checked against installed Dokploy v0.30.6 and official references:
-
-- [Dokploy Compose API](https://docs.dokploy.com/docs/api/compose): `compose.one`,
-  `compose.saveEnvironment`, `compose.deploy`.
-- [Dokploy deployment API](https://docs.dokploy.com/docs/api/deployment):
-  `deployment.allByCompose`.
-- [GitHub image publishing](https://docs.github.com/en/actions/tutorials/publish-packages/publish-docker-images)
-  and [GHCR](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
-- [GitHub Environment protections](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
-- [ngrok free plan](https://ngrok.com/docs/pricing-limits/free-plan-limits).
+When the workflow finishes, the updated version is live at **[https://staging.mlgate.ai](https://staging.mlgate.ai)**.
