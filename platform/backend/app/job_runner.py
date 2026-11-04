@@ -10,11 +10,17 @@ from .services.generation import run_generation
 logger = logging.getLogger(__name__)
 
 
-def execute_job(job_id):
-    claimed = claim_job(job_id)
+def execute_job(job_id, claimed=None):
+    if claimed is None:
+        claimed = claim_job(job_id)
     if claimed is None:
         return
-    token, scenario, snapshot, user_id = claimed
+
+    if len(claimed) == 5:
+        _, token, scenario, snapshot, user_id = claimed
+    else:
+        token, scenario, snapshot, user_id = claimed
+
     stop = Event()
 
     def heartbeat():

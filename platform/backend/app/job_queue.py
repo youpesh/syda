@@ -1,11 +1,11 @@
-"""Database-owned dispatch, execution leases, and attempt-fenced updates."""
+"""Database-owned queue, execution leases, and attempt-fenced updates."""
 import logging
 import os
 import uuid
 import httpx
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from . import database
 from .models.entities import JobRecord
 
@@ -13,8 +13,7 @@ logger = logging.getLogger(__name__)
 ACTIVE = ("generating", "validating", "evaluating")
 MAX_ATTEMPTS = max(1, int(os.getenv("GENERATION_MAX_ATTEMPTS", "3")))
 LEASE_SECONDS = max(30, int(os.getenv("GENERATION_LEASE_SECONDS", "120")))
-DELIVERY_WINDOW_SECONDS = max(60, int(os.getenv("GENERATION_DELIVERY_WINDOW_SECONDS", "3600")))
-DISPATCH_RETRY_SECONDS = max(5, int(os.getenv("GENERATION_DISPATCH_RETRY_SECONDS", "30")))
+POLL_INTERVAL_SECONDS = max(0.5, float(os.getenv("GENERATION_POLL_INTERVAL_SECONDS", "2.0")))
 DATA_DIR = Path(os.getenv("JOB_DATA_DIR", "data/jobs"))
 
 
@@ -31,42 +30,8 @@ def output_directory(job, root=None):
     return directory / "attempts" / job.output_attempt if job.output_attempt else directory
 
 
-def publish_job(job_id, *, db=None):
-    """Best effort; queued rows are durable dispatch intent, not lost on failure."""
-    own_session = db is None
-    db = db or database.SessionLocal()
-    try:
-        timestamp = now()
-        reserved = db.query(JobRecord).filter(
-            JobRecord.id == job_id, JobRecord.status == "queued",
-            or_(JobRecord.next_dispatch_at.is_(None), JobRecord.next_dispatch_at <= timestamp),
-        ).update({JobRecord.next_dispatch_at: timestamp + timedelta(seconds=DISPATCH_RETRY_SECONDS)}, synchronize_session=False)
-        db.commit()
-        if not reserved:
-            return False
-        try:
-            from .tasks.generation import generate_dataset
-            generate_dataset.apply_async(
-                args=[job_id],
-                task_id=str(uuid.uuid4()),
-                retry=False,
-                expires=DELIVERY_WINDOW_SECONDS,
-            )
-            db.query(JobRecord).filter(
-                JobRecord.id == job_id, JobRecord.status == "queued",
-            ).update({JobRecord.next_dispatch_at: now() + timedelta(seconds=DELIVERY_WINDOW_SECONDS)}, synchronize_session=False)
-            db.commit()
-            return True
-        except Exception as error:
-            # Never log broker URLs or provider credentials from exception strings.
-            logger.warning("Dispatch deferred for job %s (%s)", job_id, type(error).__name__)
-            return False
-    finally:
-        if own_session:
-            db.close()
-
-
 def claim_job(job_id):
+    """Atomically claim a specific queued job by ID."""
     with database.SessionLocal() as db:
         token = str(uuid.uuid4())
         timestamp = now()
@@ -85,6 +50,76 @@ def claim_job(job_id):
             return None
         job = db.get(JobRecord, job_id)
         return token, job.scenario, job.provider_snapshot, job.user_id
+
+
+def claim_next_job():
+    """Atomically claim the next available queued job from the database.
+
+    On PostgreSQL, uses `FOR UPDATE SKIP LOCKED` so concurrent workers claim distinct jobs
+    with zero locks or deadlocks. On SQLite, uses atomic conditional updates with retry.
+    Returns (job_id, token, scenario, provider_snapshot, user_id) or None.
+    """
+    with database.SessionLocal() as db:
+        timestamp = now()
+        token = str(uuid.uuid4())
+        is_postgres = bool(db.bind and db.bind.dialect.name == "postgresql")
+
+        for _ in range(5):
+            query = db.query(JobRecord).filter(
+                JobRecord.status == "queued",
+                JobRecord.attempt_count < MAX_ATTEMPTS,
+                or_(JobRecord.retry_at.is_(None), JobRecord.retry_at <= timestamp),
+            ).order_by(JobRecord.created_at)
+
+            if is_postgres:
+                candidate = query.with_for_update(skip_locked=True).first()
+            else:
+                candidate = query.first()
+
+            if not candidate:
+                return None
+
+            job_id = candidate.id
+            claimed = db.query(JobRecord).filter(
+                JobRecord.id == job_id, JobRecord.status == "queued",
+                JobRecord.attempt_count == candidate.attempt_count,
+            ).update({
+                JobRecord.status: "generating", JobRecord.attempt_token: token,
+                JobRecord.attempt_count: JobRecord.attempt_count + 1,
+                JobRecord.heartbeat_at: timestamp, JobRecord.updated_at: timestamp,
+                JobRecord.progress: 0, JobRecord.current_stage: "Starting generation worker",
+            }, synchronize_session=False)
+            db.commit()
+            if claimed:
+                job = db.get(JobRecord, job_id)
+                return job.id, token, job.scenario, job.provider_snapshot, job.user_id
+
+        return None
+
+
+def notify_job_queued(db=None):
+    """Signal workers via PostgreSQL LISTEN/NOTIFY for zero-latency wakeup."""
+    own_session = db is None
+    db = db or database.SessionLocal()
+    try:
+        if db.bind and db.bind.dialect.name == "postgresql":
+            db.execute(text("NOTIFY syda_generation_queue;"))
+            db.commit()
+    except Exception as error:
+        logger.debug("Queue notify omitted or unsupported (%s)", error)
+    finally:
+        if own_session:
+            db.close()
+
+
+def publish_job(job_id, *, db=None):
+    """Signal that a job is ready for execution.
+
+    In the database-native queue, persisting the JobRecord with status='queued'
+    is itself the durable dispatch. This notifies listening workers.
+    """
+    notify_job_queued(db=db)
+    return True
 
 
 def update_attempt(job_id, token, updates):
@@ -141,9 +176,8 @@ def fail_attempt(job_id, token, error):
         db.commit()
 
 
-
 def reconcile_jobs():
-    """Recover expired execution leases and publish queued jobs. Safe to repeat."""
+    """Recover expired execution leases for interrupted or crashed workers."""
     timestamp = now()
     with database.SessionLocal() as db:
         stale = db.query(JobRecord).filter(
@@ -159,14 +193,8 @@ def reconcile_jobs():
             ).update({
                 JobRecord.status: "queued" if retry else "failed",
                 JobRecord.current_stage: "Worker interrupted; waiting to retry" if retry else "Generation interrupted; retry limit reached or legacy job",
-                JobRecord.attempt_token: None, JobRecord.next_dispatch_at: timestamp,
-                JobRecord.retry_at: timestamp, JobRecord.download_url: None,
+                JobRecord.attempt_token: None,
+                JobRecord.retry_at: timestamp,
+                JobRecord.download_url: None,
             }, synchronize_session=False)
         db.commit()
-        queued = db.query(JobRecord.id).filter(
-            JobRecord.status == "queued",
-            or_(JobRecord.next_dispatch_at.is_(None), JobRecord.next_dispatch_at <= timestamp),
-            or_(JobRecord.retry_at.is_(None), JobRecord.retry_at <= timestamp),
-        ).order_by(JobRecord.created_at).limit(100).all()
-    for (job_id,) in queued:
-        publish_job(job_id)

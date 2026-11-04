@@ -115,66 +115,41 @@ docker compose down
 
 ## Queued dataset generation
 
-Dataset generation runs in a Celery worker. FastAPI creates a PostgreSQL job in
-`queued` state and publishes its ID to Redis. A dispatcher republishes unclaimed
-queued jobs and recovers expired worker leases every five seconds. PostgreSQL is
-the authoritative job/result store; Redis only transports task IDs.
+Dataset generation runs in a background worker process backed directly by PostgreSQL.
+FastAPI creates a `JobRecord` in `queued` state in the database. The worker claims jobs
+atomically using `FOR UPDATE SKIP LOCKED`, eliminating the need for Redis, Celery, or an
+external dispatcher service. PostgreSQL is the authoritative and exclusive job and queue store.
 
-`docker compose up --build` starts the API, frontend, PostgreSQL, Redis, worker,
-and dispatcher. The worker uses the same backend image and job/settings volumes
-as the API. Redis is internal to the Compose network and persists its queue using
-AOF. For queue deployments use PostgreSQL; SQLite remains useful for unit tests.
+`docker compose up --build` starts the API, frontend, PostgreSQL, and background worker.
+The worker uses the same backend image and job/settings volumes as the API.
 
-For development, after `uv sync --project platform/backend`, run the following in
-separate terminals from `platform/backend`, alongside the frontend and API:
+For development, after `uv sync --project platform/backend`, start the worker in a separate terminal:
 
 ```bash
-uv run celery -A app.celery_app:celery_app worker --loglevel=INFO --concurrency=1 --queues=generation
-uv run python -m app.dispatcher
+uv run python -m app.worker
 ```
 
-Set `CELERY_BROKER_URL` to a running Redis instance and `DATABASE_URL` to the same
-PostgreSQL database in all processes. The API must initialize the schema before
-starting the worker and dispatcher. All processes must share `JOB_DATA_DIR` and
-`PROVIDER_ENCRYPTION_KEY` (or the existing `data/settings` directory). Keep one
-API instance during the additive schema migration, then start other instances.
-Stop/drain old API-owned generations before upgrading; legacy interrupted jobs
-without a saved provider snapshot are marked failed by reconciliation.
+All processes must share `DATABASE_URL`, `JOB_DATA_DIR`, and `PROVIDER_ENCRYPTION_KEY`
+(or the existing `data/settings` directory).
 
-The provider, model, and compatible endpoint are captured at submission. API keys
-are never put in Redis: the worker decrypts the owner's current saved key. Key
-rotation before execution therefore takes effect; deleting a required credential
-fails the job rather than switching providers. Live provider failures now surface
-as failed/retrying jobs instead of silently substituting offline data.
+The provider, model, and compatible endpoint are captured at submission. API keys are
+loaded by the worker from the owner's encrypted settings at execution time. Key rotation
+before execution takes effect; deleting a required credential fails the job rather than
+switching providers. Provider failures surface as retrying or failed jobs.
 
-Generation attempts have an atomic claim, a heartbeat, and a unique output
-directory. Only the current attempt can update status or publish downloads.
-Unfinished output stays private; legacy completed output paths remain supported.
-An API restart does not mark worker-owned jobs failed. A worker whose heartbeat
-expires is retried from the beginning, up to `GENERATION_MAX_ATTEMPTS` (default 3).
-Explicit timeout/connection errors, HTTP 429, and HTTP 5xx failures are retried with
-bounded backoff. Invalid input and missing credentials fail immediately.
-
-Default maximum task duration is one hour (`GENERATION_TIME_LIMIT`); Redis's
-visibility timeout is set longer than that duration. `GENERATION_LEASE_SECONDS`
-defaults to 120 seconds, with a heartbeat every third of that interval. A long
-visibility timeout does not block database reconciliation of a lost worker.
-Repeated delivery never starts a second attempt while an existing lease is live.
-Fencing prevents stale attempts from publishing results, but cannot undo a model
-API call already in flight: recovery can incur additional provider usage. This is
-at-least-once execution, not exactly-once billing or partial-generation resume.
-Only increase concurrency after checking memory and provider rate limits.
+Generation attempts have an atomic claim, a heartbeat, and an isolated per-attempt output
+directory. Only the owning attempt can update status or publish downloads.
+A worker whose heartbeat expires is automatically recovered and retried from the beginning,
+up to `GENERATION_MAX_ATTEMPTS` (default 3). Exponential backoff is applied on retryable errors.
 
 Validation:
 
 ```bash
 uv run --project platform/backend pytest platform/backend/tests tests/test_scenarios.py
-SYDA_QUEUE_INTEGRATION=1 uv run --project platform/backend pytest platform/backend/tests/test_celery_transport.py -v
 ```
 
-The opt-in test requires disposable PostgreSQL and Redis services and exercises
-real broker delivery, duplicate task delivery, offline generation, and output
-publication. CI provisions these services. Before production rollout also stop a
+CI runs the full backend and scenario test suite including atomic worker claiming,
+exponential backoff, crash recovery, and attempt fencing. Before production rollout also stop a
 worker during generation, restart the API independently, and verify recovery and
 downloads from the API container. Cleanup of old attempt directories, cancellation,
 priorities, and resuming partial generation are outside this change.
