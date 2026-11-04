@@ -46,16 +46,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Install dependencies
         run: |
-          cd platform
+          cd platform/frontend
           npm ci
       - name: Frontend typecheck
         run: |
-          cd platform
+          cd platform/frontend
           npm run typecheck
       - name: Frontend production build
         run: |
-          cd platform
+          cd platform/frontend
           npm run build
