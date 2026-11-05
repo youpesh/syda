@@ -95,7 +95,7 @@ export default function Scenarios() {
               <TableCell className="min-w-0 whitespace-normal"><Link className="font-medium hover:underline" to={`/scenarios/${scenario.id}`}>{scenario.title}</Link><p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{scenario.description}</p></TableCell>
               <TableCell className="hidden tabular-nums sm:table-cell">{scenario.recordCount.toLocaleString()}</TableCell>
               <TableCell className="hidden text-muted-foreground md:table-cell">{new Date(scenario.updatedAt).toLocaleString()}</TableCell>
-              <TableCell><div className="flex justify-end gap-2"><Link className={buttonVariants({ variant: "outline", size: "sm" })} to={`/datasets/${scenario.id}`}>Sheet</Link><Link className={buttonVariants({ variant: "outline", size: "sm" })} to={`/scenarios/${scenario.id}`}>Open</Link><DeleteScenarioButton scenario={scenario} onDeleted={(id) => setScenarios((current) => current.filter((item) => item.id !== id))} /></div></TableCell>
+              <TableCell><div className="flex justify-end gap-2"><Link className={buttonVariants({ variant: "outline", size: "sm" })} to={`/scenarios/${scenario.id}`}>Open</Link><DeleteScenarioButton scenario={scenario} onDeleted={(id) => setScenarios((current) => current.filter((item) => item.id !== id))} /></div></TableCell>
             </TableRow>)}</TableBody>
           </Table></CardContent>
         </Card>}

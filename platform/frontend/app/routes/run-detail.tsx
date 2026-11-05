@@ -4,7 +4,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import type { Route } from "./+types/run-detail";
 import { AppShell } from "~/components/studio/app-shell";
-import { DataPreview } from "~/components/studio/data-preview";
+import { RunSheet } from "~/components/studio/run-sheet";
 import { EvaluationReport } from "~/components/studio/evaluation-report";
 import { ExportToDatabase } from "~/components/studio/export-to-database";
 import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
@@ -85,7 +85,7 @@ export default function RunDetail() {
     } finally { setSavingScenario(false); }
   };
 
-  return <AppShell title={job?.scenario?.title ?? "Generation run"} subtitle={job ? `Run ${job.jobId}` : "Loading run"} headerActions={job && <div className="flex items-center gap-2">{active && <Button disabled={cancelling} onClick={() => void cancelJob()} size="sm" variant="destructive">{cancelling ? "Cancelling…" : "Cancel run"}</Button>}{job.scenarioId && filesAvailable && <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/datasets/${job.scenarioId}?run=${job.jobId}`}>Open sheet</Link>}{job.scenarioId ? <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${job.scenarioId}`}>Edit scenario</Link> : <Button disabled={savingScenario} onClick={() => void saveScenario()} size="sm" variant="outline">{savingScenario ? "Saving…" : "Save as scenario"}</Button>}{filesAvailable && <ExportToDatabase jobId={job.jobId} />}{filesAvailable && <a className={buttonVariants({ size: "sm" })} href={job.downloadUrl ?? `/api/download/${job.jobId}`}>Download dataset</a>}</div>}>
+  return <AppShell title={job?.scenario?.title ?? "Generation run"} subtitle={job ? `Run ${job.jobId}` : "Loading run"} headerActions={job && <div className="flex items-center gap-2">{active && <Button disabled={cancelling} onClick={() => void cancelJob()} size="sm" variant="destructive">{cancelling ? "Cancelling…" : "Cancel run"}</Button>}{job.scenarioId ? <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${job.scenarioId}`}>Edit scenario</Link> : <Button disabled={savingScenario} onClick={() => void saveScenario()} size="sm" variant="outline">{savingScenario ? "Saving…" : "Save as scenario"}</Button>}{filesAvailable && <ExportToDatabase jobId={job.jobId} />}{filesAvailable && <a className={buttonVariants({ size: "sm" })} href={job.downloadUrl ?? `/api/download/${job.jobId}`}>Download dataset</a>}{filesAvailable && <a className={buttonVariants({ size: "sm", variant: "outline" })} href={`/api/download/${job.jobId}?format=json`}>JSON</a>}</div>}>
     <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8"><div className="mx-auto max-w-6xl space-y-5">
       <Link className="text-xs text-muted-foreground hover:underline" to="/history">← Generation history</Link>
       {error && <Alert variant="destructive"><AlertTitle>Run unavailable</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
@@ -103,7 +103,7 @@ export default function RunDetail() {
             <Card><CardHeader><CardTitle>Workflow</CardTitle><CardDescription>The causal order used for generation.</CardDescription></CardHeader><CardContent><div className="flex flex-wrap gap-2">{job.scenario?.workflow?.map((step, index) => <Badge key={`${step}-${index}`} variant="outline">{index + 1}. {step}</Badge>)}</div>{job.scenario?.paths?.length ? <p className="mt-4 text-xs text-muted-foreground">{job.scenario.paths.length} scenario paths configured</p> : null}</CardContent></Card>
             <Card className="lg:col-span-2"><CardHeader><CardTitle>Rules</CardTitle><CardDescription>Constraints included in this run.</CardDescription></CardHeader><CardContent><ul className="list-disc space-y-1 pl-5 text-xs text-muted-foreground">{job.scenario?.rules?.map((rule, index) => <li key={index}>{rule}</li>)}</ul></CardContent></Card>
           </div></TabsContent>
-          <TabsContent className="pt-3" value="data"><DataPreview complete={complete} jobId={job.jobId} /></TabsContent>
+          <TabsContent className="pt-3" value="data">{filesAvailable && <RunSheet job={job} />}</TabsContent>
           <TabsContent className="space-y-4 pt-3" value="evaluation">{job.scenario && <RunQualitySummary stats={job.stats} scenario={job.scenario} />}<EvaluationReport jobId={job.jobId} stats={job.stats} /></TabsContent>
         </Tabs>
       </>}
