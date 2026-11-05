@@ -4,6 +4,8 @@ import { RunQualitySummary } from "~/components/studio/run-quality-summary";
 import { createChatFetch } from "~/lib/chat-fetch";
 import { saveScenario } from "~/lib/save-scenario";
 import {
+  lazy,
+  Suspense,
   useEffect,
   useMemo,
   useRef,
@@ -16,7 +18,6 @@ import { useChat } from "@ai-sdk/react";
 import { Link, useLocation, useNavigate, useParams } from "react-router";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
-  AiMagicIcon,
   ArrowUp02Icon,
   SparklesIcon,
 } from "@hugeicons/core-free-icons";
@@ -95,6 +96,19 @@ const promptSuggestions = [
 ];
 
 // metadata.scenarioId links a chat scenario card to its one saved scenario (persisted with the conversation).
+// The Flower hops above its box, so don't clip it to the avatar circle.
+const AGENT_AVATAR_CLASS = "self-start overflow-visible rounded-none bg-transparent";
+// ponytail: bot-avatars is ~130 KB; load it after the chat renders, not in the route chunk.
+const BotAvatar = lazy(() => import("bot-avatars").then((m) => ({ default: m.BotAvatar })));
+
+function AgentAvatar({ working = false, paused = false }: { working?: boolean; paused?: boolean }) {
+  return (
+    <Suspense fallback={<span className="block size-8" />}>
+      <BotAvatar type="flower" size={32} state={working ? "working" : "default"} paused={paused} aria-hidden />
+    </Suspense>
+  );
+}
+
 type SydaMessage = UIMessage<{ scenarioId?: string }, { scenario: ScenarioConfiguration; status: { message: string } }>;
 
 type ChatRun = ChatRunReference;
@@ -862,8 +876,9 @@ export default function Home() {
                         >
                           <Message align={message.role === "user" ? "end" : "start"}>
                             {message.role === "assistant" && (
-                              <MessageAvatar className="self-start bg-primary text-primary-foreground">
-                                <HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} />
+                              <MessageAvatar className={AGENT_AVATAR_CLASS}>
+                                {/* ponytail: only the newest reply animates; a long chat doesn't run a canvas per message. */}
+                                <AgentAvatar paused={index !== messages.length - 1} />
                               </MessageAvatar>
                             )}
                             <MessageContent>
@@ -897,14 +912,13 @@ export default function Home() {
                     {(status === "submitted" || isAwaitingResponse) && (
                       <MessageScrollerItem messageId="thinking-indicator" scrollAnchor>
                           <Message align="start">
-                          <MessageAvatar className="self-start bg-primary text-primary-foreground">
-                            <HugeiconsIcon icon={AiMagicIcon} strokeWidth={2} />
+                          <MessageAvatar className={AGENT_AVATAR_CLASS}>
+                            <AgentAvatar working />
                           </MessageAvatar>
                           <MessageContent>
                             <Bubble align="start" className="w-full" variant="ghost">
                               <BubbleContent className="w-full">
                                 <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
-                                  <Spinner />
                                   <span className="shimmer" aria-live="polite">{agentStatus ?? "Thinking…"}</span>
                                 </div>
                               </BubbleContent>
