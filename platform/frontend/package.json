@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test:chat": "node --experimental-strip-types --test tests/chat-fetch.test.mjs",
+    "test:scenario-save": "node --experimental-strip-types --test tests/save-scenario.test.mjs",
     "build": "react-router build",
     "dev": "react-router dev",
     "start": "react-router-serve ./build/server/index.js",
