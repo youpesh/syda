@@ -191,3 +191,42 @@ def test_latest_dataset_dir_picks_newest_completed_run_owned_by_user(monkeypatch
 
         conversation.runs = [{"jobId": "foreign"}, {"jobId": "running"}]
         assert agent._latest_dataset_dir(db, conversation, user.id) is None
+
+
+def test_tool_status_streams_live_as_transient_parts(monkeypatch, conversation_db):
+    import threading
+
+    factory, user, conversation_id = conversation_db
+
+    async def exercise():
+        release = asyncio.Event()
+
+        async def compile_with_tools(on_status=None, **_):
+            # Sync tools run in a worker thread; report from one like pydantic-ai does.
+            thread = threading.Thread(target=on_status, args=("Drafting the scenario…",))
+            thread.start()
+            thread.join()
+            on_status("Fixing validation issues…")
+            await release.wait()
+            return ChatResponse(message="Draft ready, with two tables.")
+
+        monkeypatch.setattr(agent, "compile_scenario_agent", compile_with_tools)
+        with factory() as db:
+            response = await agent.chat_with_agent(request_for(conversation_id), RequestConnection(), db, user)
+            stream = response.body_iterator
+            assert await asyncio.wait_for(anext(stream), 0.5) == ": keep-alive\n\n"
+            # Both statuses arrive while the agent is still working.
+            live = [await asyncio.wait_for(anext(stream), 0.5) for _ in range(2)]
+            assert decode_events(live) == [
+                {"type": "data-status", "data": {"message": "Drafting the scenario…"}, "transient": True},
+                {"type": "data-status", "data": {"message": "Fixing validation issues…"}, "transient": True},
+            ]
+            release.set()
+            events = decode_events([chunk async for chunk in stream])
+        # The final text arrives whole, not word-by-word with artificial delays.
+        assert [e["delta"] for e in events if e["type"] == "text-delta"] == ["Draft ready, with two tables."]
+
+    asyncio.run(exercise())
+    with factory() as db:
+        parts = db.get(ChatConversation, conversation_id).messages[-1]["parts"]
+        assert all(p["type"] != "data-status" for p in parts)

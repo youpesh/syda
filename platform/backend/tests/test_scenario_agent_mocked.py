@@ -214,6 +214,7 @@ def test_agent_answers_dataset_questions_with_query_dataset(monkeypatch, tmp_pat
     # must still come back instead of "I haven't changed the saved draft yet".
     for prompt in ("How many claims were approved vs denied?", "What % of claims were denied?"):
         calls.clear()
+        statuses = []
         _fake_llm(monkeypatch, _ScenarioToolTestModel(
             tool_name="query_dataset", tool_args={"sql": sql},
             final_message="2 claims were approved and 1 was denied.",
@@ -223,7 +224,9 @@ def test_agent_answers_dataset_questions_with_query_dataset(monkeypatch, tmp_pat
             current_scenario=current,
             provider_selection={"agent_model": True, "id": "gemini", "model": "mock", "key": "test"},
             dataset_dir=str(tmp_path),
+            on_status=statuses.append,
         ))
+        assert statuses == ["Querying the generated data…"], prompt
         assert calls == [{
             "ok": True, "columns": ["status", "n"],
             "rows": [{"status": "approved", "n": 2}, {"status": "denied", "n": 1}],

@@ -95,7 +95,7 @@ const promptSuggestions = [
 ];
 
 // metadata.scenarioId links a chat scenario card to its one saved scenario (persisted with the conversation).
-type SydaMessage = UIMessage<{ scenarioId?: string }, { scenario: ScenarioConfiguration }>;
+type SydaMessage = UIMessage<{ scenarioId?: string }, { scenario: ScenarioConfiguration; status: { message: string } }>;
 
 type ChatRun = ChatRunReference;
 
@@ -465,8 +465,13 @@ export default function Home() {
       },
     }),
   }), []);
+  // Live tool progress ("Drafting the scenario…"); transient, never saved to the transcript.
+  const [agentStatus, setAgentStatus] = useState<string>();
   const { clearError, error, messages, sendMessage, setMessages, status, stop } = useChat<SydaMessage>({
     transport: chatTransport,
+    onData: (part) => {
+      if (part.type === "data-status") setAgentStatus(part.data.message);
+    },
   });
   const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
   const isThinking = status === "submitted" || status === "streaming" || isAwaitingResponse;
@@ -704,6 +709,7 @@ export default function Home() {
     if (!text || isThinking || conversationLoading || (conversationId && loadedConversationId !== conversationId)) return;
 
     setConversationError(undefined);
+    setAgentStatus(undefined);
     if (!conversationId) {
       try {
         const response = await fetch("/api/conversations", {
@@ -899,7 +905,7 @@ export default function Home() {
                               <BubbleContent className="w-full">
                                 <div className="flex items-center gap-2 py-1 text-xs text-muted-foreground">
                                   <Spinner />
-                                  <span className="shimmer">Syda Agent is analyzing schema & compiling scenario rules…</span>
+                                  <span className="shimmer" aria-live="polite">{agentStatus ?? "Thinking…"}</span>
                                 </div>
                               </BubbleContent>
                             </Bubble>
