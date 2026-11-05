@@ -2,6 +2,7 @@ import type { SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { RunQualitySummary } from "~/components/studio/run-quality-summary";
 import { createChatFetch } from "~/lib/chat-fetch";
+import { saveScenario } from "~/lib/save-scenario";
 import {
   useEffect,
   useMemo,
@@ -93,7 +94,8 @@ const promptSuggestions = [
   },
 ];
 
-type SydaMessage = UIMessage<unknown, { scenario: ScenarioConfiguration }>;
+// metadata.scenarioId links a chat scenario card to its one saved scenario (persisted with the conversation).
+type SydaMessage = UIMessage<{ scenarioId?: string }, { scenario: ScenarioConfiguration }>;
 
 type ChatRun = ChatRunReference;
 
@@ -459,6 +461,7 @@ export default function Home() {
   const skipConversationLoadRef = useRef<string | undefined>(undefined);
   const editorReturnRef = useRef<{
     editedScenario?: ScenarioConfiguration;
+    scenarioId?: string;
     messageId: string;
     generatedRun?: ChatRun;
   } | undefined>(undefined);
@@ -488,6 +491,7 @@ export default function Home() {
     const returnState = location.state as {
       schemaSource?: SchemaSource;
       editedScenario?: ScenarioConfiguration;
+      scenarioId?: string;
       messageId?: string;
       generatedRun?: ChatRun;
     } | null;
@@ -504,16 +508,16 @@ export default function Home() {
   useEffect(() => {
     const returnState = editorReturnRef.current;
     if (!returnState || (conversationId && loadedConversationId !== conversationId)) return;
-    if (returnState.editedScenario) {
-      setMessages((currentMessages) => currentMessages.map((message) => message.id === returnState.messageId
-        ? {
-            ...message,
-            parts: message.parts.map((part) => part.type === "data-scenario"
-              ? { ...part, data: returnState.editedScenario! }
-              : part),
-          }
-        : message));
-    }
+    const savedId = returnState.scenarioId ?? returnState.generatedRun?.scenarioId;
+    setMessages((currentMessages) => currentMessages.map((message) => message.id === returnState.messageId
+      ? {
+          ...message,
+          metadata: savedId ? { ...message.metadata, scenarioId: savedId } : message.metadata,
+          parts: returnState.editedScenario
+            ? message.parts.map((part) => part.type === "data-scenario" ? { ...part, data: returnState.editedScenario! } : part)
+            : message.parts,
+        }
+      : message));
     if (returnState.generatedRun) {
       setChatRuns((runs) => runs.some((run) => run.jobId === returnState.generatedRun!.jobId)
         ? runs
@@ -763,17 +767,23 @@ export default function Home() {
     navigate("/app");
   };
 
-  const openEditor = async (scenario: ScenarioConfiguration, messageId: string) => {
-    const response = await fetch("/api/scenarios", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(scenario),
-    });
-    if (!response.ok) throw new Error(`Could not save scenario (${response.status}).`);
-    const saved = await response.json() as { id: string };
+  const saveMessageScenario = async (scenario: ScenarioConfiguration, messageId: string) => {
+    const savedId = messages.find((message) => message.id === messageId)?.metadata?.scenarioId;
+    const id = await saveScenario(scenario, savedId);
     window.dispatchEvent(new Event("syda:scenarios-changed"));
+    if (id !== savedId) {
+      setMessages((currentMessages) => currentMessages.map((message) => message.id === messageId
+        ? { ...message, metadata: { ...message.metadata, scenarioId: id } }
+        : message));
+    }
+    return id;
+  };
+
+  const openEditor = async (scenario: ScenarioConfiguration, messageId: string) => {
+    // ponytail: the editor hands scenarioId back on return; leaving it with browser Back loses that link for a first save.
+    const id = await saveMessageScenario(scenario, messageId);
     const returnTo = conversationId ? `/app/${conversationId}` : "/app";
-    navigate(`/scenarios/${saved.id}?returnTo=${encodeURIComponent(returnTo)}&messageId=${encodeURIComponent(messageId)}`);
+    navigate(`/scenarios/${id}?returnTo=${encodeURIComponent(returnTo)}&messageId=${encodeURIComponent(messageId)}`);
   };
 
   const startGeneration = async (scenario: ScenarioConfiguration, messageId: string) => {
@@ -786,27 +796,20 @@ export default function Home() {
     const validation = await validationResponse.json() as { valid: boolean; schema_errors?: string[] };
     if (!validation.valid) throw new Error(validation.schema_errors?.join(" ") || "Fix the scenario before generating.");
 
-    const saveResponse = await fetch("/api/scenarios", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(scenario),
-    });
-    if (!saveResponse.ok) throw new Error(`Could not save this scenario (${saveResponse.status}).`);
-    const saved = await saveResponse.json() as { id: string };
-    window.dispatchEvent(new Event("syda:scenarios-changed"));
+    const scenarioId = await saveMessageScenario(scenario, messageId);
 
     try {
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scenario, scenarioId: saved.id }),
+        body: JSON.stringify({ scenario, scenarioId }),
       });
       if (!response.ok) {
         const body = await response.json().catch(() => undefined) as { detail?: string } | undefined;
         throw new Error(body?.detail ?? `Could not start generation (${response.status}).`);
       }
       const job = await response.json() as { jobId: string };
-      setChatRuns((runs) => [...runs, { messageId, jobId: job.jobId, scenarioId: saved.id, scenario }]);
+      setChatRuns((runs) => [...runs, { messageId, jobId: job.jobId, scenarioId, scenario }]);
     } catch (error) {
       throw new Error(`The scenario was saved, but generation could not start. ${error instanceof Error ? error.message : "Try again from the scenario editor."}`);
     }

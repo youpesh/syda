@@ -129,7 +129,7 @@ export default function ScenarioEditor() {
     try {
       if (dirty) await save();
       navigate(returnTo, {
-        state: draft && returnMessageId ? { editedScenario: draft, messageId: returnMessageId } : null,
+        state: draft && returnMessageId ? { editedScenario: draft, messageId: returnMessageId, scenarioId } : null,
       });
     } catch {
       // Keep the editor open so the user can correct or retry a failed save.
