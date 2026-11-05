@@ -765,3 +765,46 @@ class TestInferSchemaFromDb:
 
         assert len(result["relationships"]) == 1
         assert result["relationships"][0]["child"] == "orders.customer_id"
+
+
+# ── query_dataset ────────────────────────────────────────────────────────────
+
+class TestQueryDataset:
+
+    def test_answers_questions_and_blocks_writes(self, tmp_path):
+        from syda.mcp_server import query_dataset
+
+        pd.DataFrame({"id": [1, 2, 3], "status": ["approved", "approved", "denied"],
+                      "amount": [100.0, 300.0, 50.0]}).to_csv(tmp_path / "claims.csv", index=False)
+
+        # No sql -> table listing
+        listing = query_dataset(str(tmp_path))
+        assert listing["tables"]["claims"] == {"columns": ["id", "status", "amount"], "row_count": 3}
+
+        # Aggregate question
+        res = query_dataset(str(tmp_path),
+                            "SELECT status, COUNT(*) n, AVG(amount) avg FROM claims GROUP BY status ORDER BY status")
+        assert res["ok"] and res["rows"] == [
+            {"status": "approved", "n": 2, "avg": 200.0},
+            {"status": "denied", "n": 1, "avg": 50.0},
+        ]
+
+        # Row cap
+        capped = query_dataset(str(tmp_path), "SELECT * FROM claims", max_rows=2)
+        assert capped["row_count"] == 2 and capped["truncated"] is True
+
+        # Recursive CTEs are reads
+        assert query_dataset(str(tmp_path),
+                             "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<3) "
+                             "SELECT COUNT(*) c FROM n")["rows"] == [{"c": 3}]
+
+        # Writes and ATTACH (which would create a file on disk) are denied
+        for bad in ["DELETE FROM claims", "DROP TABLE claims", "PRAGMA table_info(claims)",
+                    f"ATTACH '{tmp_path / 'evil.db'}' AS evil"]:
+            assert query_dataset(str(tmp_path), bad)["ok"] is False, bad
+        assert not (tmp_path / "evil.db").exists()
+
+    def test_missing_dir_returns_error(self, tmp_path):
+        from syda.mcp_server import query_dataset
+        res = query_dataset(str(tmp_path))
+        assert res["ok"] is False and "No CSV" in res["message"]

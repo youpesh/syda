@@ -4,8 +4,9 @@ Syda MCP server.
 Exposes Syda's synthetic data generation capabilities to AI agents
 (Claude Desktop, Cursor, Windsurf, etc.) over the Model Context Protocol.
 
-Runs over stdio. Five tools:
+Runs over stdio. Six tools:
   - generate_from_schema  (primary)
+  - query_dataset         (read-only SQL over generated CSVs)
   - validate_schema
   - infer_schema_from_db
   - get_providers
@@ -48,6 +49,8 @@ except ImportError:
 
 from dotenv import find_dotenv, load_dotenv
 
+from .query import query_dataset
+
 # find_dotenv()'s default search walks up from the *caller's file location*
 # (via stack-frame introspection), not the working directory. That's a no-op
 # for a real pip/wheel install (mcp_server.py lives deep in site-packages,
@@ -82,7 +85,8 @@ mcp = FastMCP(
         "Syda handles LLM generation, FK integrity, codegen optimisation for large tables, "
         "and cost tracking. The primary tool is generate_from_schema — pass a schema dict "
         "describing each table's columns and the tool returns generated data plus a full "
-        "cost/token report.\n\n"
+        "cost/token report. After generating with output_dir set, use query_dataset to "
+        "answer the user's questions about the data or verify its quality with SQL.\n\n"
         "Supported providers: anthropic (Claude), openai (GPT), gemini, grok, azureopenai, "
         "openai_compatible (Ollama, Groq, etc.). Provider is auto-detected from env vars if "
         "not specified.\n\n"
@@ -755,6 +759,9 @@ def get_providers() -> Dict[str, Any]:
             "No providers configured. Set at least one API key env var."
         ),
     }
+
+
+query_dataset = mcp.tool()(query_dataset)
 
 
 @mcp.tool()

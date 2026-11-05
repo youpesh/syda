@@ -137,7 +137,7 @@ Edit `~/.codeium/windsurf/mcp_config.json`:
 
 ## Available tools
 
-The MCP server exposes five tools:
+The MCP server exposes six tools:
 
 ### `generate_from_schema` (primary)
 
@@ -185,6 +185,20 @@ Claude calls `generate_from_schema` automatically and returns a preview of the g
 - `provider` — `anthropic`, `openai`, `gemini`, `grok`, `openai_compatible`
 - `generation_mode` — `auto` (default), `direct`, `codegen`
 - `max_workers` — parallel table generation (default 1)
+
+---
+
+### `query_dataset`
+
+Ask questions about a generated dataset, or check its quality, in plain English. Every `<table>.csv` in `output_dir` is loaded as a SQLite table, and the assistant writes the SQL for you. Queries are read-only: SQLite blocks writes, `ATTACH`, and `PRAGMA`. Results are capped at `max_rows` (default 200).
+
+Call it without `sql` to list tables, columns, and row counts.
+
+**Example prompts:**
+
+> *"What percentage of claims were approved vs denied, and what was the average amount for each?"*
+
+> *"Are there any encounters whose patient_id doesn't exist in patients?"*
 
 ---
 
@@ -245,6 +259,15 @@ Syda returns:
 
 Here are 3 sample rows from each table:
 [previews]
+
+User: What share of encounters were emergency visits?
+
+[calls query_dataset with:
+   SELECT encounter_type, ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct
+   FROM encounters GROUP BY encounter_type]
+
+Claude: 18.4% of the 2,000 encounters were emergency visits. Outpatient was
+        the most common type at 61.2%.
 ```
 
 ---
