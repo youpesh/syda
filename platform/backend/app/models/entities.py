@@ -148,3 +148,27 @@ class ChatConversation(Base):
             payload["scenarioDraft"] = self.scenario_draft
             payload["draftVersion"] = self.draft_version or 0
         return payload
+
+
+class ConnectionProfile(Base):
+    """A user's saved database connection details. Passwords are never stored."""
+
+    __tablename__ = "connection_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    dialect: Mapped[str] = mapped_column(String(20), nullable=False)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    database: Mapped[str] = mapped_column(String(128), nullable=False)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "dialect": self.dialect, "host": self.host,
+            "port": self.port, "database": self.database, "username": self.username,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }

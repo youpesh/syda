@@ -5,6 +5,7 @@ import type { Route } from "./+types/connections";
 import { AppShell } from "~/components/studio/app-shell";
 import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
+import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "~/components/ui/card";
 
@@ -33,7 +34,8 @@ export default function Connections() {
             <div className="flex flex-wrap gap-2">
               <LiveConnections connections={connections} source={source} onSource={setSource} disabled={false} />
             </div>
-            <p className="text-xs text-muted-foreground">Connection profiles last while this page is open. Passwords are never saved.</p>
+            {connections.profiles.length > 0 && <ul className="divide-y rounded-xl border text-sm">{connections.profiles.map(p => <li key={p.id} className="flex flex-wrap items-center gap-2 px-3 py-2"><span className="font-medium">{p.name}</span><Badge variant="outline">{p.dialect}</Badge><span className="truncate text-xs text-muted-foreground">{p.username}@{p.host}:{p.port}/{p.database}</span></li>)}</ul>}
+            <p className="text-xs text-muted-foreground">Connection profiles are saved to your account after a successful test. Passwords are never saved.</p>
           </CardContent>
         </Card>
         {source && <Card>
