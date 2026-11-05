@@ -22,7 +22,7 @@ def test_insurance_rules_pass_while_unique_demographics_fail_privacy():
     definition = _scenario_definition(scenario, scenario.schemas or {})
     assert definition.rules == scenario.rules
     assert definition.secondary_metric == {"label": "Denial rate", "value": "15%"}
-    assert len(definition.checks) == len(scenario.checks) == 6
+    assert len(definition.checks) == len(scenario.checks) == 8
 
     generated = ScenarioEngine(_LocalTableGenerator()).generate(
         definition, scenario.record_count, start_at=date(2026, 1, 1)

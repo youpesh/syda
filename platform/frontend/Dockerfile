@@ -1,6 +1,6 @@
 FROM node:20-slim AS development-dependencies-env
-COPY . /app
 WORKDIR /app
+COPY ./package.json ./package-lock.json /app/
 RUN npm ci
 
 FROM node:20-slim AS production-dependencies-env

@@ -27,6 +27,14 @@ class JobRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
+    provider_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    attempt_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    output_attempt: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_dispatch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     def to_dict(self):
         return {
             "jobId": self.id,
@@ -140,3 +148,27 @@ class ChatConversation(Base):
             payload["scenarioDraft"] = self.scenario_draft
             payload["draftVersion"] = self.draft_version or 0
         return payload
+
+
+class ConnectionProfile(Base):
+    """A user's saved database connection details. Passwords are never stored."""
+
+    __tablename__ = "connection_profiles"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), ForeignKey("user.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    dialect: Mapped[str] = mapped_column(String(20), nullable=False)
+    host: Mapped[str] = mapped_column(String(255), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    database: Mapped[str] = mapped_column(String(128), nullable=False)
+    username: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id, "name": self.name, "dialect": self.dialect, "host": self.host,
+            "port": self.port, "database": self.database, "username": self.username,
+            "updatedAt": self.updated_at.isoformat() if self.updated_at else None,
+        }

@@ -3513,7 +3513,7 @@ requires-dist = [
     { name = "isort", marker = "extra == 'dev'", specifier = ">=5.12.0" },
     { name = "jinja2", specifier = ">=3.0.0" },
     { name = "jsonref", specifier = ">=1.1.0" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0.0" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.0.0,<2" },
     { name = "mkdocs", marker = "extra == 'all'", specifier = ">=1.6.1" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6.1" },
     { name = "mkdocs-macros-plugin", marker = "extra == 'all'", specifier = ">=1.3.7" },

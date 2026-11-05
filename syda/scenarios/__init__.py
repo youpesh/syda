@@ -1,6 +1,6 @@
 """Scenario-driven generation public API."""
 
-from .engine import ScenarioEngine, TableGenerator
+from .engine import ScenarioEngine, ScenarioValidationError, TableGenerator
 from .models import (
     ScenarioBinding,
     ScenarioCheck,
@@ -10,6 +10,7 @@ from .models import (
     ScenarioPlan,
     ScenarioPlanSummary,
     ScenarioStep,
+    ViolationReport,
 )
 
 __all__ = [
@@ -17,10 +18,12 @@ __all__ = [
     "ScenarioCheck",
     "ScenarioDefinition",
     "ScenarioEngine",
+    "ScenarioValidationError",
     "ScenarioGenerationResult",
     "ScenarioPath",
     "ScenarioPlan",
     "ScenarioPlanSummary",
     "ScenarioStep",
     "TableGenerator",
+    "ViolationReport",
 ]

@@ -1,6 +1,7 @@
-import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
+import type { SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { RunQualitySummary } from "~/components/studio/run-quality-summary";
+import { createChatFetch } from "~/lib/chat-fetch";
 import {
   useEffect,
   useMemo,
@@ -60,6 +61,7 @@ import {
 } from "~/components/ui/dialog";
 import { Progress, ProgressLabel, ProgressValue } from "~/components/ui/progress";
 import { AppShell } from "~/components/studio/app-shell";
+import { CleanMessageText } from "~/components/studio/clean-message-text";
 import { DataPreview } from "~/components/studio/data-preview";
 import type { ChatRunReference, CostEstimate, GenerationJob, SavedConversation, ScenarioConfiguration } from "~/lib/studio-types";
 
@@ -131,20 +133,18 @@ function PromptComposer({
   value,
   onChange,
   onSubmit,
+  onStop,
   compact = false,
   disabled = false,
   isLoading = false,
-  source, onSource, connections,
 }: {
   value: string;
   onChange: (value: string) => void;
   onSubmit: () => void;
+  onStop: () => void;
   compact?: boolean;
   disabled?: boolean;
   isLoading?: boolean;
-  connections: ReturnType<typeof useLiveProfiles>;
-  source: SchemaSource | null;
-  onSource: (source: SchemaSource | null) => void;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -179,10 +179,9 @@ function PromptComposer({
           <label className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center rounded-full border px-3 text-sm font-medium focus-within:ring-2 focus-within:ring-ring">
             Attach<input className="sr-only" aria-label="Attach schema or sample" disabled={disabled || isLoading} type="file" accept=".csv,.json,.txt" onChange={async e => { const file = e.target.files?.[0]; e.target.value = ""; if (!file) return; setAttachmentError(""); if (file.size > 100000 || !/\.(csv|json|txt)$/i.test(file.name)) { setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB."); return; } try { onChange(value + `\n\nAttached context (${file.name}):\n${await file.text()}`); } catch { setAttachmentError("Could not read this file. Please retry."); } }} />
           </label>
-          <LiveConnections connections={connections} source={source} onSource={onSource} disabled={disabled || isLoading} />
-          <Button aria-label="Send prompt" className="ml-auto shrink-0" disabled={!value.trim() || disabled || isLoading} size="icon" type="submit">
+          <Button aria-label={isLoading ? "Stop response" : "Send prompt"} title={isLoading ? "Stop response" : "Send prompt"} className="ml-auto shrink-0" disabled={!isLoading && (!value.trim() || disabled)} size="icon" type={isLoading ? "button" : "submit"} onClick={isLoading ? onStop : undefined}>
           {isLoading ? (
-            <Spinner />
+            <span aria-hidden="true" className="size-3 rounded-[2px] bg-current" />
           ) : (
             <HugeiconsIcon icon={ArrowUp02Icon} strokeWidth={2} />
           )}
@@ -416,7 +415,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
     };
   }, [run.jobId]);
 
-  const status = job?.status ?? "generating";
+  const status = job?.status ?? "queued";
   const complete = status === "complete";
   const failed = status === "failed";
 
@@ -436,7 +435,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
             <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/runs/${run.jobId}?tab=data`}>Browse full dataset</Link>
           </div>
         </div>
-        {complete && <RunQualitySummary stats={job?.stats} scenario={run.scenario} />}
+        {(complete || failed) && job?.stats && <RunQualitySummary stats={job.stats} scenario={run.scenario} />}
         {failed && <Link className={buttonVariants({ size: "sm", variant: "outline" })} to={`/scenarios/${run.scenarioId}`}>Review scenario and retry</Link>}
         {complete && job?.filesAvailable && <DataPreview compact complete jobId={run.jobId} showDownloads={false} />}
       </CardContent>
@@ -452,7 +451,6 @@ export default function Home() {
   conversationIdRef.current = conversationId;
   const [prompt, setPrompt] = useState("");
   const [source, setSource] = useState<SchemaSource | null>(null);
-  const connections = useLiveProfiles();
   const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);
   const [conversationTitle, setConversationTitle] = useState("");
   const [loadedConversationId, setLoadedConversationId] = useState<string>();
@@ -468,6 +466,7 @@ export default function Home() {
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const chatTransport = useMemo(() => new DefaultChatTransport<SydaMessage>({
     api: "/api/agent/chat",
+    fetch: createChatFetch(),
     prepareSendMessagesRequest: ({ body, id, messages, trigger, messageId }) => ({
       body: {
         ...body,
@@ -482,7 +481,8 @@ export default function Home() {
   const { clearError, error, messages, sendMessage, setMessages, status, stop } = useChat<SydaMessage>({
     transport: chatTransport,
   });
-  const isThinking = status === "submitted" || status === "streaming";
+  const [isAwaitingResponse, setIsAwaitingResponse] = useState(false);
+  const isThinking = status === "submitted" || status === "streaming" || isAwaitingResponse;
 
   useEffect(() => {
     const returnState = location.state as {
@@ -535,6 +535,7 @@ export default function Home() {
     }
 
     stop();
+    setIsAwaitingResponse(false);
     setConversationError(undefined);
     if (!conversationId) {
       setConversationLoading(false);
@@ -593,6 +594,8 @@ export default function Home() {
       .then((conversation) => {
         if (!active) return;
         const restoredMessages = [...conversation.messages] as SydaMessage[];
+        const lastMsg = restoredMessages.length > 0 ? restoredMessages[restoredMessages.length - 1] : null;
+        setIsAwaitingResponse(lastMsg?.role === "user");
         if (conversation.scenarioDraft) {
           let assistantIndex = -1;
           for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
@@ -630,6 +633,56 @@ export default function Home() {
       .finally(() => { if (active) setConversationLoading(false); });
     return () => { active = false; };
   }, [conversationId, navigate, setMessages, stop]);
+
+  useEffect(() => {
+    if (!conversationId || !isAwaitingResponse) return;
+    let active = true;
+    const interval = setInterval(() => {
+      fetch(`/api/conversations/${conversationId}`)
+        .then(async (response) => {
+          if (!response.ok) return;
+          const conversation = await response.json() as SavedConversation;
+          if (!active) return;
+          const restoredMessages = [...conversation.messages] as SydaMessage[];
+          const lastMsg = restoredMessages.length > 0 ? restoredMessages[restoredMessages.length - 1] : null;
+          if (lastMsg?.role === "assistant") {
+            setIsAwaitingResponse(false);
+            if (conversation.scenarioDraft) {
+              let assistantIndex = -1;
+              for (let index = restoredMessages.length - 1; index >= 0; index -= 1) {
+                if (restoredMessages[index].role === "assistant") {
+                  assistantIndex = index;
+                  break;
+                }
+              }
+              const assistantMessage = assistantIndex >= 0
+                ? restoredMessages[assistantIndex]
+                : { id: crypto.randomUUID(), role: "assistant" as const, parts: [] };
+              const scenarioPart = { type: "data-scenario" as const, id: "scenario", data: conversation.scenarioDraft };
+              const parts = assistantMessage.parts.filter((part) => part.type !== "data-scenario") as SydaMessage["parts"];
+              parts.push(scenarioPart as SydaMessage["parts"][number]);
+              const restoredAssistant = { ...assistantMessage, parts } as SydaMessage;
+              if (assistantIndex >= 0) restoredMessages[assistantIndex] = restoredAssistant;
+              else restoredMessages.push(restoredAssistant);
+            }
+            setMessages(restoredMessages);
+            setChatRuns(conversation.runs ?? []);
+            persistedSnapshotRef.current = JSON.stringify({
+              title: conversation.title,
+              messages: restoredMessages,
+              runs: conversation.runs ?? [],
+              scenarioDraft: conversation.scenarioDraft ?? undefined,
+            });
+            window.dispatchEvent(new Event("syda:conversations-changed"));
+          }
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [conversationId, isAwaitingResponse, setMessages]);
 
   useEffect(() => {
     if (!conversationId || loadedConversationId !== conversationId || status === "streaming") return;
@@ -698,6 +751,7 @@ export default function Home() {
   const startNewScenario = () => {
     setSource(null);
     stop();
+    setIsAwaitingResponse(false);
     setPrompt("");
     setMessages([]);
     setChatRuns([]);
@@ -777,7 +831,7 @@ export default function Home() {
               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">
                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.
               </p>
-              <PromptComposer connections={connections} source={source} onSource={setSource} disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
+              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} value={prompt} />
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {promptSuggestions.map((suggestion) => (
                   <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">
@@ -823,15 +877,12 @@ export default function Home() {
                             <MessageContent>
                               <Bubble align={message.role === "user" ? "end" : "start"} className={scenario ? "w-full" : undefined} variant={message.role === "user" ? "secondary" : "ghost"}>
                                 <BubbleContent className={scenario ? "w-full" : undefined}>
-                                  {text && (
-                                    <p className={scenario ? "mb-3 text-xs leading-5" : undefined}>
-                                      {text.split("\n\nDatabase schema context (")[0]}
-                                      {text.includes("\n\nDatabase schema context (") && <span className="mt-2 block text-xs text-muted-foreground">Database schema included with this prompt.</span>}
-                                      {isStreamingThis && (
-                                        <span className="ml-1 inline-block h-3.5 w-1.5 animate-pulse rounded-xs bg-primary align-middle" />
-                                      )}
-                                    </p>
-                                  )}
+                                  <CleanMessageText
+                                    text={text}
+                                    isStreaming={isStreamingThis}
+                                    isUser={message.role === "user"}
+                                    hasScenario={Boolean(scenario)}
+                                  />
                                   {scenario && (
                                     <ScenarioCard
                                       sourceName={messages.slice(0, index).reverse().find(item => item.role === "user")?.parts.filter(part => part.type === "text").map(part => part.text).join(" ").match(/Database schema context \((.*); structure only, output CSV\):/)?.[1] ?? "Chat instructions"}
@@ -849,7 +900,7 @@ export default function Home() {
                         </MessageScrollerItem>
                       );
                     })}
-                    {status === "submitted" && (
+                    {(status === "submitted" || isAwaitingResponse) && (
                       <MessageScrollerItem messageId="thinking-indicator" scrollAnchor>
                           <Message align="start">
                           <MessageAvatar className="self-start bg-primary text-primary-foreground">
@@ -876,12 +927,7 @@ export default function Home() {
             <div className="shrink-0 border-t bg-background px-5 py-4">
               <div className="mx-auto w-full max-w-3xl">
                 <div className="flex items-end gap-2">
-                  <PromptComposer connections={connections} source={source} onSource={setSource} compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} value={prompt} />
-                  {isThinking && (
-                    <Button onClick={() => stop()} type="button" variant="outline">
-                      Stop
-                    </Button>
-                  )}
+                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} value={prompt} />
                 </div>
                 {error && <p className="mt-2 text-xs text-destructive">{error.message}</p>}
               </div>

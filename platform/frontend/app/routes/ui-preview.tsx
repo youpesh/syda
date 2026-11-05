@@ -69,6 +69,7 @@ import {
 } from "~/components/ui/sidebar";
 import { Textarea } from "~/components/ui/textarea";
 import { ReviewWorkspace, useReviewWorkspace, viewTitles } from "~/components/review-workspace";
+import { CleanMessageText } from "~/components/studio/clean-message-text";
 
 export function meta({}: Route.MetaArgs) {
   return [
@@ -571,7 +572,7 @@ export default function Home() {
                           <Message align="end">
                             <MessageContent>
                               <Bubble variant="secondary">
-                                <BubbleContent>{turn.prompt}</BubbleContent>
+                                <BubbleContent><CleanMessageText text={turn.prompt} isUser /></BubbleContent>
                               </Bubble>
                             </MessageContent>
                           </Message>
@@ -584,7 +585,7 @@ export default function Home() {
                             <MessageContent>
                               <Bubble className="w-full" variant="ghost">
                                 <BubbleContent className="w-full">
-                                  <p className="mb-3 text-xs leading-5">{turn.response}</p>
+                                  <CleanMessageText text={turn.response} hasScenario={Boolean(turn.scenario)} />
                                   <ScenarioCard
                                     onGenerate={() => review.configure(turn.scenario.title, turn.scenario.recordCount, turn.prompt)}
                                     scenario={turn.scenario}

@@ -18,24 +18,42 @@ services:
       retries: 5
 
   backend:
-    build:
+    build: &backend_build
       context: ..
       dockerfile: platform/backend/Dockerfile
     container_name: syda-backend
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
-    environment:
+    environment: &backend_environment
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-syda}
       CORS_ORIGINS: "http://localhost:5173,http://localhost:3000"
-    env_file:
+    env_file: &backend_env_file
       - path: ./backend/.env
         required: false
-    volumes:
+    volumes: &backend_volumes
       - job_data:/app/platform/backend/data/jobs
       - settings_data:/app/platform/backend/data/settings
     depends_on:
       postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    build: *backend_build
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "app.worker"]
+    environment: *backend_environment
+    env_file: *backend_env_file
+    volumes: *backend_volumes
+    stop_grace_period: 65s
+    depends_on:
+      backend:
         condition: service_healthy
 
   frontend:

@@ -1,5 +1,8 @@
 # Syda Platform
 
+For manually deploying a selected branch or PR to Dokploy staging, see
+[Staging deployment setup and instructions](STAGING.md).
+
 An end-to-end web platform and interactive studio built directly into the [Syda](https://github.com/syda-ai/syda) monorepo.
 
 Syda Platform provides an interactive visual studio to define data schemas, configure causal constraints, preview generated synthetic datasets, and run generation workloads with referential integrity.
@@ -109,3 +112,90 @@ To stop the containers:
 ```bash
 docker compose down
 ```
+
+## Queued dataset generation
+
+Dataset generation runs in a background worker process backed directly by PostgreSQL.
+FastAPI creates a `JobRecord` in `queued` state in the database. The worker claims jobs
+atomically using `FOR UPDATE SKIP LOCKED`, eliminating the need for Redis, Celery, or an
+external dispatcher service. PostgreSQL is the authoritative and exclusive job and queue store.
+
+`docker compose up --build` starts the API, frontend, PostgreSQL, and background worker.
+The worker uses the same backend image and job/settings volumes as the API.
+
+For development, after `uv sync --project platform/backend`, start the worker in a separate terminal:
+
+```bash
+uv run python -m app.worker
+```
+
+All processes must share `DATABASE_URL`, `JOB_DATA_DIR`, and `PROVIDER_ENCRYPTION_KEY`
+(or the existing `data/settings` directory).
+
+The provider, model, and compatible endpoint are captured at submission. API keys are
+loaded by the worker from the owner's encrypted settings at execution time. Key rotation
+before execution takes effect; deleting a required credential fails the job rather than
+switching providers. Provider failures surface as retrying or failed jobs.
+
+Generation attempts have an atomic claim, a heartbeat, and an isolated per-attempt output
+directory. Only the owning attempt can update status or publish downloads.
+A worker whose heartbeat expires is automatically recovered and retried from the beginning,
+up to `GENERATION_MAX_ATTEMPTS` (default 3). Exponential backoff is applied on retryable errors.
+
+Validation:
+
+```bash
+uv run --project platform/backend pytest platform/backend/tests tests/test_scenarios.py
+```
+
+CI runs the full backend and scenario test suite including atomic worker claiming,
+exponential backoff, crash recovery, and attempt fencing. Before production rollout also stop a
+worker during generation, restart the API independently, and verify recovery and
+downloads from the API container. Cleanup of old attempt directories, cancellation,
+priorities, and resuming partial generation are outside this change.
+
+## Long-running scenario chats
+
+`POST /api/agent/chat` sends an SSE comment immediately and every 15 seconds while
+the model prepares a draft. These keep-alive comments pass through the frontend
+proxy without becoming assistant messages. This avoids an idle connection while
+waiting for model/tool calls; see [Cloudflare's 524 guidance](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/)
+and the [SSE comment format](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events#event_stream_format).
+
+Navigation or a disconnected stream does not cancel compilation. Its result is
+saved to the conversation and can be recovered by reopening the chat. This work
+runs in the API process, so it does not survive an API process restart. Dataset
+generation uses the separate durable queue described above.
+
+Proxy failures display a short recovery message instead of the intermediary's
+HTML error page. Starting a new chat clears the previous chat's pending UI state.
+When creating a custom scenario, a supplied `schemas` map replaces the starter's
+tables; omitting it preserves the starter. Updating an existing scenario continues
+to merge the supplied table definitions into that scenario.
+The agent tools advertise schema maps as JSON-encoded strings so nested constraints
+have a clear provider input type. They are validated back into native dictionaries;
+saved scenario/API configuration remains an ordinary JSON object.
+
+Chat regression checks:
+
+```bash
+uv run --project platform/backend pytest platform/backend/tests/test_chat_stream.py platform/backend/tests/test_scenario_agent_mocked.py
+cd platform/frontend
+npm run test:chat
+```
+
+## Direct database export integrity
+
+`POST /api/connections/export` exports completed jobs using their declared table
+names. Internal `scenario_instance_id` and `scenario_path` CSV columns are omitted
+unless explicitly declared in the scenario schema. Destination columns are checked
+before any writes; unsupported columns produce a validation error.
+
+All table inserts use one connection and transaction, with parents inserted before
+children. `replace` deletes rows in reverse dependency order and preserves table
+constraints; `fail` rejects existing destination tables. Existing rows are restored
+if an insert fails. Newly created tables may remain empty after a failed export on
+databases with implicit DDL commits (including MySQL and Oracle); table creation is
+completed before row changes begin. Transactional target tables are required for
+rollback guarantees. Self-referencing required fields honor both `nullable: false`
+and the legacy `not_null: true` constraint.

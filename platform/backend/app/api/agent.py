@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, TypeGuard
 
@@ -11,7 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .auth import require_authenticated
-from ..database import get_db
+from ..database import SessionLocal, get_db
 from ..models.entities import ChatConversation
 from ..models.scenario import ChatRequest, ChatResponse, ScenarioConfiguration
 from ..models.user import User
@@ -20,6 +21,16 @@ from ..provider_settings import resolve_provider
 
 router = APIRouter(prefix="/agent", tags=["Agent"])
 logger = logging.getLogger(__name__)
+CHAT_HEARTBEAT_SECONDS = 15
+# Keep background work alive after its HTTP stream disconnects. Tasks are removed
+# on completion; navigating away must not cancel draft persistence.
+_compilation_tasks: set[asyncio.Task] = set()
+
+
+def _compilation_finished(task: asyncio.Task) -> None:
+    _compilation_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("Background scenario compilation failed", exc_info=task.exception())
 
 class ChatStreamRequest(BaseModel):
     """The AI SDK UIMessage request shape sent by useChat or standard chat clients."""
@@ -168,6 +179,10 @@ async def chat_with_agent(
         )
         if conversation is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        # Persist the user message right away so it is immediately visible in history
+        conversation.messages = messages
+        conversation.updated_at = datetime.now(timezone.utc)
+        db.commit()
 
     current_scenario = None
     if conversation and conversation.scenario_draft:
@@ -188,21 +203,88 @@ async def chat_with_agent(
             conversation.updated_at = datetime.now(timezone.utc)
             db.commit()
 
+    conv_id = conversation.id if conversation else None
+    user_id = user.id
+
+    async def run_compilation_and_persist():
+        response = await compile_scenario_agent(
+            prompt=prompt,
+            current_scenario=current_scenario,
+            history=history,
+            provider_selection=provider_selection,
+        )
+        if conv_id:
+            try:
+                with SessionLocal() as session:
+                    target_conv = (
+                        session.query(ChatConversation)
+                        .filter(
+                            ChatConversation.id == conv_id,
+                            ChatConversation.user_id == user_id,
+                        )
+                        .first()
+                    )
+                    if target_conv:
+                        if response.scenario and _scenario_is_valid_draft(response.scenario):
+                            serialized_draft = response.scenario.model_dump(by_alias=True)
+                            if target_conv.scenario_draft != serialized_draft:
+                                target_conv.scenario_draft = serialized_draft
+                                target_conv.draft_version = (target_conv.draft_version or 0) + 1
+
+                        assistant_parts: list[dict[str, Any]] = [
+                            {"type": "text", "text": response.message, "state": "done"}
+                        ]
+                        if response.scenario is not None:
+                            assistant_parts.append({
+                                "type": "data-scenario",
+                                "id": "scenario",
+                                "data": response.scenario.model_dump(by_alias=True),
+                            })
+                        assistant_msg = {
+                            "id": f"asst-{uuid.uuid4().hex[:12]}",
+                            "role": "assistant",
+                            "parts": assistant_parts,
+                        }
+                        cur_messages = list(target_conv.messages or messages)
+                        already_present = any(
+                            m.get("role") == "assistant"
+                            and any(
+                                p.get("text") == response.message
+                                for p in m.get("parts", [])
+                                if isinstance(p, dict) and p.get("type") == "text"
+                            )
+                            for m in cur_messages
+                        )
+                        if not already_present:
+                            cur_messages.append(assistant_msg)
+                        target_conv.messages = cur_messages
+                        target_conv.updated_at = datetime.now(timezone.utc)
+                        session.commit()
+            except Exception as persist_err:
+                logger.error("Failed to persist assistant turn for %s: %s", conv_id, persist_err)
+        return response
+
+    # Launch background compilation so it completes and persists even if client navigates away
+    compilation_task = asyncio.create_task(run_compilation_and_persist())
+    _compilation_tasks.add(compilation_task)
+    compilation_task.add_done_callback(_compilation_finished)
+
     async def stream():
         try:
-            response = await compile_scenario_agent(
-                prompt=prompt,
-                current_scenario=current_scenario,
-                history=history,
-                provider_selection=provider_selection,
-            )
-            if conversation and response.scenario and _scenario_is_valid_draft(response.scenario):
-                serialized_draft = response.scenario.model_dump(by_alias=True)
-                if conversation.scenario_draft != serialized_draft:
-                    conversation.scenario_draft = serialized_draft
-                    conversation.draft_version = (conversation.draft_version or 0) + 1
-                    conversation.updated_at = datetime.now(timezone.utc)
-                    db.commit()
+            # Flush the response immediately, then keep it active while the model
+            # works. SSE comments are ignored by the AI SDK's event parser.
+            yield ": keep-alive\n\n"
+            while not compilation_task.done():
+                if await request.is_disconnected():
+                    return
+                done, _ = await asyncio.wait(
+                    {compilation_task}, timeout=CHAT_HEARTBEAT_SECONDS,
+                )
+                if not done:
+                    yield ": keep-alive\n\n"
+            if await request.is_disconnected():
+                return
+            response = compilation_task.result()
             text_id = "scenario-response"
             yield _sse({"type": "start"})
             yield _sse({"type": "text-start", "id": text_id})

@@ -96,29 +96,61 @@ class DatabaseSchemaLoader:
         Args:
             data: Dict of {table_name: DataFrame} as returned by generate_for_schemas().
             if_exists: Behaviour when the table already contains rows —
-                ``"append"`` (default) adds rows, ``"replace"`` truncates first,
-                ``"fail"`` raises if the table is non-empty.
+                ``"append"`` (default) adds rows, ``"replace"`` deletes rows without dropping tables,
+                ``"fail"`` raises if a destination table exists.
+
+        Row changes share one transaction. Creating new tables has dialect-specific
+        DDL semantics, including implicit commits on MySQL and Oracle.
         """
         if if_exists not in ("append", "replace", "fail"):
             raise ValueError(f"if_exists must be 'append', 'replace', or 'fail', got '{if_exists}'")
 
-        ordered = self._fk_insertion_order(list(data.keys()))
-        for table_name in ordered:
-            if table_name not in data:
-                continue
-            df = data[table_name]
-            df.to_sql(table_name, self._engine, if_exists=if_exists, index=False)
-            print(f"  [OK] Wrote {len(df)} rows to {table_name}")
+        from sqlalchemy import MetaData, Table, inspect
 
-    def _fk_insertion_order(self, table_names: List[str]) -> List[str]:
+        with self._engine.begin() as connection:
+            inspector = inspect(connection)
+            existing = set(inspector.get_table_names())
+            # Validate every destination before the first write, including replace.
+            for name, frame in data.items():
+                if name in existing:
+                    if if_exists == "fail":
+                        raise ValueError(f"Destination table '{name}' already exists")
+                    columns = {column["name"] for column in inspector.get_columns(name)}
+                    unknown = set(frame.columns) - columns
+                    if unknown:
+                        raise ValueError(f"Table '{name}' has no destination columns: {', '.join(sorted(unknown))}")
+
+            ordered = self._fk_insertion_order(list(data.keys()), inspector=inspector)
+            # Finish DDL before any row changes: some databases implicitly commit
+            # CREATE TABLE. Failed exports may leave empty new tables, never rows
+            # from an earlier table insert.
+            for name in ordered:
+                if name not in existing:
+                    data[name].head(0).to_sql(name, connection, if_exists="fail", index=False)
+            if if_exists == "replace":
+                # Delete children first, then insert parents first. Keep constraints.
+                metadata = MetaData()
+                for name in reversed(ordered):
+                    if name in existing:
+                        table = Table(name, metadata, autoload_with=connection)
+                        connection.execute(table.delete())
+            for name in ordered:
+                data[name].to_sql(name, connection, if_exists="append", index=False, chunksize=1000)
+        for name in ordered:
+            print(f"  [OK] Wrote {len(data[name])} rows to {name}")
+
+    def _fk_insertion_order(self, table_names: List[str], inspector=None) -> List[str]:
         """Topologically sort tables so parent tables are inserted before children."""
         table_set = set(table_names)
+        inspector = inspector if inspector is not None else self._inspector
+        existing_tables = set(inspector.get_table_names())
         deps: Dict[str, set] = {t: set() for t in table_names}
         for table in table_names:
-            for fk in self._inspector.get_foreign_keys(table):
-                ref = fk["referred_table"]
-                if ref in table_set:
-                    deps[table].add(ref)
+            if table in existing_tables:
+                for fk in inspector.get_foreign_keys(table):
+                    ref = fk["referred_table"]
+                    if ref in table_set and ref != table:
+                        deps[table].add(ref)
 
         order: List[str] = []
         visited: set = set()

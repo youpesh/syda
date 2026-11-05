@@ -1168,3 +1168,27 @@ class TestParallelRateLimitHandling:
         with patch.object(g, "_generate_one_table", side_effect=fake_one_table):
             with pytest.raises(Exception, match="Bad"):
                 g.generate_for_schemas(schemas=schemas, default_sample_size=3)
+
+
+@pytest.mark.parametrize('constraints,required', [
+    ({'nullable': False}, True), ({'not_null': True}, True),
+    ({'primary_key': True}, True), ({'nullable': True}, False),
+])
+def test_self_referencing_foreign_keys_respect_nullability(constraints, required):
+    import threading
+    generator = MagicMock()
+    generator._fk_lock = threading.Lock()
+    generator.model_config.generation_mode = 'direct'
+    generator._generate_data.return_value = pd.DataFrame({
+        'id': ['a', 'b', 'c'], 'manager_id': ['a', 'a', 'b'],
+    })
+    generator.generator_manager.apply_custom_generators.side_effect = lambda frame, *a, **kw: frame
+    _, frame, _, _ = SyntheticDataGenerator._generate_one_table(
+        generator, schema_name='Employee', llm_schema={'id': 'text', 'manager_id': 'foreign_key'},
+        metadata={'manager_id': {'constraints': constraints}}, model_description='', prompt='',
+        sample_size=3, batch_size=None, output_dir=None, ext='csv', cache=None,
+        schema_hash='', fk_exposed={}, extracted_foreign_keys={'Employee': {'manager_id': ('Employee', 'id')}},
+        results={}, custom_generators={}, is_template=False, run_report=None,
+    )
+    assert frame.manager_id.isna().any() == (not required)
+    assert set(frame.manager_id.dropna()) <= set(frame.id)

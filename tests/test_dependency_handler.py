@@ -269,5 +269,34 @@ class TestForeignKeyHandler:
         
         # Check that the result is invalid due to the reference to non-existent id
         assert is_valid is False
+
+    def test_self_referencing_foreign_keys_not_treated_as_cycles(self):
+        """Self-referencing table (e.g. employee.manager_id -> employee.id) must not cause cycle error."""
+        schemas = {"Employee": {"type": "object"}}
+        schema_metadata = {"Employee": {}}
+        foreign_keys = {
+            "Employee": {"manager_id": ("Employee", "id")}
+        }
+        deps = DependencyHandler.extract_dependencies(schemas, schema_metadata, foreign_keys)
+        assert deps["Employee"] == []
+
+        graph = DependencyHandler.build_dependency_graph(["Employee"], deps)
+        assert not DependencyHandler.has_cycle(graph)
+        order = DependencyHandler.determine_generation_order(graph)
+        assert order == ["Employee"]
+
+    def test_verify_referential_integrity_self_referential(self):
+        """Verify referential integrity on self-referential table with nullable roots."""
+        mock_generator_manager = MagicMock()
+        handler = ForeignKeyHandler(generator_manager=mock_generator_manager)
+        extracted_foreign_keys = {
+            "Employee": {"manager_id": ("Employee", "id")}
+        }
+        emp_df = pd.DataFrame({
+            "id": [1, 2, 3],
+            "manager_id": [None, 1, 1],
+        })
+        is_valid = handler.verify_referential_integrity({"Employee": emp_df}, extracted_foreign_keys)
+        assert is_valid is True
     
     # End of TestForeignKeyHandler class

@@ -34,6 +34,8 @@ def test_insurance_template_has_valid_machine_checks():
         "allowed_values",
         "temporal_order",
         "absence_by_value",
+        "state_machine",
+        "semantic_invariant",
     }
 
 
@@ -71,3 +73,66 @@ def test_agent_accepts_path_with_required_parents():
 
     assert validated is not None
     assert errors == []
+
+
+def test_loan_origination_template_matches_and_validates():
+    from app.agents.scenario_agent import _starter_scenario_for_context
+
+    loan_starter = _starter_scenario_for_context("Create a loan approval scenario with 50 instances")
+    assert loan_starter.title == "Loan origination & underwriting"
+    assert loan_starter.secondary_metric.label == "Rejection rate"
+    assert "Underwriting" in loan_starter.workflow
+    assert "Disbursement" in loan_starter.workflow
+
+    validated, errors = _validate_scenario_candidate(loan_starter)
+    assert errors == []
+    assert validated is not None
+
+
+def test_auto_reconcile_translates_plain_english_absence_rule():
+    from app.agents.scenario_agent import _auto_reconcile_scenario_candidate
+
+    raw_candidate = {
+        "title": "Natural Language Test",
+        "description": "Test non-technical business input",
+        "record_count": 50,
+        "workflow": ["Applicant", "Underwriting", "Disbursement"],
+        "rules": [
+            "Rejected loans cannot be disbursed",
+        ],
+        "checks": [],
+    }
+
+    reconciled = _auto_reconcile_scenario_candidate(raw_candidate)
+    assert "Disbursement" in reconciled["schemas"]
+    assert "status" in reconciled["schemas"]["Underwriting"]
+
+    absence_checks = [c for c in reconciled["checks"] if c["kind"] == "absence_by_value"]
+    assert len(absence_checks) == 1
+    assert absence_checks[0]["source"] == "Underwriting.status"
+    assert absence_checks[0]["value"] == "rejected"
+    assert absence_checks[0]["absent_table"] == "Disbursement"
+
+
+def test_auto_reconcile_normalizes_dotless_absence_source():
+    from app.agents.scenario_agent import _auto_reconcile_scenario_candidate
+
+    raw_candidate = {
+        "title": "Dotless Source Test",
+        "description": "Test source without dot",
+        "record_count": 50,
+        "workflow": ["Order", "Shipment"],
+        "checks": [
+            {
+                "name": "no_shipment_on_cancelled",
+                "kind": "absence_by_value",
+                "source": "Order",
+                "value": "cancelled",
+                "absent_table": "Shipment",
+            }
+        ],
+    }
+
+    reconciled = _auto_reconcile_scenario_candidate(raw_candidate)
+    assert reconciled["checks"][0]["source"] == "Order.status"
+    assert "status" in reconciled["schemas"]["Order"]

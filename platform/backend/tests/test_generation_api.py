@@ -2,6 +2,7 @@ import csv
 import io
 import uuid
 import zipfile
+import pytest
 
 import pandas as pd
 from fastapi.testclient import TestClient
@@ -10,7 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app import database
+from app import database, job_queue, job_runner
 from app.api import generation
 from app.main import app
 from app.models.entities import JobRecord
@@ -27,6 +28,45 @@ _TEST_USER = User(
     is_verified=True,
     display_name="Syda Test",
 )
+
+
+@pytest.mark.parametrize("amount,expected_status", [(0, "failed"), (25, "complete")])
+def test_worker_enforces_causal_gate_and_retains_report(monkeypatch, tmp_path, amount, expected_status):
+    scenario = _scenario(record_count=3, paths=[{
+        "name": "paid", "steps": ["Parent", "Child"], "weight": 1,
+        "overrides": {"Parent": {"status": "paid", "amount": amount}},
+    }])
+    scenario["schemas"]["Parent"].update({"status": "text", "amount": "float"})
+    scenario["checks"] = [{
+        "name": "positive_payment<script>", "kind": "semantic_invariant", "table": "Parent",
+        "condition": "status == 'paid'", "assertion": "amount > 0",
+    }]
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+        assert job["status"] == expected_status
+        report = client.get(f"/api/evaluation/{job_id}/report")
+        assert report.status_code == 200
+        html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
+        assert html_report.status_code == 200
+        if expected_status == "failed":
+            assert job["stats"]["evaluationResult"] == "fail"
+            assert job["downloadUrl"] is None
+            assert not client.get(f"/api/jobs/{job_id}").json()["filesAvailable"]
+            assert report.json()["violations"][0]["rule"] == "positive_payment<script>"
+            assert "positive_payment&lt;script&gt;" in html_report.text
+            assert "positive_payment<script>" not in html_report.text
+            assert client.get(f"/api/download/{job_id}").status_code == 409
+            assert client.get(f"/api/preview/{job_id}").status_code == 409
+            assert not list((tmp_path / "jobs").rglob("*.csv"))
+            with database.SessionLocal() as db:
+                assert db.get(JobRecord, job_id).attempt_count == 1
+        else:
+            assert report.json()["violations"] == []
+            assert job["stats"]["evaluationResult"] == "partial"
+            assert client.get(f"/api/download/{job_id}").status_code == 200
 
 
 def _scenario(record_count: int = 11, paths: list[dict] | None = None) -> dict:
@@ -63,8 +103,11 @@ def _client(monkeypatch, tmp_path) -> TestClient:
     testing_session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", testing_session)
-    monkeypatch.setattr(generation, "SessionLocal", testing_session)
     monkeypatch.setattr(generation, "DATA_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(job_runner, "DATA_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(job_queue, "DATA_DIR", tmp_path / "jobs")
+    # Exercise real worker execution synchronously; broker transport has a separate test.
+    monkeypatch.setattr(generation, "publish_job", lambda job_id, **kw: job_runner.execute_job(job_id))
     for key in ("OPENAI_API_KEY", "GEMINI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     app.dependency_overrides.clear()
@@ -293,6 +336,26 @@ def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):
         )
 
 
+def test_intentionally_absent_table_does_not_reject_valid_path(monkeypatch, tmp_path):
+    scenario = _scenario(record_count=3, paths=[{
+        "name": "cancelled", "steps": ["Parent"], "weight": 1,
+        "overrides": {"Parent": {"name": "cancelled"}},
+    }])
+    scenario["checks"] = [{
+        "name": "cancelled_has_no_child", "kind": "absence_by_value",
+        "source": "Parent.name", "value": "cancelled", "absent_table": "Child",
+    }]
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+        assert job["status"] == "complete"
+        assert job["stats"]["tableRowCounts"] == {"Parent": 3, "Child": 0}
+        assert job["stats"]["violations"] == []
+        assert client.get(f"/api/download/{job_id}").status_code == 200
+
+
 def test_generation_estimate_discloses_offline_fallback(monkeypatch, tmp_path):
     with _client(monkeypatch, tmp_path) as client:
         response = client.post("/api/estimate", json={"scenario": _scenario()})
@@ -359,6 +422,9 @@ def test_generation_returns_actionable_error_when_database_is_unavailable(
     monkeypatch, tmp_path
 ):
     class FailingSession:
+        def get(self, *args):
+            raise SQLAlchemyError("database unavailable")
+
         def add(self, _record):
             return None
 
@@ -473,3 +539,46 @@ def test_deleting_chat_removes_its_draft_and_preserves_saved_scenario(monkeypatc
         assert client.get(f"/api/conversations/{conversation_id}").status_code == 404
         assert all(item["id"] != conversation_id for item in client.get("/api/conversations").json())
         assert client.get(f"/api/scenarios/{scenario_id}").status_code == 200
+
+
+def test_cancel_generation_job(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        # Do not run synchronously, leave in queued state
+        monkeypatch.setattr(generation, "publish_job", lambda job_id, **kw: True)
+        job = client.post("/api/generate", json={"scenario": _scenario()})
+        assert job.status_code == 200
+        job_id = job.json()["jobId"]
+
+        cancel_resp = client.post(f"/api/jobs/{job_id}/cancel")
+        assert cancel_resp.status_code == 200
+        assert cancel_resp.json()["status"] == "cancelled"
+
+        status = client.get(f"/api/jobs/{job_id}").json()
+        assert status["status"] == "cancelled"
+        assert "cancelled" in status["currentStage"].lower()
+
+        # Cannot cancel an already cancelled job
+        repeat = client.post(f"/api/jobs/{job_id}/cancel")
+        assert repeat.status_code == 400
+
+
+@pytest.mark.parametrize('format', ['csv', 'json'])
+def test_zip_download_encodes_commas_quotes_and_unicode_in_title(monkeypatch, tmp_path, format):
+    from urllib.parse import unquote
+    title = 'Patient, Claim "résumé"'
+    with _client(monkeypatch, tmp_path) as client:
+        scenario = _scenario(record_count=2)
+        scenario['title'] = title
+        created = client.post('/api/generate', json={'scenario': scenario})
+        job_id = created.json()['jobId']
+        response = client.get(f'/api/download/{job_id}?format={format}')
+        assert response.status_code == 200
+        headers = response.headers.get_list('content-disposition')
+        assert len(headers) == 1
+        disposition = headers[0]
+        assert disposition.startswith("attachment; filename*=utf-8''")
+        assert ',' not in disposition and '"' not in disposition
+        assert title.lower().replace(' ', '_') in unquote(disposition)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            assert len(archive.namelist()) == 2
+            assert all(name.endswith('.' + format) for name in archive.namelist())

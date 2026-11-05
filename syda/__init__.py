@@ -12,11 +12,13 @@ from .scenarios import (
     ScenarioBinding,
     ScenarioDefinition,
     ScenarioEngine,
+    ScenarioValidationError,
     ScenarioGenerationResult,
     ScenarioPath,
     ScenarioPlan,
     ScenarioPlanSummary,
     ScenarioStep,
+    ViolationReport,
 )
 from .schemas import ModelConfig
 
@@ -32,11 +34,13 @@ __all__ = [
     "ScenarioBinding",
     "ScenarioDefinition",
     "ScenarioEngine",
+    "ScenarioValidationError",
     "ScenarioGenerationResult",
     "ScenarioPath",
     "ScenarioPlan",
     "ScenarioPlanSummary",
     "ScenarioStep",
+    "ViolationReport",
 ]
 
 __version__ = "0.4.0"

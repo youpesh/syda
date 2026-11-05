@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional, Set
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ._utils import (
     _ROW_KEY_FIELD,
@@ -78,27 +78,79 @@ class ScenarioBinding(BaseModel):
     model_config = _SCENARIO_MODEL_CONFIG
 
 
+class ViolationReport(BaseModel):
+    """Structured report of a causal or semantic rule violation."""
+
+    table: str = Field(description="Table name where the violation occurred")
+    row: Any = Field(description="Row index, primary key, or scenario instance ID")
+    rule: str = Field(description="Name of the violated rule or check")
+    error: str = Field(description="Detailed error message explaining the violation")
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        populate_by_name=True,
+        serialize_by_alias=True,
+    )
+
+
 class ScenarioCheck(BaseModel):
     """Machine-checkable rule that Syda can enforce or evaluate after generation.
 
-    ``allowed_values`` constrains one field. ``temporal_order`` requires every
-    earlier timestamp for a scenario instance to be no later than its later
-    timestamp. Free-form business rules remain in ``ScenarioDefinition.rules``;
-    they are included in enrichment prompts but are not treated as executable.
+    Kinds:
+        allowed_values: Constrains one field to an allowed set of values.
+        temporal_order: Requires earlier timestamp to precede later timestamp,
+                        or an ordered chain of timestamps.
+        absence_by_value: Forbids a related record when a source field has a specific value.
+        state_transition: Validates legal state transitions across rows or fields.
+        semantic_invariant: Conditional business constraint (e.g. status == 'paid' => amount > 0).
+        custom_rule: Custom expression evaluated against records.
     """
 
     name: str = Field(min_length=1)
-    kind: Literal["allowed_values", "temporal_order", "absence_by_value"]
+    kind: Literal[
+        "allowed_values",
+        "temporal_order",
+        "absence_by_value",
+        "state_transition",
+        "state_machine",
+        "semantic_invariant",
+        "custom_rule",
+    ]
     table: Optional[str] = None
     field: Optional[str] = None
     values: List[Any] = Field(default_factory=list)
     before: Optional[str] = None
     after: Optional[str] = None
+    chain: Optional[List[str]] = None
+    strict: bool = False
     source: Optional[str] = None
     value: Any = None
     absent_table: Optional[str] = None
+    transitions: Optional[Dict[str, List[str]]] = None
+    initial_states: Optional[List[str]] = None
+    terminal_states: Optional[List[str]] = None
+    previous_field: Optional[str] = None
+    order_by: Optional[str] = None
+    condition: Optional[str] = None
+    assertion: Optional[str] = None
+    expression: Optional[str] = None
 
     model_config = _SCENARIO_MODEL_CONFIG
+
+    @field_validator("transitions", mode="before")
+    @classmethod
+    def normalize_transitions(cls, val: Any) -> Any:
+        if isinstance(val, dict):
+            normalized: Dict[str, List[str]] = {}
+            for k, v in val.items():
+                if isinstance(v, (list, tuple, set)):
+                    normalized[str(k)] = [str(x) for x in v]
+                elif v is not None:
+                    normalized[str(k)] = [str(v)]
+                else:
+                    normalized[str(k)] = []
+            return normalized
+        return val
 
     @model_validator(mode="after")
     def validate_check_shape(self) -> "ScenarioCheck":
@@ -107,24 +159,40 @@ class ScenarioCheck(BaseModel):
                 raise ValueError(
                     "allowed_values checks require table, field, and at least one value."
                 )
-            if self.before or self.after or self.source or self.absent_table or self.value is not None:
-                raise ValueError("allowed_values checks cannot use other check fields.")
         elif self.kind == "temporal_order":
-            if not self.before or not self.after or "." not in self.before or "." not in self.after:
+            if self.chain is not None:
+                if len(self.chain) < 2:
+                    raise ValueError(
+                        "temporal_order checks with chain require at least two field references."
+                    )
+            elif not self.before or not self.after or "." not in self.before or "." not in self.after:
                 raise ValueError(
-                    "temporal_order checks require before and after as Table.field references."
+                    "temporal_order checks require before and after as Table.field references, or a chain."
                 )
-            if self.table or self.field or self.values:
-                raise ValueError("temporal_order checks cannot use table/field/values.")
-            if self.source or self.absent_table or self.value is not None:
-                raise ValueError("temporal_order checks cannot use source/absent_table.")
         elif self.kind == "absence_by_value":
             if not self.source or "." not in self.source or not self.absent_table:
                 raise ValueError(
                     "absence_by_value checks require source as Table.field and absent_table."
                 )
-            if self.before or self.after or self.table or self.field or self.values:
-                raise ValueError("absence_by_value checks cannot use other check fields.")
+        elif self.kind in ("state_transition", "state_machine"):
+            if not self.table or not self.field:
+                raise ValueError(
+                    f"{self.kind} checks require table and field."
+                )
+            if not self.transitions:
+                raise ValueError(
+                    f"{self.kind} checks require a transitions mapping of state -> allowed next states."
+                )
+        elif self.kind == "semantic_invariant":
+            if not self.table:
+                raise ValueError("semantic_invariant checks require table.")
+            if not self.expression and not (self.condition and self.assertion):
+                raise ValueError(
+                    "semantic_invariant checks require expression, or both condition and assertion."
+                )
+        elif self.kind == "custom_rule":
+            if not self.table or not self.expression:
+                raise ValueError("custom_rule checks require table and expression.")
         return self
 
     def validate_references(self, schemas: Dict[str, Dict[str, Any]]) -> None:
@@ -133,8 +201,14 @@ class ScenarioCheck(BaseModel):
             if self.table not in schemas or self.field not in _schema_fields(schemas[self.table]):
                 raise ValueError(f"unknown field '{self.table}.{self.field}'")
         elif self.kind == "temporal_order":
-            for reference in (self.before, self.after):
-                table, field = _split_reference(reference or "")
+            refs = self.chain if self.chain is not None else [self.before, self.after]
+            for reference in refs:
+                if not reference:
+                    continue
+                if "." in reference:
+                    table, field = _split_reference(reference)
+                else:
+                    table, field = self.table or "", reference
                 if table not in schemas or field not in _schema_fields(schemas[table]):
                     raise ValueError(f"unknown field '{reference}'")
                 definition = schemas[table][field]
@@ -147,12 +221,35 @@ class ScenarioCheck(BaseModel):
                     raise ValueError(
                         f"'{reference}' is {field_type or 'untyped'}; expected date or datetime"
                     )
-        else:
+        elif self.kind == "absence_by_value":
             table, field = _split_reference(self.source or "")
             if table not in schemas or field not in _schema_fields(schemas[table]):
                 raise ValueError(f"unknown field '{self.source}'")
             if self.absent_table not in schemas:
                 raise ValueError(f"unknown table '{self.absent_table}'")
+        elif self.kind in ("state_transition", "state_machine"):
+            real_tbl = self.table if (self.table and self.table in schemas) else next((t for t in schemas if t.lower() == (self.table or "").lower()), None)
+            if real_tbl is None:
+                raise ValueError(f"unknown table '{self.table}'")
+            tbl_fields = _schema_fields(schemas[real_tbl])
+
+            def _find_field(name: Optional[str]) -> Optional[str]:
+                if not name:
+                    return None
+                if name in tbl_fields:
+                    return name
+                return next((f for f in tbl_fields if f.lower() == name.lower()), None)
+
+            if _find_field(self.field) is None:
+                raise ValueError(f"unknown field '{self.table}.{self.field}'")
+            if self.previous_field and _find_field(self.previous_field) is None:
+                raise ValueError(f"unknown field '{self.table}.{self.previous_field}'")
+            if self.order_by and _find_field(self.order_by) is None:
+                raise ValueError(f"unknown field '{self.table}.{self.order_by}'")
+        elif self.kind in ("semantic_invariant", "custom_rule"):
+            real_tbl = self.table if (self.table and self.table in schemas) else next((t for t in schemas if t.lower() == (self.table or "").lower()), None)
+            if real_tbl is None:
+                raise ValueError(f"unknown table '{self.table}'")
 
 
 class ScenarioDefinition(BaseModel):
@@ -429,19 +526,158 @@ class ScenarioDefinition(BaseModel):
         return self
 
     def resolved_paths(self) -> List[ScenarioPath]:
-        """Return declared paths or a default path containing every step.
+        """Return declared paths or automatically infer branching paths from absence checks.
 
         Returns:
             Paths used for scenario allocation.
         """
         if self.paths:
             return self.paths
+
+        all_steps = [step.name for step in self.steps]
+        absence_checks = [
+            c for c in self.checks
+            if c.kind == "absence_by_value" and c.absent_table and c.source
+        ]
+
+        if not absence_checks:
+            return [
+                ScenarioPath(
+                    name="default",
+                    steps=all_steps,
+                    weight=1.0,
+                )
+            ]
+
+        # Inferred paths from absence rules
+        # 1. Determine rate / weight from secondary metric (e.g. "Rejection rate": "20%")
+        absent_weight = 0.20
+        metric_val = self.secondary_metric.get("value", "") if isinstance(self.secondary_metric, dict) else ""
+        if isinstance(metric_val, str) and "%" in metric_val:
+            try:
+                num = float(metric_val.replace("%", "").strip())
+                if 0 < num < 100:
+                    absent_weight = round(num / 100.0, 3)
+            except Exception:
+                pass
+
+        # 2. Collect all tables that must be absent and their cascading child dependents
+        absent_tables: Set[str] = {c.absent_table for c in absence_checks if c.absent_table}
+        changed = True
+        while changed:
+            changed = False
+            for tbl, sch in (self.schemas or {}).items():
+                if tbl in absent_tables:
+                    continue
+                fks = _foreign_keys(sch)
+                if any(parent in absent_tables for parent, _ in fks.values()):
+                    absent_tables.add(tbl)
+                    changed = True
+
+        table_to_step: Dict[str, str] = {}
+        for step in self.steps:
+            table_to_step[step.table] = step.name
+            table_to_step[step.table.lower()] = step.name
+            table_to_step[step.name] = step.name
+            table_to_step[step.name.lower()] = step.name
+
+        absent_step_names = {
+            table_to_step.get(tbl, table_to_step.get(tbl.lower(), tbl))
+            for tbl in absent_tables
+        }
+        absent_steps = [s for s in all_steps if s not in absent_step_names]
+        if not absent_steps:
+            absent_steps = all_steps[:1]
+
+        # 3. Setup state overrides for the source status field
+        absent_overrides: Dict[str, Dict[str, Any]] = {}
+        normal_overrides: Dict[str, Dict[str, Any]] = {}
+        for c in absence_checks:
+            if c.source and "." in c.source and c.value is not None:
+                src_tbl, src_col = c.source.split(".", 1)
+                src_step = table_to_step.get(src_tbl, table_to_step.get(src_tbl.lower(), src_tbl))
+                absent_overrides.setdefault(src_step, {})[src_col] = c.value
+                normal_val = None
+                for other_check in self.checks:
+                    tbl_match = (
+                        other_check.table == src_tbl
+                        or other_check.table == src_step
+                        or (other_check.table and other_check.table.lower() == src_tbl.lower())
+                    )
+                    if tbl_match and other_check.field == src_col:
+                        if other_check.kind == "allowed_values" and other_check.values:
+                            candidates = [
+                                v for v in (other_check.values or [])
+                                if not (type(v) is type(c.value) and v == c.value)
+                            ]
+                            if candidates:
+                                normal_val = candidates[0]
+                                break
+                        elif other_check.kind in ("state_machine", "state_transition") and other_check.transitions:
+                            fsm_states = set(other_check.transitions.keys())
+                            for targets in other_check.transitions.values():
+                                fsm_states.update(targets)
+                            if other_check.initial_states:
+                                fsm_states.update(other_check.initial_states)
+                            candidates = [
+                                s for s in sorted(fsm_states)
+                                if s != str(c.value)
+                            ]
+                            if candidates:
+                                if other_check.initial_states:
+                                    init_cands = [s for s in other_check.initial_states if s != str(c.value)]
+                                    normal_val = init_cands[0] if init_cands else candidates[0]
+                                else:
+                                    normal_val = candidates[0]
+                                break
+
+                if normal_val is None and src_tbl in (self.schemas or {}):
+                    col_def = self.schemas[src_tbl].get(src_col)
+                    if isinstance(col_def, dict) and "constraints" in col_def:
+                        enum_vals = col_def["constraints"].get("enum")
+                        if isinstance(enum_vals, list):
+                            candidates = [
+                                v for v in enum_vals
+                                if not (type(v) is type(c.value) and v == c.value)
+                            ]
+                            if candidates:
+                                normal_val = candidates[0]
+
+                if normal_val is None:
+                    if isinstance(c.value, bool):
+                        normal_val = not c.value
+                    elif isinstance(c.value, (int, float)):
+                        normal_val = 0 if c.value != 0 else 1
+                    else:
+                        normal_val = "approved" if c.value in ("denied", "rejected", "cancelled") else "completed"
+                normal_overrides.setdefault(src_step, {})[src_col] = normal_val
+
+        trigger_val = absence_checks[0].value
+        if isinstance(trigger_val, bool):
+            path_name = str(trigger_val).lower()
+        elif isinstance(trigger_val, (int, float)):
+            path_name = str(trigger_val)
+        elif isinstance(trigger_val, str) and trigger_val.strip():
+            candidate = trigger_val.strip()
+            path_name = candidate if candidate != "approved" else "rejected"
+        elif trigger_val is not None:
+            path_name = str(trigger_val)
+        else:
+            path_name = "rejected"
+
         return [
             ScenarioPath(
-                name="default",
-                steps=[step.name for step in self.steps],
-                weight=1.0,
-            )
+                name="approved",
+                steps=all_steps,
+                weight=round(1.0 - absent_weight, 3),
+                overrides=normal_overrides,
+            ),
+            ScenarioPath(
+                name=path_name,
+                steps=absent_steps,
+                weight=absent_weight,
+                overrides=absent_overrides,
+            ),
         ]
 
 
@@ -459,6 +695,7 @@ class ScenarioGenerationResult(BaseModel):
     instance_count: int = Field(alias="instanceCount")
     instance_ids: List[str] = Field(alias="instanceIds")
     path_counts: Dict[str, int] = Field(alias="pathCounts")
+    violations: List[ViolationReport] = Field(default_factory=list)
 
     model_config = ConfigDict(
         arbitrary_types_allowed=True,
