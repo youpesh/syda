@@ -192,3 +192,41 @@ def test_agent_retries_text_only_confirmation_and_creates_draft(monkeypatch):
     assert response.scenario is not None
     assert response.scenario.record_count == 10000
     assert response.message == "I created the insurance claims draft."
+
+
+def test_agent_answers_dataset_questions_with_query_dataset(monkeypatch, tmp_path):
+    import syda.query
+
+    (tmp_path / "claim.csv").write_text("claim_id,status\n1,approved\n2,approved\n3,denied\n")
+    calls = []
+    real_query = syda.query.query_dataset
+
+    def spy(output_dir, sql=None, max_rows=200):
+        result = real_query(output_dir, sql, max_rows)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(syda.query, "query_dataset", spy)
+    current = ScenarioConfiguration.model_validate(DOMAIN_TEMPLATES[0])
+    sql = "SELECT status, COUNT(*) AS n FROM claim GROUP BY status ORDER BY status"
+
+    # The second prompt contains "%", which counts as change intent; the answer
+    # must still come back instead of "I haven't changed the saved draft yet".
+    for prompt in ("How many claims were approved vs denied?", "What % of claims were denied?"):
+        calls.clear()
+        _fake_llm(monkeypatch, _ScenarioToolTestModel(
+            tool_name="query_dataset", tool_args={"sql": sql},
+            final_message="2 claims were approved and 1 was denied.",
+        ))
+        response = asyncio.run(compile_scenario_agent(
+            prompt=prompt,
+            current_scenario=current,
+            provider_selection={"agent_model": True, "id": "gemini", "model": "mock", "key": "test"},
+            dataset_dir=str(tmp_path),
+        ))
+        assert calls == [{
+            "ok": True, "columns": ["status", "n"],
+            "rows": [{"status": "approved", "n": 2}, {"status": "denied", "n": 1}],
+            "row_count": 2, "truncated": False,
+        }], prompt
+        assert response.message == "2 claims were approved and 1 was denied.", prompt

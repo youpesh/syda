@@ -168,3 +168,26 @@ def test_cancelling_stream_wait_does_not_cancel_compilation(monkeypatch, convers
     asyncio.run(exercise())
     with factory() as db:
         assert db.get(ChatConversation, conversation_id).messages[-1]["parts"][0]["text"] == "Saved despite stream cancellation"
+
+
+def test_latest_dataset_dir_picks_newest_completed_run_owned_by_user(monkeypatch, conversation_db, tmp_path):
+    from app.models.entities import JobRecord
+
+    factory, user, conversation_id = conversation_db
+    monkeypatch.setattr(agent, "DATA_DIR", tmp_path)
+    other_user = uuid.uuid4()
+    jobs = {"old": (user.id, "complete"), "new": (user.id, "complete"),
+            "running": (user.id, "generating"), "foreign": (other_user, "complete")}
+    with factory() as db:
+        for job_id, (owner, status) in jobs.items():
+            db.add(JobRecord(id=job_id, user_id=owner, status=status, scenario={}))
+            (tmp_path / job_id).mkdir()
+            (tmp_path / job_id / "claim.csv").write_text("id\n1\n")
+        db.commit()
+        conversation = db.get(ChatConversation, conversation_id)
+
+        conversation.runs = [{"jobId": "old"}, {"jobId": "new"}, {"jobId": "running"}, {"jobId": "foreign"}]
+        assert agent._latest_dataset_dir(db, conversation, user.id) == str(tmp_path / "new")
+
+        conversation.runs = [{"jobId": "foreign"}, {"jobId": "running"}]
+        assert agent._latest_dataset_dir(db, conversation, user.id) is None

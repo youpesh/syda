@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 
 from .auth import require_authenticated
 from ..database import SessionLocal, get_db
-from ..models.entities import ChatConversation
+from ..job_queue import DATA_DIR, output_directory
+from ..models.entities import ChatConversation, JobRecord
 from ..models.scenario import ChatRequest, ChatResponse, ScenarioConfiguration
 from ..models.user import User
 from ..agents.scenario_agent import compile_scenario_agent
@@ -127,6 +128,24 @@ def _scenario_is_valid_draft(scenario: ScenarioConfiguration | None) -> TypeGuar
     )
 
 
+def _latest_dataset_dir(db: Session, conversation: ChatConversation, user_id: Any) -> str | None:
+    """Output folder of the conversation's newest completed run, for dataset Q&A."""
+    for run in reversed(conversation.runs or []):
+        job_id = run.get("jobId") if isinstance(run, dict) else None
+        if not isinstance(job_id, str):
+            continue
+        job = (
+            db.query(JobRecord)
+            .filter(JobRecord.id == job_id, JobRecord.user_id == user_id, JobRecord.status == "complete")
+            .first()
+        )
+        if job:
+            directory = output_directory(job, DATA_DIR)
+            if any(directory.glob("*.csv")):
+                return str(directory)
+    return None
+
+
 def _sse(chunk: dict[str, Any]) -> str:
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
@@ -205,6 +224,7 @@ async def chat_with_agent(
 
     conv_id = conversation.id if conversation else None
     user_id = user.id
+    dataset_dir = _latest_dataset_dir(db, conversation, user.id) if conversation else None
 
     async def run_compilation_and_persist():
         response = await compile_scenario_agent(
@@ -212,6 +232,7 @@ async def chat_with_agent(
             current_scenario=current_scenario,
             history=history,
             provider_selection=provider_selection,
+            dataset_dir=dataset_dir,
         )
         if conv_id:
             try:

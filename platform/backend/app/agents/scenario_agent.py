@@ -30,6 +30,7 @@ Conversation behavior:
 - If a draft tool returns validation errors, correct the listed fields and call the tool again. Do not treat draft validation errors as a provider failure.
 - Never infer a specific value from vague language such as “smaller” or “faster.” Ask a concise question when the requested change is ambiguous. Only confirm a change after the draft tool succeeds, and use its returned title, table count, and instance count.
 - Chat can design and validate a dataset scenario; it must not start dataset generation. Generation requires the user's explicit action in the interface.
+- When the query_dataset tool is available, answer questions about the generated data (counts, rates, averages, quality checks such as orphaned foreign keys) by querying it with one read-only SQLite SELECT per call. Call it without sql first if you need table or column names. Report only numbers the tool returns; never estimate them. Querying never changes the scenario draft.
 
 Natural business language translation:
 - Users are business users and domain experts who express requirements in natural, non-technical language (e.g. "Create a loan approval scenario with 50 instances where 20% of loans are rejected and rejected loans don't get disbursed" or "I want an e-commerce order scenario where cancelled orders are never shipped").
@@ -769,6 +770,7 @@ async def compile_scenario_agent(
     current_scenario: Optional[ScenarioConfiguration] = None,
     history: Optional[List[Dict[str, Any]]] = None,
     provider_selection: Optional[dict[str, Any]] = None,
+    dataset_dir: Optional[str] = None,
 ) -> ChatResponse:
     """
     Uses the configured conversational agent and validated draft tools. Safe fallback replies
@@ -820,6 +822,21 @@ async def compile_scenario_agent(
             # The model decides which fields to change; tools merge and validate
             # that intent against the canonical draft loaded for this turn.
             staged_candidate: dict[str, Optional[ScenarioConfiguration]] = {"scenario": None}
+            dataset_queried = {"used": False}
+
+            if dataset_dir:
+                context_str += (
+                    "\nThis chat's latest generation run produced a dataset. Answer questions "
+                    "about the generated data with query_dataset.\n"
+                )
+
+                @agent.tool_plain
+                def query_dataset(sql: Optional[str] = None) -> dict[str, Any]:
+                    """Run one read-only SQLite SELECT over this chat's latest generated dataset (each CSV is a table). Omit sql to list tables, columns and row counts."""
+                    from syda.query import query_dataset as run_query
+
+                    dataset_queried["used"] = True
+                    return run_query(dataset_dir, sql)
 
             @agent.tool_plain
             def create_scenario_draft(patch: ScenarioCreationPatch) -> dict[str, Any]:
@@ -876,7 +893,10 @@ async def compile_scenario_agent(
 
             @cast(Any, agent).output_validator
             def require_created_draft(reply: ScenarioAgentReply) -> ScenarioAgentReply:
-                if should_attach_scenario and current_scenario is None and staged_candidate["scenario"] is None:
+                if (
+                    should_attach_scenario and current_scenario is None
+                    and staged_candidate["scenario"] is None and not dataset_queried["used"]
+                ):
                     raise ModelRetry(
                         "No scenario has been created. Call create_scenario_draft and correct any "
                         "validation errors before confirming the scenario. If the starter already "
@@ -905,6 +925,12 @@ async def compile_scenario_agent(
                 if not should_attach_scenario:
                     return ChatResponse(message=clean_msg, scenario=None)
                 validated_output = staged_candidate["scenario"]
+                if validated_output is None and dataset_queried["used"]:
+                    # A data question that happened to match change-intent words.
+                    return ChatResponse(
+                        message=clean_msg,
+                        scenario=current_scenario if current_scenario and _scenario_is_useful(current_scenario) else None,
+                    )
                 if validated_output is None:
                     return ChatResponse(
                         message=(
