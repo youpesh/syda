@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, TypeGuard
@@ -225,6 +224,12 @@ async def chat_with_agent(
     conv_id = conversation.id if conversation else None
     user_id = user.id
     dataset_dir = _latest_dataset_dir(db, conversation, user.id) if conversation else None
+    # Sync tools run in a worker thread, so hand status updates back to this loop.
+    loop = asyncio.get_running_loop()
+    status_queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def report_status(text: str) -> None:
+        loop.call_soon_threadsafe(status_queue.put_nowait, text)
 
     async def run_compilation_and_persist():
         response = await compile_scenario_agent(
@@ -233,6 +238,7 @@ async def chat_with_agent(
             history=history,
             provider_selection=provider_selection,
             dataset_dir=dataset_dir,
+            on_status=report_status,
         )
         if conv_id:
             try:
@@ -298,10 +304,20 @@ async def chat_with_agent(
             while not compilation_task.done():
                 if await request.is_disconnected():
                     return
-                done, _ = await asyncio.wait(
-                    {compilation_task}, timeout=CHAT_HEARTBEAT_SECONDS,
-                )
-                if not done:
+                next_status = asyncio.ensure_future(status_queue.get())
+                try:
+                    done, _ = await asyncio.wait(
+                        {compilation_task, next_status},
+                        timeout=CHAT_HEARTBEAT_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not next_status.done():
+                        next_status.cancel()
+                if next_status in done:
+                    # Transient: shown live by useChat's onData, never saved to the transcript.
+                    yield _sse({"type": "data-status", "data": {"message": next_status.result()}, "transient": True})
+                elif not done:
                     yield ": keep-alive\n\n"
             if await request.is_disconnected():
                 return
@@ -309,11 +325,7 @@ async def chat_with_agent(
             text_id = "scenario-response"
             yield _sse({"type": "start"})
             yield _sse({"type": "text-start", "id": text_id})
-            for delta in re.findall(r"\S+\s*", response.message):
-                if await request.is_disconnected():
-                    return
-                yield _sse({"type": "text-delta", "id": text_id, "delta": delta})
-                await asyncio.sleep(0.015)
+            yield _sse({"type": "text-delta", "id": text_id, "delta": response.message})
             yield _sse({"type": "text-end", "id": text_id})
             if response.scenario is not None:
                 yield _sse({

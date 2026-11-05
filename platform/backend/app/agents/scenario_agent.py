@@ -2,7 +2,7 @@ import re
 import asyncio
 import logging
 import json
-from typing import Optional, List, Dict, Any, cast
+from typing import Optional, List, Dict, Any, Callable, cast
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, Json, field_validator
 
@@ -771,11 +771,18 @@ async def compile_scenario_agent(
     history: Optional[List[Dict[str, Any]]] = None,
     provider_selection: Optional[dict[str, Any]] = None,
     dataset_dir: Optional[str] = None,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> ChatResponse:
     """
     Uses the configured conversational agent and validated draft tools. Safe fallback replies
     preserve the canonical draft and never synthesize an edit when the provider is unavailable.
     """
+    def status(text: str) -> None:
+        # ponytail: tools report their own progress; event_stream_handler would also
+        # switch model calls to streaming requests, which this doesn't need.
+        if on_status:
+            on_status(text)
+
     provider = provider_selection or resolve_provider()
     recent_user_context = "\n".join(
         item["content"]
@@ -836,11 +843,13 @@ async def compile_scenario_agent(
                     from syda.query import query_dataset as run_query
 
                     dataset_queried["used"] = True
+                    status("Querying the generated data…")
                     return run_query(dataset_dir, sql)
 
             @agent.tool_plain
             def create_scenario_draft(patch: ScenarioCreationPatch) -> dict[str, Any]:
                 """Apply requested changes to a validated domain starter, then validate and stage the new draft."""
+                status("Drafting the scenario…")
                 candidate_data = _starter_scenario_for_context(conversation_context).model_dump(by_alias=True)
                 changes = patch.model_dump(by_alias=True, exclude_unset=True)
                 candidate_data.update(changes)
@@ -851,6 +860,7 @@ async def compile_scenario_agent(
                     return {"valid": False, "errors": [str(error)]}
                 validated, errors = _validate_scenario_candidate(candidate)
                 if validated is None:
+                    status("Fixing validation issues…")
                     return {"valid": False, "errors": errors}
                 staged_candidate["scenario"] = validated
                 return {
@@ -863,6 +873,7 @@ async def compile_scenario_agent(
             @agent.tool_plain
             def update_scenario_draft(patch: ScenarioDraftPatch) -> dict[str, Any]:
                 """Apply only the model-selected fields to the saved draft, preserving all unspecified values."""
+                status("Updating the draft…")
                 if current_scenario is None:
                     return {"valid": False, "errors": ["There is no saved scenario to update. Create a new draft instead."]}
                 changes = patch.model_dump(by_alias=True, exclude_unset=True)
@@ -881,6 +892,7 @@ async def compile_scenario_agent(
                     return {"valid": False, "errors": [str(error)]}
                 validated, errors = _validate_scenario_candidate(candidate)
                 if validated is None:
+                    status("Fixing validation issues…")
                     return {"valid": False, "errors": errors}
                 staged_candidate["scenario"] = validated
                 return {
