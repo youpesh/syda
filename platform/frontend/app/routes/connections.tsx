@@ -34,7 +34,7 @@ export default function Connections() {
             <div className="flex flex-wrap gap-2">
               <LiveConnections connections={connections} source={source} onSource={setSource} disabled={false} />
             </div>
-            {connections.profiles.length > 0 && <ul className="divide-y rounded-xl border text-sm">{connections.profiles.map(p => <li key={p.id} className="flex flex-wrap items-center gap-2 px-3 py-2"><span className="font-medium">{p.name}</span><Badge variant="outline">{p.dialect}</Badge><span className="truncate text-xs text-muted-foreground">{p.username}@{p.host}:{p.port}/{p.database}</span></li>)}</ul>}
+            {connections.profiles.length > 0 && <ul className="divide-y rounded-xl border text-sm">{connections.profiles.map(p => <li key={p.id}><Button type="button" variant="ghost" className="h-auto w-full flex-wrap justify-start gap-2 rounded-none px-3 py-2 font-normal" onClick={() => connections.show(p.id)}><span className="font-medium">{p.name}</span><Badge variant="outline">{p.dialect}</Badge><span className="truncate text-xs text-muted-foreground">{p.username}@{p.host}:{p.port}/{p.database}</span></Button></li>)}</ul>}
             <p className="text-xs text-muted-foreground">Connection profiles are saved to your account after a successful test. Passwords are never saved.</p>
           </CardContent>
         </Card>

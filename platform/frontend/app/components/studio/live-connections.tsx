@@ -7,11 +7,13 @@ import type { SchemaTable } from "~/lib/studio-types";
 
 export type Profile = { id: string; name: string; dialect: "PostgreSQL" | "MySQL" | "Oracle"; host: string; port: string; database: string; username: string };
 export type SchemaSource = { name: string; schemas: Record<string, SchemaTable> };
-const fresh = (): Profile => ({ id: crypto.randomUUID(), name: "New connection", dialect: "PostgreSQL", host: "localhost", port: "5432", database: "", username: "" });
+const fresh = (): Profile => ({ id: crypto.randomUUID(), name: "New connection", dialect: "PostgreSQL", host: "", port: "5432", database: "", username: "" });
 
 export function useLiveProfiles() {
+  // Saved profiles only. The dialog edits `draft`, a copy that joins `profiles` once save() succeeds.
   const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [active, setActive] = useState("");
+  const [draft, setDraft] = useState<Profile | null>(null);
+  const [open, setOpen] = useState(false);
   useEffect(() => {
     void fetch("/api/connections/profiles").then(r => r.ok ? r.json() : []).then((saved: (Omit<Profile, "port"> & { port: number })[]) => {
       // Keep any profile added before the list arrived.
@@ -21,23 +23,26 @@ export function useLiveProfiles() {
   const save = async (profile: Profile) => {
     const response = await fetch(`/api/connections/profiles/${profile.id}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...profile, port: Number(profile.port) }) });
     if (!response.ok) throw new Error("Schema loaded, but the connection profile could not be saved. Check the connection name and retry.");
+    setProfiles(prev => prev.some(p => p.id === profile.id) ? prev.map(p => p.id === profile.id ? profile : p) : [...prev, profile]);
   };
-  // 404 means the profile was never saved.
-  const remove = (id: string) => fetch(`/api/connections/profiles/${id}`, { method: "DELETE" }).catch(() => undefined);
-  return { profiles, setProfiles, active, setActive, save, remove };
+  const remove = (id: string) => { setProfiles(prev => prev.filter(p => p.id !== id)); void fetch(`/api/connections/profiles/${id}`, { method: "DELETE" }).catch(() => undefined); };
+  // Opens the dialog on the given profile, else the first saved one, else a new draft. Any earlier unsaved draft is dropped.
+  const show = (id?: string) => { const p = profiles.find(x => x.id === id) ?? profiles[0]; setDraft(p ? { ...p } : fresh()); setOpen(true); };
+  return { profiles, draft, setDraft, open, setOpen, show, save, remove };
 }
 export function LiveConnections({ source, onSource, disabled, connections }: { source: SchemaSource | null; onSource: (value: SchemaSource | null) => void; disabled: boolean; connections: ReturnType<typeof useLiveProfiles> }) {
-  const [open, setOpen] = useState(false);
-  const { profiles, setProfiles, active, setActive, save, remove } = connections;
+  const { profiles, draft: profile, setDraft, open, setOpen, show, save, remove } = connections;
   const [password, setPassword] = useState("");
   const [schemas, setSchemas] = useState<Record<string, SchemaTable> | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const version = useRef(0);
-  const profile = profiles.find(p => p.id === active);
+  const active = profile?.id ?? "";
+  const saved = profiles.some(p => p.id === active);
+  const options = profile ? [...profiles.map(p => p.id === active ? profile : p), ...(saved ? [] : [profile])] : profiles;
   const reset = () => { version.current++; setBusy(false); setSchemas(null); setPassword(""); setError(""); };
-  const add = () => { reset(); const p = fresh(); setProfiles(prev => [...prev, p]); setActive(p.id); };
-  const update = (patch: Partial<Profile>) => { version.current++; setSchemas(null); setError(""); setProfiles(prev => prev.map(p => p.id === active ? { ...p, ...patch } : p)); };
+  const add = () => { reset(); setDraft(fresh()); };
+  const update = (patch: Partial<Profile>) => { version.current++; setSchemas(null); setError(""); setDraft(d => d && { ...d, ...patch }); };
   const inspect = async () => {
     if (!profile) return;
     const requestVersion = ++version.current;
@@ -54,18 +59,18 @@ export function LiveConnections({ source, onSource, disabled, connections }: { s
     } finally { if (requestVersion === version.current) setBusy(false); }
   };
   return <>
-    <Button type="button" size="sm" variant="outline" className="h-9 min-w-0 max-w-full" disabled={disabled} onClick={() => { setOpen(true); if (!profiles.length) add(); }}><span className="truncate">{source ? `Source: ${source.name}` : "Connect database"}</span></Button>
+    <Button type="button" size="sm" variant="outline" className="h-9 min-w-0 max-w-full" disabled={disabled} onClick={() => show()}><span className="truncate">{source ? `Source: ${source.name}` : "Connect database"}</span></Button>
     {source && <Button type="button" size="sm" className="h-9" variant="ghost" disabled={disabled} onClick={() => onSource(null)}>Use CSV only</Button>}
-    <Dialog open={open} onOpenChange={next => { setOpen(next); if (!next) reset(); }}><DialogContent className="w-[calc(100%-2rem)] max-w-3xl max-h-[85svh] overflow-y-auto"><DialogHeader><DialogTitle>Database connections</DialogTitle><DialogDescription>Import table structure into your prompt. No database records are read or written. Profiles are saved to your account after a successful test; passwords are never saved.</DialogDescription></DialogHeader>
-      <div className="flex flex-wrap items-end gap-2"><label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">Connection<select aria-label="Connection" className="h-9 w-full min-w-0 rounded-xl border bg-background px-3" value={active} disabled={busy} onChange={e => { reset(); setActive(e.target.value); }}>{profiles.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><Button type="button" variant="outline" disabled={busy} onClick={add}>Add connection</Button></div>
+    <Dialog open={open} onOpenChange={next => { setOpen(next); if (!next) reset(); }}><DialogContent className="w-[calc(100%-2rem)] max-w-3xl max-h-[85svh] overflow-y-auto"><DialogHeader><DialogTitle>Database connections</DialogTitle><DialogDescription>Syda reads table structure only, never records, and uses it to build a scenario. Profiles are saved to your account after a successful test; passwords are never saved.</DialogDescription></DialogHeader>
+      <div className="flex flex-wrap items-end gap-2"><label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">Connection<select aria-label="Connection" className="h-9 w-full min-w-0 rounded-xl border bg-background px-3" value={active} disabled={busy} onChange={e => { reset(); show(e.target.value); }}>{options.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><Button type="button" variant="outline" disabled={busy} onClick={add}>Add connection</Button></div>
       {profile && <div className="grid gap-3 sm:grid-cols-2">
-        {([['name', 'Connection name'], ['host', 'Host'], ['port', 'Port'], ['database', 'Database / service name'], ['username', 'Username']] as const).map(([key, label]) => <label key={key} className="flex flex-col gap-1 text-xs">{label}<Input disabled={busy} value={profile[key]} onChange={e => update({ [key]: e.target.value })} /></label>)}
         <label className="flex flex-col gap-1 text-xs">Database type<select className="h-9 rounded-xl border bg-background px-3" disabled={busy} value={profile.dialect} onChange={e => { const dialect = e.target.value as Profile['dialect']; update({ dialect, port: dialect === "MySQL" ? "3306" : dialect === "Oracle" ? "1521" : "5432" }); }}><option>PostgreSQL</option><option>MySQL</option><option>Oracle</option></select></label>
+        {([['name', 'Connection name'], ['host', 'Host'], ['port', 'Port'], ['database', 'Database / service name'], ['username', 'Username']] as const).map(([key, label]) => <label key={key} className="flex flex-col gap-1 text-xs">{label}<Input disabled={busy} value={profile[key]} onChange={e => update({ [key]: e.target.value })} />{key === "host" && <span className="text-muted-foreground">Must be reachable from the Syda server</span>}</label>)}
         <label className="flex flex-col gap-1 text-xs">Password<Input type="password" autoComplete="off" disabled={busy} value={password} onChange={e => { setPassword(e.target.value); setSchemas(null); }} /></label>
       </div>}
       {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-      <div className="flex flex-wrap gap-2"><Button type="button" disabled={busy || !profile?.database.trim() || !profile?.username.trim() || !profile?.host.trim() || !/^\d+$/.test(profile?.port ?? "") || Number(profile?.port) < 1 || Number(profile?.port) > 65535} onClick={() => void inspect()}>{busy ? "Reading schema…" : error ? "Retry connection" : "Test & load schema"}</Button>{profile && <Button type="button" variant="outline" disabled={busy} onClick={() => { reset(); void remove(active); setProfiles(p => p.filter(x => x.id !== active)); setActive(profiles.find(x => x.id !== active)?.id ?? ""); }}>Remove profile</Button>}</div>
-      {schemas && <><SchemaExplorer key={active} schemas={schemas} /><p className="text-xs text-muted-foreground">The imported schema will be included with your next prompt and shared with the configured AI provider. Review the generated plan before running it. Output is a CSV download.</p><Button type="button" disabled={!Object.keys(schemas).length} onClick={() => { onSource({ name: profile?.name || "Database", schemas }); setOpen(false); reset(); }}>Use this schema</Button></>}
+      <div className="flex flex-wrap gap-2"><Button type="button" disabled={busy || !profile?.database.trim() || !profile?.username.trim() || !profile?.host.trim() || !/^\d+$/.test(profile?.port ?? "") || Number(profile?.port) < 1 || Number(profile?.port) > 65535} onClick={() => void inspect()}>{busy ? "Reading schema…" : error ? "Retry connection" : "Test & load schema"}</Button>{profile && <Button type="button" variant="outline" disabled={busy} onClick={() => { reset(); if (saved) remove(active); const next = profiles.find(x => x.id !== active); if (next) setDraft({ ...next }); else setOpen(false); }}>{saved ? "Remove profile" : "Discard"}</Button>}</div>
+      {schemas && <><SchemaExplorer key={active} schemas={schemas} /><p className="text-xs text-muted-foreground">The imported structure is used to build your scenario and is shared with the configured AI provider. Review the generated plan before running it.</p><Button type="button" disabled={!Object.keys(schemas).length} onClick={() => { onSource({ name: profile?.name || "Database", schemas }); setOpen(false); reset(); }}>Use this schema</Button></>}
     </DialogContent></Dialog>
   </>;
 }
