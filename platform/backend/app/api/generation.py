@@ -192,6 +192,12 @@ def _job_payload(job: JobRecord) -> Dict[str, Any]:
     return payload
 
 
+def _documents(job_dir: Path) -> list[Path]:
+    """Linked documents rendered under <job_dir>/<table>/, in document order."""
+    files = [path for path in job_dir.glob("*/document_*") if path.suffix in (".pdf", ".html")]
+    return sorted(files, key=lambda path: (path.parent.name, len(path.name), path.name))
+
+
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, db: Session = Depends(get_db), user: User = Depends(require_authenticated)):
     """Return one persisted run with its scenario snapshot and results."""
@@ -224,10 +230,13 @@ async def preview_generated_dataset(
     job_id: str,
     limit: int = Query(25, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    table: Optional[str] = Query(None, description="Return only this table"),
+    column: Optional[str] = Query(None, description="With value: keep rows where column equals value"),
+    value: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_authenticated),
 ):
-    """Return one page of every generated table for browsing in the UI."""
+    """Return one page of every generated table, or of one table filtered by column = value."""
     job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -243,16 +252,65 @@ async def preview_generated_dataset(
     row_counts_by_name = {
         name.lower(): count for name, count in (stats.table_row_counts.items() if stats else [])
     }
+    if table is not None:
+        csv_files = [path for path in csv_files if path.stem.lower() == table.lower()]
+        if not csv_files:
+            raise HTTPException(status_code=404, detail=f"Table '{table}' was not generated")
+    filtering = table is not None and column is not None and value is not None
     tables = {}
     for path in csv_files:
-        raw_frame = pd.read_csv(path, skiprows=range(1, offset + 1), nrows=limit)
+        row_count = row_counts_by_name.get(path.stem.lower(), 0)
+        if filtering:
+            # ponytail: reads the whole table to filter; index the CSVs if tables outgrow memory.
+            full = pd.read_csv(path, dtype={column: str})
+            if column not in full.columns:
+                raise HTTPException(status_code=400, detail=f"Unknown column '{column}'")
+            matches = full[full[column] == value]
+            row_count = len(matches)
+            raw_frame = matches.iloc[offset:offset + limit]
+        else:
+            raw_frame = pd.read_csv(path, skiprows=range(1, offset + 1), nrows=limit)
         frame = raw_frame.astype(object).where(pd.notna(raw_frame), None)
         tables[path.stem] = {
             "columns": frame.columns.tolist(),
             "rows": frame.to_dict(orient="records"),
-            "rowCount": row_counts_by_name.get(path.stem.lower(), 0),
+            "rowCount": row_count,
         }
-    return {"jobId": job_id, "tables": tables}
+    documents = [
+        {"table": path.parent.name, "name": path.name,
+         "url": f"/api/documents/{job_id}/{path.parent.name}/{path.name}"}
+        for path in _documents(job_dir)
+    ]
+    return {"jobId": job_id, "tables": tables, "documents": documents}
+
+
+@router.get("/documents/{job_id}/{table}/{name}")
+async def get_document(
+    job_id: str,
+    table: str,
+    name: str,
+    download: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
+):
+    """Serve one linked document inline for preview, or as an attachment."""
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
+    if not job or job.status != "complete":
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = output_directory(job, DATA_DIR) / table / name
+    if path not in _documents(output_directory(job, DATA_DIR)):
+        raise HTTPException(status_code=404, detail="Document not found")
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if path.suffix == ".html":
+        # Rendered from user/LLM content: never run it with the app's origin.
+        headers["Content-Security-Policy"] = "sandbox"
+    return FileResponse(
+        path,
+        media_type="application/pdf" if path.suffix == ".pdf" else "text/html",
+        filename=f"{table}_{name}",
+        content_disposition_type="attachment" if download else "inline",
+        headers=headers,
+    )
 
 
 @router.get("/evaluation/{job_id}/report")
@@ -343,6 +401,7 @@ async def download_generated_dataset(
     title_slug = scenario.title.lower().replace(" ", "_")
 
     csv_files = list(job_dir.glob("*.csv")) if job_dir.exists() else []
+    documents = _documents(job_dir)
 
     # If specific table requested or only 1 table generated
     if table:
@@ -367,7 +426,7 @@ async def download_generated_dataset(
             )
         raise HTTPException(status_code=404, detail=f"Table '{table}' was not generated")
 
-    if len(csv_files) == 1 and format == "csv":
+    if len(csv_files) == 1 and format == "csv" and not documents:
         return FileResponse(
             csv_files[0],
             media_type="text/csv",
@@ -375,7 +434,7 @@ async def download_generated_dataset(
         )
 
     if csv_files and format == "json":
-        if len(csv_files) == 1:
+        if len(csv_files) == 1 and not documents:
             raw_frame = pd.read_csv(csv_files[0])
             records = raw_frame.astype(object).where(pd.notna(raw_frame), None).to_dict(orient="records")
             return JSONResponse(
@@ -388,6 +447,8 @@ async def download_generated_dataset(
                 raw_frame = pd.read_csv(path)
                 records = raw_frame.astype(object).where(pd.notna(raw_frame), None).to_dict(orient="records")
                 zf.writestr(f"{path.stem}.json", json.dumps(records, default=str))
+            for path in documents:
+                zf.write(path, arcname=f"{path.parent.name}/{path.name}")
         buf.seek(0)
         return StreamingResponse(
             iter([buf.getvalue()]),
@@ -395,12 +456,14 @@ async def download_generated_dataset(
             headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(f'{title_slug}_{job_id}_json.zip', safe='')}"},
         )
 
-    if len(csv_files) > 1:
+    if len(csv_files) > 1 or documents:
         # Stream zip archive with all tables
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for f in csv_files:
                 zf.write(f, arcname=f.name)
+            for path in documents:
+                zf.write(path, arcname=f"{path.parent.name}/{path.name}")
         buf.seek(0)
 
         return StreamingResponse(

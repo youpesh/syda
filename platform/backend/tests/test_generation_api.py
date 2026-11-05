@@ -562,6 +562,71 @@ def test_cancel_generation_job(monkeypatch, tmp_path):
         assert repeat.status_code == 400
 
 
+def _document_scenario(output: str = "html", name: str = "Note") -> dict:
+    scenario = _scenario(record_count=3)
+    scenario["workflow"].append(name)
+    scenario["schemas"][name] = {
+        "__template__": True,
+        "__template_source__": "<p>{{ name }}</p><p>{{ name.__class__.__mro__ }}</p>",
+        "__output_file_type__": output,
+        "__foreign_keys__": {"parent_id": "Parent.parent_id", "name": "Parent.name"},
+        "note_id": {"type": "integer", "constraints": {"primary_key": True}},
+        "parent_id": "foreign_key",
+        "name": "text",
+    }
+    return scenario
+
+
+def test_linked_documents_are_generated_previewed_and_downloaded(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        job_id = client.post("/api/generate", json={"scenario": _document_scenario()}).json()["jobId"]
+        assert client.get(f"/api/status/{job_id}").json()["status"] == "complete"
+
+        documents = client.get(f"/api/preview/{job_id}").json()["documents"]
+        assert [doc["name"] for doc in documents] == ["document_1.html", "document_2.html", "document_3.html"]
+        parent_names = {row["name"] for row in client.get(f"/api/preview/{job_id}").json()["tables"]["parent"]["rows"]}
+
+        inline = client.get(documents[0]["url"])
+        assert inline.status_code == 200
+        assert inline.headers["content-security-policy"] == "sandbox"
+        assert inline.headers["content-disposition"].startswith("inline")
+        assert any(name in inline.text for name in parent_names)  # linked to its parent row
+        assert "<class" not in inline.text  # sandboxed Jinja
+        assert client.get(documents[0]["url"] + "?download=true").headers["content-disposition"].startswith("attachment")
+        assert client.get(f"/api/documents/{job_id}/..").status_code == 404
+        assert client.get(f"/api/documents/{job_id}/Note/..%2F..%2Fjob.db").status_code == 404
+
+        for format in ("csv", "json"):
+            with zipfile.ZipFile(io.BytesIO(client.get(f"/api/download/{job_id}?format={format}").content)) as archive:
+                assert "Note/document_3.html" in archive.namelist()
+
+        other = User(id=uuid.uuid4(), email="other@example.com", hashed_password="x",
+                     is_active=True, is_superuser=False, is_verified=True)
+        app.dependency_overrides[require_authenticated] = lambda: other
+        assert client.get(documents[0]["url"]).status_code == 404
+        assert client.get(f"/api/preview/{job_id}").status_code == 404
+
+
+def test_linked_pdf_documents_render_with_weasyprint(monkeypatch, tmp_path):
+    try:
+        import weasyprint  # noqa: F401
+    except OSError:
+        pytest.skip("WeasyPrint system libraries (pango) are not installed")
+    with _client(monkeypatch, tmp_path) as client:
+        job_id = client.post("/api/generate", json={"scenario": _document_scenario("pdf")}).json()["jobId"]
+        documents = client.get(f"/api/preview/{job_id}").json()["documents"]
+        assert [doc["name"] for doc in documents] == ["document_1.pdf", "document_2.pdf", "document_3.pdf"]
+        pdf = client.get(documents[0]["url"])
+        assert pdf.headers["content-type"] == "application/pdf"
+        assert pdf.content.startswith(b"%PDF")
+
+
+def test_document_table_names_and_outputs_are_validated(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        for scenario in (_document_scenario(name="../Note"), _document_scenario(output="docx")):
+            assert client.post("/api/generate", json={"scenario": scenario}).status_code == 422
+
+
 @pytest.mark.parametrize('format', ['csv', 'json'])
 def test_zip_download_encodes_commas_quotes_and_unicode_in_title(monkeypatch, tmp_path, format):
     from urllib.parse import unquote
@@ -582,3 +647,25 @@ def test_zip_download_encodes_commas_quotes_and_unicode_in_title(monkeypatch, tm
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             assert len(archive.namelist()) == 2
             assert all(name.endswith('.' + format) for name in archive.namelist())
+
+
+def test_preview_pages_one_table_filtered_by_column_value(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        job_id = client.post("/api/generate", json={"scenario": _scenario()}).json()["jobId"]
+        children = client.get(f"/api/preview/{job_id}?table=child&limit=100").json()["tables"]
+        assert list(children) == ["child"]
+        parent_id = str(children["child"]["rows"][0]["parent_id"])
+        expected = [row for row in children["child"]["rows"] if str(row["parent_id"]) == parent_id]
+
+        filtered = client.get(f"/api/preview/{job_id}", params={"table": "Child", "column": "parent_id", "value": parent_id, "limit": 1})
+        assert filtered.status_code == 200
+        table = filtered.json()["tables"]["child"]
+        assert table["rowCount"] == len(expected)
+        assert [str(row["parent_id"]) for row in table["rows"]] == [parent_id]
+
+        assert client.get(f"/api/preview/{job_id}?table=Missing").status_code == 404
+        assert client.get(f"/api/preview/{job_id}", params={"table": "Child", "column": "nope", "value": "1"}).status_code == 400
+
+        other = User(id=uuid.uuid4(), email="other@example.com", hashed_password="x", is_active=True, is_superuser=False, is_verified=True)
+        app.dependency_overrides[require_authenticated] = lambda: other
+        assert client.get(f"/api/preview/{job_id}?table=Child").status_code == 404

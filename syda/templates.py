@@ -8,25 +8,32 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Set, Tuple
 from sqlalchemy import Column, inspect
 import jinja2
+import jinja2.sandbox
 
 
 class TemplateProcessor:
     """Process document templates with placeholders and generate synthetic data."""
     
-    def __init__(self, file_processor=None):
+    def __init__(self, file_processor=None, url_fetcher=None):
         """
         Initialize the template processor.
         
         Args:
             file_processor: Optional file processor for handling different file types.
                            If None, a new UnstructuredDataProcessor will be created.
+            url_fetcher: Optional WeasyPrint url_fetcher used when rendering PDFs,
+                         e.g. to block external resources in untrusted templates.
         """
+        self.url_fetcher = url_fetcher
         # Import here to avoid circular imports
         from .unstructured import UnstructuredDataProcessor
         
         self.file_processor = file_processor or UnstructuredDataProcessor()
         self.placeholder_pattern = re.compile(r'{{\s*([a-zA-Z0-9_]+)\s*}}')
         
+    def _weasyprint_kwargs(self) -> Dict[str, Any]:
+        return {"url_fetcher": self.url_fetcher} if self.url_fetcher else {}
+
     def extract_placeholders(self, text: str) -> Set[str]:
         """
         Extract placeholder field names from text.
@@ -135,8 +142,8 @@ class TemplateProcessor:
         template_dir = os.path.dirname(os.path.abspath(template_path))
         template_file = os.path.basename(template_path)
         
-        # Set up Jinja2 environment
-        env = jinja2.Environment(
+        # Sandboxed so templates cannot reach Python internals.
+        env = jinja2.sandbox.SandboxedEnvironment(
             loader=jinja2.FileSystemLoader(template_dir),
             autoescape=jinja2.select_autoescape(['html', 'xml'])
         )
@@ -229,14 +236,14 @@ class TemplateProcessor:
                 if not pdf_path.endswith('.pdf'):
                     pdf_path = f"{os.path.splitext(output_path)[0]}.pdf"
                     
-                HTML(string=content).write_pdf(pdf_path)
+                HTML(string=content, **self._weasyprint_kwargs()).write_pdf(pdf_path)
                 
                 # Remove intermediate HTML if it was created
                 if html_path != output_path and os.path.exists(html_path):
                     os.remove(html_path)
                     
                 return pdf_path
-            except ImportError:
+            except (ImportError, OSError):  # OSError: system libs (pango) missing
                 print("WeasyPrint not installed. Saving as HTML only.")
                 return html_path
         
@@ -294,14 +301,14 @@ class TemplateProcessor:
             try:
                 from weasyprint import HTML
                 pdf_path = f"{os.path.splitext(output_path)[0]}.pdf"
-                HTML(string=html_content).write_pdf(pdf_path)
+                HTML(string=html_content, **self._weasyprint_kwargs()).write_pdf(pdf_path)
                 
                 # Remove intermediate HTML
                 if os.path.exists(html_path):
                     os.remove(html_path)
                     
                 return pdf_path
-            except ImportError:
+            except (ImportError, OSError):  # OSError: system libs (pango) missing
                 print("WeasyPrint not installed. Saving as text only.")
                 # Fall through to text saving
         
