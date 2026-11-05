@@ -5,9 +5,8 @@ import type { Route } from "./+types/scenario-editor";
 import { AppShell } from "~/components/studio/app-shell";
 import { ScenarioConfigurator } from "~/components/studio/scenario-configurator";
 import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
-import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
+import { Card, CardContent } from "~/components/ui/card";
 import { Spinner } from "~/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "~/components/ui/tabs";
 import type { CostEstimate, SavedScenario, ScenarioConfiguration } from "~/lib/studio-types";
@@ -32,7 +31,6 @@ export default function ScenarioEditor() {
   const requestedReturnTo = search.get("returnTo");
   const returnTo = requestedReturnTo?.startsWith("/app") ? requestedReturnTo : undefined;
   const returnMessageId = search.get("messageId") ?? undefined;
-  const [saved, setSaved] = useState<SavedScenario>();
   const [draft, setDraft] = useState<ScenarioConfiguration>();
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -47,7 +45,7 @@ export default function ScenarioEditor() {
         if (!response.ok) throw new Error(response.status === 404 ? "Scenario not found." : `Could not load scenario (${response.status}).`);
         return response.json() as Promise<SavedScenario>;
       })
-      .then((record) => { setSaved(record); setDraft(record.configuration); setDirty(false); })
+      .then((record) => { setDraft(record.configuration); setDirty(false); })
       .catch((fetchError) => { if (!controller.signal.aborted) setError(fetchError instanceof Error ? fetchError.message : "Could not load scenario."); });
     return () => controller.abort();
   }, [scenarioId]);
@@ -73,8 +71,6 @@ export default function ScenarioEditor() {
     try {
       const response = await fetch(`/api/scenarios/${scenarioId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(draft) });
       if (!response.ok) throw new Error(`Could not save scenario (${response.status}).`);
-      const record = await response.json() as SavedScenario;
-      setSaved(record);
       setDirty(false);
       window.dispatchEvent(new Event("syda:scenarios-changed"));
     } catch (saveError) {
@@ -136,7 +132,7 @@ export default function ScenarioEditor() {
     }
   };
 
-  return <AppShell title={draft?.title ?? "Scenario editor"} subtitle="Review the configuration before generation" headerActions={draft && <Button disabled={!dirty || saving} onClick={() => void save().catch(() => {})} size="sm" variant="outline">{saving ? <Spinner data-icon="inline-start" /> : null}{dirty ? "Save changes" : "Saved"}</Button>}>
+  return <AppShell title={draft?.title ?? "Scenario editor"} headerActions={draft && <Button disabled={!dirty || saving} onClick={() => void save().catch(() => {})} size="sm" variant="outline">{saving ? <Spinner data-icon="inline-start" /> : null}{dirty ? "Save changes" : "Saved"}</Button>}>
     <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8">
       <div className="mx-auto max-w-7xl space-y-5">
         {returnTo ? (
@@ -148,19 +144,16 @@ export default function ScenarioEditor() {
         )}
         {error && <Alert variant="destructive"><AlertTitle>Scenario needs attention</AlertTitle><AlertDescription>{error}</AlertDescription></Alert>}
         {!draft ? <div className="flex items-center gap-2 py-12 text-sm text-muted-foreground">{error ? "" : <><Spinner /> Loading scenario…</>}</div> : <>
-          <div className="flex flex-wrap items-start justify-between gap-3"><div><h1 className="text-2xl font-semibold tracking-tight">{draft.title}</h1><p className="mt-1 max-w-3xl text-sm text-muted-foreground">{draft.description}</p></div><Badge variant="outline">{dirty ? "Unsaved changes" : "Saved scenario"}</Badge></div>
           <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
             <Tabs defaultValue="overview" className="min-w-0">
               <TabsList className="max-w-full flex-wrap" variant="line">{sections.map((section) => <TabsTrigger key={section.value} value={section.value}>{section.label}</TabsTrigger>)}</TabsList>
               {sections.map((section) => <TabsContent className="pt-3" key={section.value} value={section.value}><ScenarioConfigurator onChange={updateDraft} scenario={draft} section={section.value} /></TabsContent>)}
             </Tabs>
             <Card className="xl:sticky xl:top-0">
-              <CardHeader><CardTitle>Ready to generate?</CardTitle><CardDescription>Syda will use this saved scenario as a snapshot for the run.</CardDescription></CardHeader>
               <CardContent className="space-y-4">
                 <dl className="space-y-2 text-xs"><div className="flex justify-between gap-3"><dt className="text-muted-foreground">Instances</dt><dd className="font-medium tabular-nums">{draft.recordCount.toLocaleString()}</dd></div><div className="flex justify-between gap-3"><dt className="text-muted-foreground">Tables</dt><dd className="font-medium tabular-nums">{Object.keys(draft.schemas ?? {}).length}</dd></div><div className="flex justify-between gap-3"><dt className="text-muted-foreground">Workflow steps</dt><dd className="font-medium tabular-nums">{draft.workflow.length}</dd></div><div className="flex justify-between gap-3"><dt className="text-muted-foreground">Estimated cost</dt><dd className="font-medium tabular-nums">{estimate?.estimatedCostUsd == null ? "Unavailable" : `$${estimate.estimatedCostUsd.toFixed(4)}`}</dd></div></dl>
                 {estimate?.note && <p className="text-xs text-muted-foreground">{estimate.note}</p>}
                 <Button className="w-full" disabled={generating || saving} onClick={() => void generate()}>{generating ? <Spinner data-icon="inline-start" /> : null}{generating ? "Starting run…" : "Generate dataset"}</Button>
-                {saved && <p className="text-[10px] text-muted-foreground">Scenario ID {saved.id}</p>}
               </CardContent>
             </Card>
           </div>

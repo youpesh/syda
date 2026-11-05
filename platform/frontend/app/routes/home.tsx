@@ -338,31 +338,16 @@ function ScenarioCard({
         <DialogContent className="max-h-[calc(100svh-2rem)] max-w-lg overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Review before generating</DialogTitle>
-            <DialogDescription>This scenario is a plan. No dataset has been generated yet.</DialogDescription>
+            <DialogDescription>{scenario.title}</DialogDescription>
           </DialogHeader>
           <div className="space-y-5">
-            <div>
-              <h3 className="font-medium">{scenario.title}</h3>
-              <p className="mt-1 text-xs leading-5 text-muted-foreground">{scenario.description}</p>
-            </div>
             <dl className="grid grid-cols-2 gap-3 rounded-2xl border bg-muted/30 p-4 text-xs">
               <div><dt className="text-muted-foreground">Scenario instances</dt><dd className="mt-1 font-medium tabular-nums">{scenario.recordCount.toLocaleString()}</dd></div>
               <div><dt className="text-muted-foreground">Connected tables</dt><dd className="mt-1 font-medium tabular-nums">{tableEntries.length || scenario.workflow.length}</dd></div>
               <div><dt className="text-muted-foreground">Workflow steps</dt><dd className="mt-1 font-medium tabular-nums">{scenario.workflow.length}</dd></div>
               <div><dt className="text-muted-foreground">Rules</dt><dd className="mt-1 font-medium tabular-nums">{scenario.rules.length}</dd></div>
             </dl>
-            <section className="space-y-2">
-              <h3 className="text-xs font-medium">Workflow</h3>
-              <p className="text-xs leading-5 text-muted-foreground">{scenario.workflow.join(" → ")}</p>
-            </section>
-            <section className="space-y-2">
-              <h3 className="text-xs font-medium">Generation rules</h3>
-              <ul className="list-disc space-y-1 pl-4 text-xs text-muted-foreground">
-                {scenario.rules.map((rule, index) => <li key={`${rule}-${index}`}>{rule}</li>)}
-              </ul>
-
-            </section>
-            <section className="rounded-2xl border p-4 text-xs space-y-2"><h3 className="font-medium">Source and destination</h3><p>Source: {sourceName}. Review the {tableEntries.length} table definitions below before generating.</p><p>Destination: downloadable CSV files. No database write-back.</p><details><summary className="cursor-pointer">Review table definitions</summary><div className="mt-3"><SchemaExplorer schemas={scenario.schemas ?? {}} /></div></details></section>
+            <section className="rounded-2xl border p-4 text-xs space-y-2"><h3 className="font-medium">Source and destination</h3><p>Source: {sourceName}</p><p>Destination: downloadable CSV files</p></section>
             <section className="rounded-2xl border p-4">
               <div className="flex items-start justify-between gap-3">
                 <div><h3 className="text-xs font-medium">Generation estimate</h3><p className="mt-1 text-[10px] text-muted-foreground">{estimate ? `${estimate.provider} · ${estimate.model}` : "Checking configured provider…"}</p></div>
@@ -423,9 +408,8 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
 
   return (
     <Card className="border-primary/20 shadow-none">
-      <CardHeader className="flex flex-row items-start justify-between gap-3">
-        <div><CardTitle>{complete ? "Dataset ready" : failed ? "Generation failed" : "Generating dataset"}</CardTitle><CardDescription>{run.scenario.title}</CardDescription></div>
-        <Badge variant={failed ? "destructive" : complete ? "secondary" : "outline"}>{status}</Badge>
+      <CardHeader>
+        <CardTitle>{complete ? "Dataset ready" : failed ? "Generation failed" : "Generating dataset"}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {!complete && !failed && <Progress value={job?.progress ?? 10}><ProgressLabel>{job?.currentStage ?? "Starting generation worker…"}</ProgressLabel><ProgressValue>{(value) => value}</ProgressValue></Progress>}
@@ -816,7 +800,7 @@ export default function Home() {
   };
 
   return (
-    <AppShell title={conversationTitle || latestScenario?.title || "New scenario"} subtitle={messages.length ? "Scenario design chat" : "Describe what you want to generate"} onNewScenario={startNewScenario}>
+    <AppShell title={conversationTitle || latestScenario?.title || "New scenario"} onNewScenario={startNewScenario}>
 
         {conversationError && <div className="mx-auto mt-4 w-full max-w-3xl px-5"><Alert variant="destructive"><AlertTitle>Chat history issue</AlertTitle><AlertDescription>{conversationError}</AlertDescription></Alert></div>}
 
@@ -829,7 +813,6 @@ export default function Home() {
               <div className="mb-5 flex size-10 items-center justify-center border bg-card shadow-sm">
                 <HugeiconsIcon icon={SparklesIcon} strokeWidth={1.8} />
               </div>
-              <p className="mb-2 text-xs font-medium text-muted-foreground">New synthetic data scenario</p>
               <h1 className="max-w-lg text-center text-3xl font-semibold tracking-[-0.035em] sm:text-4xl">What should we generate?</h1>
               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">
                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.

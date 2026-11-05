@@ -67,7 +67,7 @@ export function ConnectionDialog({ initial, isSaved, open, onOpenChange, onLoade
     <DialogContent className="w-[calc(100%-2rem)] max-w-xl max-h-[85svh] overflow-y-auto">
       <DialogHeader>
         <DialogTitle>{isSaved ? initial.name : "Add connection"}</DialogTitle>
-        <DialogDescription>Syda reads table structure only, never records, and uses it to build a scenario. The profile is saved after a successful test; the password never is.</DialogDescription>
+        <DialogDescription>The profile is saved after a successful test; the password never is.</DialogDescription>
       </DialogHeader>
       <form className="grid gap-3 sm:grid-cols-2" onSubmit={e => { e.preventDefault(); if (ready && !busy) void inspect(); }}>
         <label className="flex flex-col gap-1 text-xs">Database type
