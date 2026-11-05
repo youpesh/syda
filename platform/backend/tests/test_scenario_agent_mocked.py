@@ -230,3 +230,25 @@ def test_agent_answers_dataset_questions_with_query_dataset(monkeypatch, tmp_pat
             "row_count": 2, "truncated": False,
         }], prompt
         assert response.message == "2 claims were approved and 1 was denied.", prompt
+
+
+def test_staged_draft_survives_prompt_without_change_keywords(monkeypatch):
+    from app.agents.scenario_agent import _has_scenario_change_intent
+
+    prompt = "Double the instance count"
+    assert not _has_scenario_change_intent(prompt)  # the keyword gate misses this edit
+    current = ScenarioConfiguration.model_validate(DOMAIN_TEMPLATES[0])
+    _fake_llm(monkeypatch, _ScenarioToolTestModel(
+        tool_name="update_scenario_draft",
+        tool_args={"record_count": current.record_count * 2},
+        final_message="I doubled the instance count.",
+    ))
+
+    response = asyncio.run(compile_scenario_agent(
+        prompt=prompt,
+        current_scenario=current,
+        provider_selection={"agent_model": True, "id": "gemini", "model": "mock", "key": "test"},
+    ))
+
+    assert response.scenario is not None
+    assert response.scenario.record_count == current.record_count * 2

@@ -922,7 +922,9 @@ async def compile_scenario_agent(
                     else ScenarioAgentReply.model_validate(output)
                 )
                 clean_msg = _clean_agent_message(reply.message)
-                if not should_attach_scenario:
+                # The keyword gate decides when a draft is *required*; it must never
+                # discard one the model actually staged ("split Payment" has no keyword).
+                if not should_attach_scenario and staged_candidate["scenario"] is None:
                     return ChatResponse(message=clean_msg, scenario=None)
                 validated_output = staged_candidate["scenario"]
                 if validated_output is None and dataset_queried["used"]:
