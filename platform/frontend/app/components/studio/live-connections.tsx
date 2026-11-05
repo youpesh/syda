@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "~/components/ui/button";
 import { Input } from "~/components/ui/input";
+import { Textarea } from "~/components/ui/textarea";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "~/components/ui/dialog";
 import type { SchemaTable } from "~/lib/studio-types";
 
-export type Profile = { id: string; name: string; dialect: "PostgreSQL" | "MySQL" | "Oracle"; host: string; port: string; database: string; username: string };
+export type Profile = { id: string; name: string; dialect: "PostgreSQL" | "MySQL" | "Oracle" | "SQL Server"; host: string; port: string; database: string; username: string };
 export type SchemaSource = { name: string; schemas: Record<string, SchemaTable> };
 export const newProfile = (): Profile => ({ id: crypto.randomUUID(), name: "", dialect: "PostgreSQL", host: "", port: "5432", database: "", username: "" });
-const defaultPort = { PostgreSQL: "5432", MySQL: "3306", Oracle: "1521" } as const;
+const defaultPort = { PostgreSQL: "5432", MySQL: "3306", Oracle: "1521", "SQL Server": "1433" } as const;
+const dialects = Object.keys(defaultPort) as Profile["dialect"][];
 
 // Saved profiles only: an entry appears after GET /api/connections/profiles or a successful save().
 export function useLiveProfiles() {
@@ -70,7 +72,7 @@ export function ConnectionDialog({ initial, isSaved, open, onOpenChange, onLoade
       <form className="grid gap-3 sm:grid-cols-2" onSubmit={e => { e.preventDefault(); if (ready && !busy) void inspect(); }}>
         <label className="flex flex-col gap-1 text-xs">Database type
           <select className="h-9 rounded-xl border bg-background px-3" disabled={busy} value={profile.dialect} onChange={e => { const dialect = e.target.value as Profile["dialect"]; update({ dialect, port: defaultPort[dialect] }); }}>
-            {Object.keys(defaultPort).map(d => <option key={d}>{d}</option>)}
+            {dialects.map(d => <option key={d}>{d}</option>)}
           </select>
         </label>
         {fields.map(([key, label]) => <label key={key} className="flex flex-col gap-1 text-xs">{label}
@@ -84,6 +86,57 @@ export function ConnectionDialog({ initial, isSaved, open, onOpenChange, onLoade
         <DialogFooter className="sm:col-span-2">
           <Button type="button" variant="outline" onClick={() => close(false)}>Cancel</Button>
           <Button type="submit" disabled={busy || !ready}>{busy ? "Reading schema…" : error ? "Retry" : "Test & load schema"}</Button>
+        </DialogFooter>
+      </form>
+    </DialogContent>
+  </Dialog>;
+}
+
+/** Read table structure from a pasted CREATE TABLE script: for databases the Syda server cannot reach (private network, localhost). */
+export function DdlDialog({ open, onOpenChange, onLoaded }: { open: boolean; onOpenChange: (open: boolean) => void; onLoaded: (source: SchemaSource) => void }) {
+  const [dialect, setDialect] = useState<Profile["dialect"]>("PostgreSQL");
+  const [name, setName] = useState("");
+  const [ddl, setDdl] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const read = async () => {
+    setBusy(true); setError("");
+    try {
+      const response = await fetch("/api/connections/ddl", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ dialect, ddl }), signal: AbortSignal.timeout(60000) });
+      const result = await response.json().catch(() => ({ detail: "The schema service is unavailable. Check that the backend is running, then retry." }));
+      if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : response.status === 401 ? "Sign in again to read a schema." : "Check the script and try again. Scripts are limited to 2 MB.");
+      onLoaded({ name: name.trim() || `Pasted ${dialect} schema`, schemas: result.schemas });
+      onOpenChange(false);
+    } catch (cause) {
+      setError(cause instanceof Error && cause.name === "TimeoutError" ? "Reading the script timed out. Paste fewer tables and retry." : cause instanceof Error ? cause.message : "Could not read the script. Please retry.");
+    } finally { setBusy(false); }
+  };
+
+  return <Dialog open={open} onOpenChange={onOpenChange}>
+    <DialogContent className="w-[calc(100%-2rem)] max-w-2xl max-h-[85svh] overflow-y-auto">
+      <DialogHeader>
+        <DialogTitle>Paste DDL</DialogTitle>
+        <DialogDescription>No network access to your database needed. Paste CREATE TABLE statements, for example from pg_dump --schema-only, mysqldump --no-data, SQL Developer, or SSMS "Script Table as". Syda parses the script; it never runs it.</DialogDescription>
+      </DialogHeader>
+      <form className="grid gap-3 sm:grid-cols-2" onSubmit={e => { e.preventDefault(); if (ddl.trim() && !busy) void read(); }}>
+        <label className="flex flex-col gap-1 text-xs">Database type
+          <select className="h-9 rounded-xl border bg-background px-3" disabled={busy} value={dialect} onChange={e => { setDialect(e.target.value as Profile["dialect"]); setError(""); }}>
+            {dialects.map(d => <option key={d}>{d}</option>)}
+          </select>
+        </label>
+        <label className="flex flex-col gap-1 text-xs">Schema name
+          <Input disabled={busy} value={name} placeholder="Optional" onChange={e => setName(e.target.value)} />
+        </label>
+        <label className="flex flex-col gap-1 text-xs sm:col-span-2">DDL script
+          <Textarea autoFocus spellCheck={false} disabled={busy} value={ddl} onChange={e => { setDdl(e.target.value); setError(""); }}
+            placeholder={"CREATE TABLE customers (\n  id INT PRIMARY KEY,\n  email VARCHAR(255) NOT NULL UNIQUE\n);"}
+            className="field-sizing-fixed h-72 resize-y overflow-auto font-mono text-xs md:text-xs" />
+        </label>
+        {error && <p role="alert" className="text-sm text-destructive sm:col-span-2">{error}</p>}
+        <DialogFooter className="sm:col-span-2">
+          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
+          <Button type="submit" disabled={busy || !ddl.trim()}>{busy ? "Reading script…" : "Read schema"}</Button>
         </DialogFooter>
       </form>
     </DialogContent>

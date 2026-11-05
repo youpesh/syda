@@ -9,17 +9,23 @@ from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
+from sqlglot.errors import SqlglotError
 from syda.db_schema_loader import DatabaseSchemaLoader
 from .auth import require_authenticated
 from ..database import get_db
 from ..models.entities import ConnectionProfile, JobRecord
 from ..models.user import User
 from ..job_queue import DATA_DIR, output_directory
+from ..services.ddl_schema import schemas_from_ddl
 
 router = APIRouter(prefix="/connections", tags=["Connections"], dependencies=[Depends(require_authenticated)])
 
+Dialect = Literal["PostgreSQL", "MySQL", "Oracle", "SQL Server"]
+MAX_TABLES = 200
+TOO_MANY_TABLES = f"This schema has more than {MAX_TABLES} tables. Narrow it to the tables needed for this scenario."
+
 class ConnectionFields(BaseModel):
-    dialect: Literal["PostgreSQL", "MySQL", "Oracle"]
+    dialect: Dialect
     host: str = Field(min_length=1, max_length=255, pattern=r"^[a-zA-Z0-9._:\-]+$")
     port: int = Field(ge=1, le=65535)
     database: str = Field(min_length=1, max_length=128)
@@ -63,8 +69,8 @@ def delete_profile(profile_id: uuid.UUID, db: Session = Depends(get_db), user: U
         raise HTTPException(404, "Connection not found")
 
 def connection_engine(request: ConnectionRequest, read_only: bool = True):
-    driver = {"PostgreSQL": "postgresql+psycopg2", "MySQL": "mysql+pymysql", "Oracle": "oracle+oracledb"}[request.dialect]
-    options = {"connect_timeout": 10} if request.dialect != "Oracle" else {"tcp_connect_timeout": 10}
+    driver = {"PostgreSQL": "postgresql+psycopg2", "MySQL": "mysql+pymysql", "Oracle": "oracle+oracledb", "SQL Server": "mssql+pymssql"}[request.dialect]
+    options = {"Oracle": {"tcp_connect_timeout": 10}, "SQL Server": {"login_timeout": 10, "timeout": 15 if read_only else 60}}.get(request.dialect, {"connect_timeout": 10})
     if request.dialect == "PostgreSQL":
         timeout = 15000 if read_only else 60000
         options["options"] = f"-c statement_timeout={timeout}" + (" -c default_transaction_read_only=on" if read_only else "")
@@ -80,8 +86,8 @@ def inspect_connection(request: ConnectionRequest):
     try:
         engine = connection_engine(request, read_only=True)
         names = inspect(engine).get_table_names()
-        if len(names) > 200:
-            raise HTTPException(422, "This database has more than 200 tables. Use a database account scoped to the tables needed for this scenario.")
+        if len(names) > MAX_TABLES:
+            raise HTTPException(422, TOO_MANY_TABLES + " Use a database account scoped to those tables.")
         schemas = DatabaseSchemaLoader(engine).load_schemas(names)
         return {"schemas": schemas, "tableCount": len(schemas)}
     except (ImportError, ModuleNotFoundError):
@@ -92,6 +98,23 @@ def inspect_connection(request: ConnectionRequest):
     finally:
         if engine is not None:
             engine.dispose()
+
+class DdlRequest(BaseModel):
+    dialect: Dialect
+    ddl: str = Field(min_length=1, max_length=2_000_000)
+
+@router.post("/ddl")
+def parse_ddl(request: DdlRequest):
+    """Read table structure from a pasted DDL script: no network path to the database needed."""
+    try:
+        schemas = schemas_from_ddl(request.ddl, request.dialect)
+    except SqlglotError:
+        raise HTTPException(422, f"Could not read this script as {request.dialect} SQL. Check the database type and that the script is complete (no cut-off quotes).") from None
+    if not schemas:
+        raise HTTPException(422, f"No CREATE TABLE statements found. Paste table DDL and check that the database type ({request.dialect}) matches the script.")
+    if len(schemas) > MAX_TABLES:
+        raise HTTPException(422, TOO_MANY_TABLES)
+    return {"schemas": schemas, "tableCount": len(schemas)}
 
 @router.post("/export")
 def export_connection(

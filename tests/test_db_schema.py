@@ -71,6 +71,13 @@ class TestMapSqlType(unittest.TestCase):
 
     def test_boolean(self):
         self.assertEqual(_map_sql_type("BOOLEAN"), "boolean")
+        self.assertEqual(_map_sql_type("BIT"), "boolean")
+
+    def test_oracle_and_sql_server_numbers(self):
+        for t, expected in [("NUMBER", "integer"), ("NUMBER(10)", "integer"), ("NUMBER(10, 0)", "integer"),
+                            ("NUMBER(8, 2)", "float"), ("MONEY", "float"), ("DECIMAL(12,0)", "integer")]:
+            with self.subTest(t=t):
+                self.assertEqual(_map_sql_type(t), expected)
 
     def test_unknown_defaults_to_string(self):
         for t in ["GEOMETRY", "BLOB", "JSON", "UUID", "XML"]:
