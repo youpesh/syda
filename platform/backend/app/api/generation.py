@@ -4,6 +4,7 @@ import html
 import uuid
 import logging
 import zipfile
+from urllib.parse import quote
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -391,7 +392,7 @@ async def download_generated_dataset(
         return StreamingResponse(
             iter([buf.getvalue()]),
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={title_slug}_{job_id}_json.zip"},
+            headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(f'{title_slug}_{job_id}_json.zip', safe='')}"},
         )
 
     if len(csv_files) > 1:
@@ -405,7 +406,7 @@ async def download_generated_dataset(
         return StreamingResponse(
             iter([buf.getvalue()]),
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={title_slug}_{job_id}.zip"},
+            headers={"Content-Disposition": f"attachment; filename*=utf-8''{quote(f'{title_slug}_{job_id}.zip', safe='')}"},
         )
 
     raise HTTPException(status_code=404, detail="Generated dataset files are unavailable")
