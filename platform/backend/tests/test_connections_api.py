@@ -84,6 +84,35 @@ class ConnectionTests(unittest.TestCase):
     written = pd.read_sql("SELECT * FROM users", target_engine)
     self.assertEqual(len(written), 2)
 
+    with self.assertRaises(HTTPException) as caught:
+     c.export_connection(req.model_copy(update={"if_exists": "fail"}), db=db, user=user)
+    self.assertEqual(caught.exception.status_code, 409)
+
+class ConnectionProfileTests(unittest.TestCase):
+ def test_profiles_are_saved_per_user_without_password(self):
+  import uuid
+  from types import SimpleNamespace
+  from sqlalchemy.orm import Session
+  from sqlalchemy.pool import StaticPool
+  from app.database import Base
+  import app.models.user  # noqa: F401 registers the user table for the FK
+  engine=create_engine('sqlite://',poolclass=StaticPool,connect_args={'check_same_thread':False})
+  Base.metadata.create_all(engine)
+  alice,bob=SimpleNamespace(id=uuid.uuid4()),SimpleNamespace(id=uuid.uuid4())
+  pid=uuid.uuid4()
+  body=c.ConnectionProfileRequest(name='Prod',dialect='MySQL',host='db.internal',port=3306,database='shop',username='reader')
+  with Session(engine) as db:
+   c.save_profile(pid,body,db=db,user=alice)
+   c.save_profile(pid,body.model_copy(update={'name':'Renamed'}),db=db,user=alice)
+   self.assertEqual([p['name'] for p in c.list_profiles(db=db,user=alice)],['Renamed'])
+   self.assertEqual(c.list_profiles(db=db,user=bob),[])
+   for call in (lambda:c.save_profile(pid,body,db=db,user=bob),lambda:c.delete_profile(pid,db=db,user=bob)):
+    with self.assertRaises(HTTPException) as caught:call()
+    self.assertEqual(caught.exception.status_code,404)
+   self.assertNotIn('password',c.list_profiles(db=db,user=alice)[0])
+   c.delete_profile(pid,db=db,user=alice)
+   self.assertEqual(c.list_profiles(db=db,user=alice),[])
+
 if __name__ == "__main__":
  unittest.main()
 
