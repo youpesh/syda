@@ -1,5 +1,6 @@
 """Shared translation and validation of platform scenario drafts."""
 
+import re
 from typing import Any, Dict
 
 from pydantic import ValidationError
@@ -13,6 +14,16 @@ def scenario_definition(
     schemas: Dict[str, Any],
 ) -> ScenarioDefinition:
     """Translate the platform configuration into the reusable core model."""
+    for table, schema in schemas.items():
+        if not schema.get("__template__"):
+            continue
+        # The table name becomes the document folder in the job output.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", table):
+            raise ValueError(f"Document table '{table}' may only use letters, digits, '_' and '-'.")
+        if not isinstance(schema.get("__template_source__"), str):
+            raise ValueError(f"Document table '{table}' needs inline HTML in __template_source__.")
+        if schema.get("__output_file_type__", "pdf") not in ("pdf", "html"):
+            raise ValueError(f"Document table '{table}' must output 'pdf' or 'html'.")
     ordered_tables = [table for table in scenario.workflow if table in schemas]
     ordered_tables.extend(table for table in schemas if table not in ordered_tables)
 

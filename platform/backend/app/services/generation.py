@@ -1,4 +1,5 @@
 """Generation and evaluation, independent of HTTP routes and task transport."""
+import tempfile
 import time
 import random
 import logging
@@ -9,6 +10,7 @@ import pandas as pd
 from syda.schemas import validate_schema, ModelConfig
 from syda.generate import SyntheticDataGenerator
 from syda.output import save_dataframes
+from syda.templates import TemplateProcessor
 from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
 from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, ViolationRecord
@@ -388,6 +390,39 @@ def _evaluation_metrics(
     return metrics, result, total_violations
 
 
+# ponytail: rendering is sequential, one PDF per row; cap keeps big runs bounded. Parallelize if needed.
+MAX_DOCUMENTS_PER_TEMPLATE = 1000
+
+
+def _no_external_resources(url, *args, **kwargs):
+    """Templates are user-supplied, so WeasyPrint may not fetch files or URLs."""
+    # ponytail: data: images blocked too; allow via weasyprint.URLFetcher(allowed_protocols={"data"}) if needed.
+    raise ValueError("Linked documents cannot load external resources")
+
+
+def _render_documents(dfs: Dict[str, pd.DataFrame], schemas: Dict[str, Any], job_dir: Path) -> None:
+    """Render template tables to <job_dir>/<table>/document_N.<pdf|html> with Syda's template pipeline."""
+    templates = {
+        name: schema for name, schema in schemas.items()
+        if schema.get("__template__") and name in dfs and not dfs[name].empty
+    }
+    if not templates:
+        return
+    with tempfile.TemporaryDirectory() as source_dir:
+        jobs = {}
+        for index, (name, schema) in enumerate(templates.items()):
+            # The platform stores the template inline; the SDK reads it from a file.
+            source = Path(source_dir) / f"template_{index}.html"
+            source.write_text(schema["__template_source__"], encoding="utf-8")
+            jobs[name] = (dfs[name].head(MAX_DOCUMENTS_PER_TEMPLATE), {
+                **schema,
+                "__template_source__": str(source),
+                "__input_file_type__": "html",
+                "__output_file_type__": schema.get("__output_file_type__", "pdf"),
+            })
+        TemplateProcessor(url_fetcher=_no_external_resources).process_template_dataframes(jobs, str(job_dir))
+
+
 def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[str, Any], *, output_dir: Path, update_job):
     """
     Generation pipeline using syda.generate.SyntheticDataGenerator
@@ -496,6 +531,9 @@ def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[
         {name: df for name, df in dfs.items() if not df.empty},
         str(job_dir), format="csv",
     )
+    if any(schema.get("__template__") for schema in schemas.values()):
+        update_job(job_id, {"progress": 95, "current_stage": "Rendering linked documents"})
+        _render_documents(dfs, schemas, job_dir)
 
     update_job(job_id, {
         "status": "complete",
