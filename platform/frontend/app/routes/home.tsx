@@ -275,7 +275,7 @@ function ScenarioCard({
 
   return (
     <div className="flex flex-col gap-4">
-      <Card>
+      <Card className="shadow-none">
         <CardHeader>
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
@@ -422,7 +422,7 @@ function GenerationRunCard({ run }: { run: ChatRun }) {
   const failed = status === "failed";
 
   return (
-    <Card className="border-primary/20">
+    <Card className="border-primary/20 shadow-none">
       <CardHeader className="flex flex-row items-start justify-between gap-3">
         <div><CardTitle>{complete ? "Dataset ready" : failed ? "Generation failed" : "Generating dataset"}</CardTitle><CardDescription>{run.scenario.title}</CardDescription></div>
         <Badge variant={failed ? "destructive" : complete ? "secondary" : "outline"}>{status}</Badge>
@@ -886,16 +886,18 @@ export default function Home() {
                                     isUser={message.role === "user"}
                                     hasScenario={Boolean(scenario)}
                                   />
-                                  {scenario && (
-                                    <ScenarioCard
-                                      sourceName={messages.slice(0, index).reverse().find(item => item.role === "user")?.parts.filter(part => part.type === "text").map(part => part.text).join(" ").match(/Database schema context \((.*); structure only, output CSV\):/)?.[1] ?? "Chat instructions"}
-                                      messageId={message.id}
-                                      onEdit={openEditor}
-                                      onGenerate={(nextScenario) => startGeneration(nextScenario, message.id)}
-                                      scenario={scenario}
-                                    />
-                                  )}
-                                  {chatRuns.filter((run) => run.messageId === message.id).map((run) => <GenerationRunCard key={run.jobId} run={run} />)}
+                                  <div className="flex flex-col gap-6">
+                                    {scenario && (
+                                      <ScenarioCard
+                                        sourceName={messages.slice(0, index).reverse().find(item => item.role === "user")?.parts.filter(part => part.type === "text").map(part => part.text).join(" ").match(/Database schema context \((.*); structure only, output CSV\):/)?.[1] ?? "Chat instructions"}
+                                        messageId={message.id}
+                                        onEdit={openEditor}
+                                        onGenerate={(nextScenario) => startGeneration(nextScenario, message.id)}
+                                        scenario={scenario}
+                                      />
+                                    )}
+                                    {chatRuns.filter((run) => run.messageId === message.id).map((run) => <GenerationRunCard key={run.jobId} run={run} />)}
+                                  </div>
                                 </BubbleContent>
                               </Bubble>
                             </MessageContent>
