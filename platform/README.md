@@ -183,3 +183,19 @@ uv run --project platform/backend pytest platform/backend/tests/test_chat_stream
 cd platform/frontend
 npm run test:chat
 ```
+
+## Direct database export integrity
+
+`POST /api/connections/export` exports completed jobs using their declared table
+names. Internal `scenario_instance_id` and `scenario_path` CSV columns are omitted
+unless explicitly declared in the scenario schema. Destination columns are checked
+before any writes; unsupported columns produce a validation error.
+
+All table inserts use one connection and transaction, with parents inserted before
+children. `replace` deletes rows in reverse dependency order and preserves table
+constraints; `fail` rejects existing destination tables. Existing rows are restored
+if an insert fails. Newly created tables may remain empty after a failed export on
+databases with implicit DDL commits (including MySQL and Oracle); table creation is
+completed before row changes begin. Transactional target tables are required for
+rollback guarantees. Self-referencing required fields honor both `nullable: false`
+and the legacy `not_null: true` constraint.

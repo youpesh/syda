@@ -669,7 +669,11 @@ class SyntheticDataGenerator:
                 pks = df[p_col].dropna().tolist()
                 if pks:
                     col_constraints = metadata.get(fk_col, {}).get("constraints", {})
-                    is_not_null = bool(col_constraints.get("not_null") or col_constraints.get("primary_key"))
+                    is_not_null = bool(
+                        col_constraints.get("nullable") is False
+                        or col_constraints.get("not_null")
+                        or col_constraints.get("primary_key")
+                    )
                     self_fk_vals = []
                     for idx in range(len(df)):
                         if idx == 0 or (idx < max(1, len(df) // 10) and random.random() < 0.4):

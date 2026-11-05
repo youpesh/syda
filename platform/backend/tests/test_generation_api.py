@@ -537,3 +537,25 @@ def test_document_table_names_and_outputs_are_validated(monkeypatch, tmp_path):
     with _client(monkeypatch, tmp_path) as client:
         for scenario in (_document_scenario(name="../Note"), _document_scenario(output="docx")):
             assert client.post("/api/generate", json={"scenario": scenario}).status_code == 422
+
+
+@pytest.mark.parametrize('format', ['csv', 'json'])
+def test_zip_download_encodes_commas_quotes_and_unicode_in_title(monkeypatch, tmp_path, format):
+    from urllib.parse import unquote
+    title = 'Patient, Claim "résumé"'
+    with _client(monkeypatch, tmp_path) as client:
+        scenario = _scenario(record_count=2)
+        scenario['title'] = title
+        created = client.post('/api/generate', json={'scenario': scenario})
+        job_id = created.json()['jobId']
+        response = client.get(f'/api/download/{job_id}?format={format}')
+        assert response.status_code == 200
+        headers = response.headers.get_list('content-disposition')
+        assert len(headers) == 1
+        disposition = headers[0]
+        assert disposition.startswith("attachment; filename*=utf-8''")
+        assert ',' not in disposition and '"' not in disposition
+        assert title.lower().replace(' ', '_') in unquote(disposition)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            assert len(archive.namelist()) == 2
+            assert all(name.endswith('.' + format) for name in archive.namelist())
