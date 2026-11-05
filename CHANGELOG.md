@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Scenario engine** — deterministic, ledger-first generation for weighted multi-table business workflows, including exact path allocation, per-instance identity and foreign-key alignment, shared-value bindings, ordered timestamps, context-aware LLM enrichment, and post-generation integrity validation.
 
 
+## [Unreleased]
+
+### Added
+- **`query_dataset` MCP tool** — chat with a generated dataset. Loads every `<table>.csv` in `output_dir` into an in-memory SQLite database and runs a single read-only `SELECT`/`WITH` query (writes, `ATTACH` and `PRAGMA` are denied by a SQLite authorizer; results capped at `max_rows`). Call without `sql` to list tables, columns and row counts. The assistant writes the SQL, so users can ask "what % of claims were denied?" or check quality (orphaned FKs, out-of-range values) in plain English.
+
 ## [0.4.0] - 2026-08-08
 
 ### Added
