@@ -190,6 +190,59 @@ function MobileNavigation() {
   </details>;
 }
 
+const footerRecords = [
+  { label: "Patients", x: 25, y: 20, angle: -12 },
+  { label: "Visits", x: 69, y: 34, angle: 9 },
+  { label: "Diagnoses", x: 30, y: 54, angle: -7 },
+  { label: "Treatments", x: 66, y: 76, angle: 12 },
+  { label: "Orders", x: 23, y: 84, angle: 8 },
+  { label: "Payments", x: 76, y: 11, angle: -10 },
+];
+const footerLinks = [[0, 1], [1, 2], [2, 3], [4, 5]];
+
+function CreativeFooter() {
+  const [selected, setSelected] = useState(0);
+  const [positions, setPositions] = useState(footerRecords.map(({ x, y }) => ({ x, y })));
+  const fieldRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{ index: number; pointerId: number; x: number; y: number; left: number; top: number } | null>(null);
+  const related = footerLinks.flatMap(([from, to]) => from === selected ? [to] : to === selected ? [from] : []);
+  const moveRecord = (index: number, x: number, y: number) => setPositions((current) => current.map((position, i) => i === index ? { x: Math.max(19, Math.min(81, x)), y: Math.max(11, Math.min(89, y)) } : position));
+
+  return <footer className="landing-footer">
+    <div className="footer-layout">
+      <Link className="footer-brand" to="/" aria-label="Syda home"><span className="footer-brand-symbol"><span className="syda-mark" aria-hidden="true"><i /><i /><i /></span></span><span className="footer-brand-name">syda</span></Link>
+      <nav className="footer-navigation" aria-label="Footer navigation">
+        <div><span>Explore Syda</span><a href="#dataset">See the data</a><a href="#workflow">How it works</a><a href="#built-for">Built for complex data</a></div>
+        <div><span>Keep building</span><a href="https://python.syda.ai" target="_blank" rel="noreferrer">Documentation <ArrowRight aria-hidden="true" /></a><a href="https://github.com/syda-ai/syda" target="_blank" rel="noreferrer">GitHub <ArrowRight aria-hidden="true" /></a><Link to="/login">Log in</Link></div>
+        <p>Synthetic data.<br />Real-world logic.</p>
+        <Link className="footer-start" to="/register">Build your first dataset <span><ArrowRight aria-hidden="true" /></span></Link>
+      </nav>
+      <div className="footer-playground">
+        <div className="footer-playground-heading"><p>Good data has connections.</p><span>Drag a record. Follow a link.</span></div>
+        <div className="footer-record-field" ref={fieldRef} role="group" aria-label="Interactive sample record relationships">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">{footerLinks.map(([from, to]) => <line key={`${from}-${to}`} x1={positions[from].x} y1={positions[from].y} x2={positions[to].x} y2={positions[to].y} data-active={from === selected || to === selected} />)}</svg>
+          {footerRecords.map((record, index) => <button key={record.label} className="footer-record" type="button" style={{ left: `${positions[index].x}%`, top: `${positions[index].y}%`, rotate: `${record.angle}deg` }} aria-pressed={selected === index} aria-label={`${record.label}: connected to ${footerLinks.flatMap(([from, to]) => from === index ? [footerRecords[to].label] : to === index ? [footerRecords[from].label] : []).join(", ")}. Drag or use arrow keys to move.`} data-connected={related.includes(index)} onClick={() => setSelected(index)} onPointerDown={(event) => {
+            if (event.button !== 0) return;
+            setSelected(index);
+            dragRef.current = { index, pointerId: event.pointerId, x: event.clientX, y: event.clientY, left: positions[index].x, top: positions[index].y };
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }} onPointerMove={(event) => {
+            const drag = dragRef.current, field = fieldRef.current;
+            if (!drag || drag.index !== index || drag.pointerId !== event.pointerId || !field) return;
+            moveRecord(index, drag.left + (event.clientX - drag.x) / field.clientWidth * 100, drag.top + (event.clientY - drag.y) / field.clientHeight * 100);
+          }} onPointerUp={() => { dragRef.current = null; }} onPointerCancel={() => { dragRef.current = null; }} onLostPointerCapture={() => { dragRef.current = null; }} onKeyDown={(event) => {
+            const offsets: Record<string, [number, number]> = { ArrowLeft: [-3, 0], ArrowRight: [3, 0], ArrowUp: [0, -3], ArrowDown: [0, 3] };
+            const offset = offsets[event.key];
+            if (offset) { event.preventDefault(); setSelected(index); moveRecord(index, positions[index].x + offset[0], positions[index].y + offset[1]); }
+          }}><span className="footer-record-dot" aria-hidden="true" />{record.label}</button>)}
+        </div>
+        <div className="footer-relationship" aria-live="polite" aria-atomic="true"><span>{footerRecords[selected].label}</span><ArrowRight aria-hidden="true" /><span>{related.map((index) => footerRecords[index].label).join(" + ")}</span></div>
+      </div>
+      <div className="footer-bottom"><span>© {new Date().getFullYear()} Syda</span><a href="https://github.com/syda-ai/syda/blob/main/LICENSE" target="_blank" rel="noreferrer">Open source license <ArrowRight aria-hidden="true" /></a></div>
+    </div>
+  </footer>;
+}
+
 export default function Landing() {
   const pageRef = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -250,7 +303,6 @@ export default function Landing() {
 
     <section className="landing-faq landing-frame" aria-labelledby="faq-title"><h2 id="faq-title" data-reveal>Before <br />you build.</h2><div className="faq-list">{questions.map(([question, answer]) => <details name="landing-faq" key={question} data-reveal><summary>{question}<Plus aria-hidden="true" /></summary><p>{answer}</p></details>)}</div></section>
 
-    <section className="landing-cta landing-frame" aria-labelledby="cta-title"><div data-reveal><h2 id="cta-title">Give your tests context.</h2><p>Start designing your first synthetic scenario.</p></div><Link className={buttonVariants({ size: "lg" })} to="/register" data-reveal>Create your workspace <ArrowRight data-icon="inline-end" /></Link></section>
-    <footer className="landing-footer landing-frame"><Link className="landing-wordmark" to="/">syda</Link><p>Synthetic data. Connected by design.</p><span>© {new Date().getFullYear()} Syda</span></footer>
+    <CreativeFooter />
   </main>;
 }
