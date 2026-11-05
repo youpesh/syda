@@ -3,11 +3,12 @@ import { useNavigate } from "react-router";
 
 import type { Route } from "./+types/connections";
 import { AppShell } from "~/components/studio/app-shell";
-import { LiveConnections, useLiveProfiles, type SchemaSource } from "~/components/studio/live-connections";
+import { ConnectionDialog, newProfile, useLiveProfiles, type Profile, type SchemaSource } from "~/components/studio/live-connections";
 import { SchemaExplorer } from "~/components/studio/schema-explorer";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "~/components/ui/card";
+import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "~/components/ui/card";
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "~/components/ui/empty";
 
 export function meta({}: Route.MetaArgs) {
   return [{ title: "Connections — Syda" }];
@@ -15,8 +16,13 @@ export function meta({}: Route.MetaArgs) {
 
 export default function Connections() {
   const navigate = useNavigate();
-  const connections = useLiveProfiles();
+  const { profiles, save, remove } = useLiveProfiles();
   const [source, setSource] = useState<SchemaSource | null>(null);
+  // `editing` outlives `open` so the dialog keeps its content while it animates closed.
+  const [editing, setEditing] = useState<{ profile: Profile; saved: boolean; key: number } | null>(null);
+  const [open, setOpen] = useState(false);
+  const edit = (profile: Profile) => { setEditing({ profile: { ...profile }, saved: profiles.some(p => p.id === profile.id), key: Date.now() }); setOpen(true); };
+  const tables = source ? Object.keys(source.schemas).length : 0;
 
   return <AppShell title="Connections" subtitle="Database schemas for your scenarios">
     <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-8">
@@ -28,27 +34,37 @@ export default function Connections() {
         <Card>
           <CardHeader>
             <CardTitle>Database connections</CardTitle>
-            <CardDescription>Connect PostgreSQL, MySQL, or Oracle and review the imported schema. Syda reads table structure only; it does not read or write database records.</CardDescription>
+            <CardDescription>PostgreSQL, MySQL, or Oracle. Syda reads table structure only; it never reads or writes records. Passwords are never saved.</CardDescription>
+            {profiles.length > 0 && <CardAction><Button size="sm" onClick={() => edit(newProfile())}>Add connection</Button></CardAction>}
           </CardHeader>
-          <CardContent className="flex flex-col gap-4">
-            <div className="flex flex-wrap gap-2">
-              <LiveConnections connections={connections} source={source} onSource={setSource} disabled={false} />
-            </div>
-            {connections.profiles.length > 0 && <ul className="divide-y rounded-xl border text-sm">{connections.profiles.map(p => <li key={p.id}><Button type="button" variant="ghost" className="h-auto w-full flex-wrap justify-start gap-2 rounded-none px-3 py-2 font-normal" onClick={() => connections.show(p.id)}><span className="font-medium">{p.name}</span><Badge variant="outline">{p.dialect}</Badge><span className="truncate text-xs text-muted-foreground">{p.username}@{p.host}:{p.port}/{p.database}</span></Button></li>)}</ul>}
-            <p className="text-xs text-muted-foreground">Connection profiles are saved to your account after a successful test. Passwords are never saved.</p>
+          <CardContent>
+            {profiles.length === 0
+              ? <Empty><EmptyHeader><EmptyTitle>No connections yet</EmptyTitle><EmptyDescription>Add a database to import its table structure into a scenario.</EmptyDescription></EmptyHeader><Button onClick={() => edit(newProfile())}>Add connection</Button></Empty>
+              : <ul className="divide-y rounded-xl border text-sm">{profiles.map(p => <li key={p.id} className="flex flex-col gap-2 px-3 py-2 sm:flex-row sm:items-center sm:gap-3">
+                  <div className="min-w-0 sm:flex-1">
+                    <div className="flex items-center gap-2"><span className="truncate font-medium">{p.name}</span><Badge variant="outline" className="shrink-0">{p.dialect}</Badge></div>
+                    <p className="truncate text-xs text-muted-foreground">{p.username}@{p.host}:{p.port}/{p.database}</p>
+                  </div>
+                  <div className="flex shrink-0 gap-1">
+                    <Button size="sm" variant="outline" onClick={() => edit(p)}>Load schema</Button>
+                    <Button size="sm" variant="ghost" onClick={() => remove(p.id)}>Remove</Button>
+                  </div>
+                </li>)}</ul>}
           </CardContent>
         </Card>
         {source && <Card>
           <CardHeader>
             <CardTitle>{source.name}</CardTitle>
-            <CardDescription>{Object.keys(source.schemas).length} tables ready to use in a new scenario.</CardDescription>
+            <CardDescription>{tables ? `${tables} tables ready to use in a new scenario. The structure is shared with the configured AI provider.` : "No tables found in this database."}</CardDescription>
           </CardHeader>
-          <CardContent><SchemaExplorer schemas={source.schemas} /></CardContent>
-          <CardFooter>
-            <Button onClick={() => navigate("/app", { state: { schemaSource: source } })}>Use schema in new chat</Button>
+          <CardContent><SchemaExplorer key={source.name} schemas={source.schemas} /></CardContent>
+          <CardFooter className="gap-2">
+            <Button disabled={!tables} onClick={() => navigate("/app", { state: { schemaSource: source } })}>Use schema in new chat</Button>
+            <Button variant="ghost" onClick={() => setSource(null)}>Clear</Button>
           </CardFooter>
         </Card>}
       </div>
     </main>
+    {editing && <ConnectionDialog key={editing.key} initial={editing.profile} isSaved={editing.saved} open={open} onOpenChange={setOpen} onLoaded={setSource} save={save} />}
   </AppShell>;
 }
