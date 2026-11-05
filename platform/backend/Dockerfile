@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install system dependencies (libpq for PostgreSQL; pango + a font for WeasyPrint PDFs)
+# Install system dependencies (libpq for PostgreSQL; pango + a font for WeasyPrint PDFs; libmagic for syda.templates)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpangoft2-1.0-0 \
     libharfbuzz-subset0 \
     fonts-dejavu-core \
+    libmagic1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv from Astral official image
