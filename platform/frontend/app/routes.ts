@@ -12,6 +12,7 @@ export default [
   route("connections", "routes/connections.tsx"),
   route("history", "routes/history.tsx"),
   route("runs/:jobId", "routes/run-detail.tsx"),
+  route("datasets/:scenarioId", "routes/dataset-sheet.tsx"),
   route("settings", "routes/settings.tsx"),
   route("api/*", "routes/api.ts"),
 ] satisfies RouteConfig;

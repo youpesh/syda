@@ -494,3 +494,25 @@ def test_zip_download_encodes_commas_quotes_and_unicode_in_title(monkeypatch, tm
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             assert len(archive.namelist()) == 2
             assert all(name.endswith('.' + format) for name in archive.namelist())
+
+
+def test_preview_pages_one_table_filtered_by_column_value(monkeypatch, tmp_path):
+    with _client(monkeypatch, tmp_path) as client:
+        job_id = client.post("/api/generate", json={"scenario": _scenario()}).json()["jobId"]
+        children = client.get(f"/api/preview/{job_id}?table=child&limit=100").json()["tables"]
+        assert list(children) == ["child"]
+        parent_id = str(children["child"]["rows"][0]["parent_id"])
+        expected = [row for row in children["child"]["rows"] if str(row["parent_id"]) == parent_id]
+
+        filtered = client.get(f"/api/preview/{job_id}", params={"table": "Child", "column": "parent_id", "value": parent_id, "limit": 1})
+        assert filtered.status_code == 200
+        table = filtered.json()["tables"]["child"]
+        assert table["rowCount"] == len(expected)
+        assert [str(row["parent_id"]) for row in table["rows"]] == [parent_id]
+
+        assert client.get(f"/api/preview/{job_id}?table=Missing").status_code == 404
+        assert client.get(f"/api/preview/{job_id}", params={"table": "Child", "column": "nope", "value": "1"}).status_code == 400
+
+        other = User(id=uuid.uuid4(), email="other@example.com", hashed_password="x", is_active=True, is_superuser=False, is_verified=True)
+        app.dependency_overrides[require_authenticated] = lambda: other
+        assert client.get(f"/api/preview/{job_id}?table=Child").status_code == 404
