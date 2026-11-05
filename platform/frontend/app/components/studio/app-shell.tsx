@@ -9,7 +9,6 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Spinner } from "~/components/ui/spinner";
 import { Button, buttonVariants } from "~/components/ui/button";
 import { Separator } from "~/components/ui/separator";
-import { ThemeToggle } from "~/components/ui/theme-toggle";
 import { useTheme } from "~/lib/theme-provider";
 import {
   Sidebar,
@@ -69,7 +68,7 @@ function RecentChat({ conversation, active, onDeleted }: {
     <DialogContent showCloseButton={!deleting}>
       <DialogHeader>
         <DialogTitle>Delete chat?</DialogTitle>
-        <DialogDescription>Delete “{conversation.title}” and its chat draft? This cannot be undone. Saved scenarios and generated datasets will remain available.</DialogDescription>
+        <DialogDescription>Delete “{conversation.title}”? Saved scenarios and datasets are kept.</DialogDescription>
       </DialogHeader>
       {error && <Alert variant="destructive"><AlertDescription>{error}</AlertDescription></Alert>}
       <DialogFooter>
@@ -84,13 +83,11 @@ function RecentChat({ conversation, active, onDeleted }: {
 
 export function AppShell({
   title,
-  subtitle,
   children,
   headerActions,
   onNewScenario,
 }: {
   title: string;
-  subtitle?: string;
   children: ReactNode;
   headerActions?: ReactNode;
   onNewScenario?: () => void;
@@ -196,12 +193,9 @@ export function AppShell({
           <div className="flex min-w-0 items-center gap-2">
             <SidebarTrigger />
             <Separator className="h-4" orientation="vertical" />
-            <div className="min-w-0"><p className="truncate text-xs font-medium">{title}</p>{subtitle && <p className="hidden truncate text-[10px] text-muted-foreground sm:block">{subtitle}</p>}</div>
+            <h1 className="min-w-0 truncate text-sm font-medium">{title}</h1>
           </div>
-          <div className="flex items-center gap-2">
-            {headerActions}
-            <ThemeToggle />
-          </div>
+          {headerActions && <div className="flex items-center gap-2">{headerActions}</div>}
         </header>
         {authenticated ? children : <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Checking your session…</div>}
       </SidebarInset>

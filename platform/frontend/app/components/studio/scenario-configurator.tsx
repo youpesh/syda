@@ -11,7 +11,7 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "~/components/ui/alert";
 import { Badge } from "~/components/ui/badge";
 import { Button } from "~/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "~/components/ui/card";
 import { Field, FieldDescription, FieldGroup, FieldLabel, FieldSet, FieldLegend } from "~/components/ui/field";
 import { Input } from "~/components/ui/input";
 import { Skeleton } from "~/components/ui/skeleton";
@@ -168,10 +168,6 @@ export function ScenarioConfigurator({
   return (
     <div className="flex flex-col gap-4">
       {(section === "all" || section === "overview") && <Card>
-        <CardHeader>
-          <CardTitle>Generation configuration</CardTitle>
-          <CardDescription>Review the scenario inputs before any records are generated.</CardDescription>
-        </CardHeader>
         <CardContent>
           <FieldGroup>
             <Field>
@@ -202,20 +198,12 @@ export function ScenarioConfigurator({
       </Card>}
 
       {(section === "all" || section === "schema") && <Card>
-        <CardHeader>
-          <CardTitle>Schema preview</CardTitle>
-          <CardDescription>Edit field names and types, then validate the schema.</CardDescription>
-        </CardHeader>
         <CardContent>
           <SchemaEditor onChange={onChange} scenario={scenario} />
         </CardContent>
       </Card>}
 
       {(section === "all" || section === "workflow") && <Card>
-        <CardHeader>
-          <CardTitle>Workflow</CardTitle>
-          <CardDescription>Define the order of records in each scenario instance.</CardDescription>
-        </CardHeader>
         <CardContent className="flex flex-col gap-5">
           <FieldSet>
             <FieldLegend>Workflow steps</FieldLegend>
@@ -249,7 +237,6 @@ export function ScenarioConfigurator({
       </Card>}
 
       {(section === "all" || section === "rules") && <Card>
-        <CardHeader><CardTitle>Causal rules</CardTitle><CardDescription>Describe business rules and mark the rules Syda can check against generated rows.</CardDescription></CardHeader>
         <CardContent>
           <FieldSet>
             <FieldLegend>Custom rules</FieldLegend>
@@ -282,8 +269,7 @@ export function ScenarioConfigurator({
         <Card>
           <CardHeader>
             <CardTitle>Estimated run cost</CardTitle>
-            <CardDescription>Calculated before generation from the selected model and scenario size.</CardDescription>
-          </CardHeader>
+                      </CardHeader>
           <CardContent>
             {estimateLoading ? (
               <div className="flex flex-col gap-2"><Skeleton className="h-5 w-32" /><Skeleton className="h-4 w-full" /></div>
@@ -304,7 +290,6 @@ export function ScenarioConfigurator({
         <Card>
           <CardHeader>
             <CardTitle>Preflight validation</CardTitle>
-            <CardDescription>Validate tables, relationships, workflow steps, and rule inputs.</CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
             {validation && (
