@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Dict, List, Optional, Union, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -14,9 +15,13 @@ def _map_sql_type(sql_type) -> str:
         return "string"
     elif "date" in t or "time" in t:
         return "date"
-    elif "decimal" in t or "numeric" in t or "float" in t or "real" in t or "double" in t:
+    elif "number" in t or "decimal" in t or "numeric" in t or "money" in t:
+        # Scale 0 means whole numbers: Oracle NUMBER / NUMBER(10) / NUMBER(10,0), DECIMAL(10).
+        whole = t == "number" or re.search(r"\(\s*\d+\s*(,\s*0\s*)?\)", t)
+        return "integer" if whole else "float"
+    elif "float" in t or "real" in t or "double" in t:
         return "float"
-    elif "bool" in t:
+    elif "bool" in t or t == "bit":  # SQL Server BIT
         return "boolean"
     else:
         return "string"

@@ -187,3 +187,99 @@ def test_export_database_failures_do_not_expose_sql_or_row_values(tmp_path, monk
     database='test', username='user', password='test-only', jobId='error-job'), db=db, user=user)
  assert caught.value.status_code == 400
  assert 'private' not in caught.value.detail
+
+
+# Pasted DDL: the exports people actually have (SSMS, Oracle DBMS_METADATA, pg_dump, mysqldump).
+SSMS = """USE [shop]
+GO
+SET ANSI_NULLS ON
+GO
+CREATE TABLE [dbo].[Customers](
+	[CustomerID] [int] IDENTITY(1,1) NOT NULL,
+	[Email] [nvarchar](255) NOT NULL UNIQUE,
+	[Active] [bit] NULL,
+	[Balance] [money] NULL,
+	[Status] [varchar](10) NULL CHECK ([Status] IN ('active','closed')),
+	[Bio] [nvarchar](max) NULL,
+ CONSTRAINT [UQ_Bio] UNIQUE NONCLUSTERED ([Balance] ASC),
+ CONSTRAINT [PK_Customers] PRIMARY KEY CLUSTERED ([CustomerID] ASC)
+ WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF) ON [PRIMARY]
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+CREATE PROCEDURE dbo.p AS BEGIN SELECT 1; SELECT 2 END
+GO
+CREATE TABLE [dbo].[Orders]([OrderID] [int] NOT NULL PRIMARY KEY, [CustomerID] [int] NOT NULL, [PlacedAt] [datetime2](7) NULL)
+GO
+ALTER TABLE [dbo].[Orders]  WITH CHECK ADD  CONSTRAINT [FK_Orders_Customers] FOREIGN KEY([CustomerID]) REFERENCES [dbo].[Customers] ([CustomerID])
+GO
+"""
+ORACLE = '''CREATE TABLE "HR"."DEPARTMENTS" ("DEPT_ID" NUMBER(10,0) NOT NULL ENABLE, "NAME" VARCHAR2(100 BYTE) NOT NULL ENABLE,
+  CONSTRAINT "DEPT_PK" PRIMARY KEY ("DEPT_ID") USING INDEX PCTFREE 10 INITRANS 2 STORAGE(INITIAL 65536 NEXT 1048576) TABLESPACE "USERS" ENABLE
+) SEGMENT CREATION IMMEDIATE PCTFREE 10 NOCOMPRESS LOGGING STORAGE(INITIAL 65536) TABLESPACE "USERS"
+/
+CREATE TABLE "HR"."EMPLOYEES" ("EMP_ID" NUMBER PRIMARY KEY, "DEPT_ID" NUMBER REFERENCES "HR"."DEPARTMENTS",
+  "SALARY" NUMBER(8,2), "HIRED" DATE, "BIO" CLOB)
+/
+'''
+PG_DUMP = """SET statement_timeout = 0;
+CREATE TABLE public.customers (id integer NOT NULL, email text NOT NULL);
+CREATE TABLE public.orders (id bigint NOT NULL, customer_id integer, status text,
+  amount numeric(10,2), CONSTRAINT orders_status_check CHECK ((status = ANY (ARRAY['new'::text, 'paid'::text]))));
+ALTER TABLE ONLY public.customers ADD CONSTRAINT customers_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (id);
+ALTER TABLE ONLY public.orders ADD CONSTRAINT orders_customer_fk FOREIGN KEY (customer_id) REFERENCES public.customers(id);
+"""
+MYSQLDUMP = """CREATE TABLE `users` (`id` int NOT NULL AUTO_INCREMENT, `role` enum('admin','member') NOT NULL, `email` varchar(255) DEFAULT NULL,
+  PRIMARY KEY (`id`), UNIQUE KEY `email_u` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE `posts` (`id` int NOT NULL, `user_id` int, `team_id` int, PRIMARY KEY (`id`),
+  CONSTRAINT `fk_u` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`), CONSTRAINT `fk_t` FOREIGN KEY (`team_id`) REFERENCES `teams` (`id`)) ENGINE=InnoDB;
+"""
+
+def test_ddl_sql_server_ssms_export():
+ s = c.parse_ddl(c.DdlRequest(dialect='SQL Server', ddl=SSMS))['schemas']
+ assert set(s) == {'Customers', 'Orders'}
+ cu = s['Customers']
+ assert cu['CustomerID'] == {'type': 'integer', 'primary_key': True, 'not_null': True}
+ assert cu['Email'] == {'type': 'string', 'unique': True, 'not_null': True}
+ assert cu['Active'] == {'type': 'boolean'} and cu['Balance'] == {'type': 'float', 'unique': True}
+ assert cu['Status'] == {'type': 'string', 'enum': ['active', 'closed']}
+ assert s['Orders']['CustomerID'] == {'type': 'foreign_key', 'references': {'schema': 'Customers', 'field': 'CustomerID'}, 'not_null': True}
+ assert s['Orders']['PlacedAt'] == {'type': 'date'}
+
+def test_ddl_oracle_dbms_metadata_export():
+ s = c.parse_ddl(c.DdlRequest(dialect='Oracle', ddl=ORACLE))['schemas']
+ assert s['DEPARTMENTS']['DEPT_ID'] == {'type': 'integer', 'primary_key': True, 'not_null': True}
+ assert s['DEPARTMENTS']['NAME'] == {'type': 'string', 'not_null': True}
+ emp = s['EMPLOYEES']
+ assert emp['EMP_ID']['primary_key'] and emp['EMP_ID']['type'] == 'integer'
+ # REFERENCES without a column list points at the parent's primary key.
+ assert emp['DEPT_ID'] == {'type': 'foreign_key', 'references': {'schema': 'DEPARTMENTS', 'field': 'DEPT_ID'}}
+ assert emp['SALARY'] == {'type': 'float'} and emp['HIRED'] == {'type': 'date'} and emp['BIO'] == {'type': 'string'}
+
+def test_ddl_pg_dump_alter_table_keys():
+ s = c.parse_ddl(c.DdlRequest(dialect='PostgreSQL', ddl=PG_DUMP))['schemas']
+ assert s['customers']['id']['primary_key']
+ assert s['orders']['customer_id'] == {'type': 'foreign_key', 'references': {'schema': 'customers', 'field': 'id'}}
+ assert s['orders']['status'] == {'type': 'string', 'enum': ['new', 'paid']}
+ assert s['orders']['amount'] == {'type': 'float'}
+
+def test_ddl_mysqldump_enum_unique_and_external_fk():
+ s = c.parse_ddl(c.DdlRequest(dialect='MySQL', ddl=MYSQLDUMP))['schemas']
+ assert s['users']['role'] == {'type': 'string', 'not_null': True, 'enum': ['admin', 'member']}
+ assert s['users']['email'] == {'type': 'string', 'unique': True}
+ assert s['posts']['user_id']['type'] == 'foreign_key'
+ assert s['posts']['team_id'] == {'type': 'integer'}  # `teams` isn't in the paste
+
+def test_ddl_without_tables_is_actionable():
+ for ddl in ('SELECT 1;', "CREATE TABLE t (a varchar(5) DEFAULT 'oops"):
+  with pytest.raises(HTTPException) as caught:
+   c.parse_ddl(c.DdlRequest(dialect='PostgreSQL', ddl=ddl))
+  assert caught.value.status_code == 422
+
+def test_sql_server_engine_uses_pymssql_with_timeouts():
+ req = c.ConnectionRequest(dialect='SQL Server', host='db', port=1433, database='shop', username='u', password='p')
+ with patch.object(c, 'create_engine') as create:
+  c.connection_engine(req)
+ url = create.call_args.args[0]
+ assert url.drivername == 'mssql+pymssql' and url.database == 'shop'
+ assert create.call_args.kwargs['connect_args'] == {'login_timeout': 10, 'timeout': 15}
