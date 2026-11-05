@@ -134,8 +134,28 @@ export function DataPreview({ jobId, complete, showDownloads = true, compact = f
       <CardHeader>
         <CardTitle>Generated dataset</CardTitle>
       </CardHeader>
-      <CardContent>
+      <CardContent className="flex flex-col gap-6">
         {tableContent}
+        {preview.documents?.length ? (
+          <section aria-label="Linked documents">
+            <h3 className="mb-2 text-sm font-medium">Linked documents <Badge variant="outline">{preview.documents.length.toLocaleString()}</Badge></h3>
+            <Table>
+              <TableHeader><TableRow><TableHead>Document</TableHead><TableHead>Table</TableHead><TableHead className="text-right">Actions</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {preview.documents.map((doc) => (
+                  <TableRow key={doc.url}>
+                    <TableCell>{doc.name}</TableCell>
+                    <TableCell>{doc.table}</TableCell>
+                    <TableCell className="space-x-3 text-right">
+                      <a className="text-xs underline-offset-4 hover:underline" href={doc.url} rel="noreferrer" target="_blank">Preview</a>
+                      <a className="text-xs underline-offset-4 hover:underline" href={`${doc.url}?download=true`}>Download</a>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </section>
+        ) : null}
       </CardContent>
       {showDownloads && (
         <CardFooter className="justify-end gap-2">

@@ -63,6 +63,7 @@ export interface GenerationJob {
 export interface DatasetPreview {
   jobId: string;
   tables: Record<string, { columns: string[]; rows: Record<string, unknown>[]; rowCount: number }>;
+  documents?: { table: string; name: string; url: string }[];
 }
 
 export interface SavedScenario {
