@@ -13,6 +13,7 @@ from syda.output import save_dataframes
 from syda.templates import TemplateProcessor
 from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
+from ..evaluation.statistical_similarity import evaluate_statistical_similarity
 from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, ViolationRecord
 logger = logging.getLogger(__name__)
 
@@ -356,11 +357,15 @@ def _evaluation_metrics(
     dfs: Dict[str, pd.DataFrame],
     schemas: Dict[str, Any],
     scenario: ScenarioConfiguration,
+    reference_data: Optional[Dict[str, list[Dict[str, Any]]]] = None,
     return_details: bool = False,
 ) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
     privacy_metric = _privacy_leakage_metric(dfs)
+    statistical_result = evaluate_statistical_similarity(
+        dfs, schemas, reference_data
+    )
     definition = _scenario_definition(scenario, schemas)
     executable_checks = ScenarioEngine.evaluate_checks(definition, dfs)
     # Use the same temporal/FSM rules as core validation. Choosing arbitrary date
@@ -407,9 +412,14 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="statistical_similarity",
             label="Statistical similarity",
-            status="not_evaluated",
-            value="No reference",
-            detail="Provide a reference sample to compare numeric and categorical distributions.",
+            status=statistical_result.status,
+            value=(
+                "No reference"
+                if statistical_result.score is None
+                else f"{statistical_result.score:.3f}"
+            ),
+            detail=statistical_result.detail,
+            violations=statistical_result.violations,
         ),
         EvaluationMetric(
             key="semantic_correctness",
@@ -501,7 +511,15 @@ def _render_documents(dfs: Dict[str, pd.DataFrame], schemas: Dict[str, Any], job
         TemplateProcessor(url_fetcher=_no_external_resources).process_template_dataframes(jobs, str(job_dir))
 
 
-def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[str, Any], *, output_dir: Path, update_job):
+def run_generation(
+    job_id: str,
+    scenario: ScenarioConfiguration,
+    provider: dict[str, Any],
+    *,
+    output_dir: Path,
+    update_job,
+    reference_data: Optional[Dict[str, list[Dict[str, Any]]]] = None,
+):
     """
     Generation pipeline using syda.generate.SyntheticDataGenerator
     and saving datasets to disk while persisting job metadata in the database.
@@ -576,7 +594,11 @@ def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[
     elapsed = round(time.time() - t0, 1)
     total_records = sum(len(df) for df in dfs.values())
     metrics, evaluation_result, total_violations, violation_records = _evaluation_metrics(
-        dfs, schemas, scenario, return_details=True
+        dfs,
+        schemas,
+        scenario,
+        reference_data=reference_data,
+        return_details=True,
     )
     metric_by_key = {metric.key: metric for metric in metrics}
     table_row_counts = {name: len(df) for name, df in dfs.items()}

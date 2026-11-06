@@ -38,6 +38,7 @@ def execute_job(job_id, claimed=None):
         if not snapshot:
             raise ValueError("Job has no provider snapshot")
         provider = dict(snapshot)
+        reference_data = provider.pop("reference_data", {})
         if provider["id"] != "offline":
             with database.SessionLocal() as db:
                 key = provider_key(provider["id"], user_id, db)
@@ -48,6 +49,7 @@ def execute_job(job_id, claimed=None):
             job_id, ScenarioConfiguration.model_validate(scenario), provider,
             output_dir=DATA_DIR / job_id / "attempts" / token,
             update_job=lambda _, values: update_attempt(job_id, token, values),
+            reference_data=reference_data,
         )
     except LostLease:
         logger.info("Generation attempt no longer owns job %s", job_id)
