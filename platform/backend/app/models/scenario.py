@@ -84,6 +84,31 @@ class GenerateRequest(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
+
+class StatisticalFieldResult(BaseModel):
+    table: str
+    column: str
+    kind: Literal["numeric", "categorical"]
+    score: float
+    ks_statistic: Optional[float] = Field(
+        default=None,
+        alias="ksStatistic",
+        exclude_if=lambda value: value is None,
+    )
+    wasserstein_distance: Optional[float] = Field(
+        default=None,
+        alias="wassersteinDistance",
+        exclude_if=lambda value: value is None,
+    )
+    chi_square_statistic: Optional[float] = Field(
+        default=None,
+        alias="chiSquareStatistic",
+        exclude_if=lambda value: value is None,
+    )
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+
 class EvaluationMetric(BaseModel):
     key: str
     label: str
@@ -91,6 +116,11 @@ class EvaluationMetric(BaseModel):
     value: str
     detail: str
     violations: int = 0
+    field_results: Optional[List[StatisticalFieldResult]] = Field(
+        default=None,
+        alias="fieldResults",
+        exclude_if=lambda value: value is None,
+    )
 
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
