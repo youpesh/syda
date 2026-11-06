@@ -113,6 +113,105 @@ type SydaMessage = UIMessage<{ scenarioId?: string }, { scenario: ScenarioConfig
 
 type ChatRun = ChatRunReference;
 
+type ReferenceRow = Record<string, unknown>;
+type ReferenceData = Record<string, ReferenceRow[]>;
+type ReferenceAttachment = {
+  data: ReferenceData;
+  fileName: string;
+  schemaSummary: string;
+};
+
+function parseReferenceData(text: string): ReferenceData {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Reference JSON is not valid JSON.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Reference JSON must be an object whose keys are table names.");
+  }
+
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (!entries.length) throw new Error("Reference JSON must contain at least one table.");
+
+  const referenceData: ReferenceData = {};
+  for (const [table, value] of entries) {
+    if (!table.trim() || !Array.isArray(value) || !value.length) {
+      throw new Error(`Reference table ${table || "(unnamed)"} must contain at least one row.`);
+    }
+    referenceData[table] = value.map((row, index) => {
+      if (!row || typeof row !== "object" || Array.isArray(row) || !Object.keys(row).length) {
+        throw new Error(`Reference table ${table} row ${index + 1} must be a non-empty object.`);
+      }
+      return row as ReferenceRow;
+    });
+  }
+  return referenceData;
+}
+
+function parseCsvReferenceData(text: string, fileName: string): ReferenceData {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let quoted = false;
+  const input = text.replace(/^\uFEFF/, "");
+
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input[index];
+    if (character === '"') {
+      if (quoted && input[index + 1] === '"') {
+        field += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (character === "," && !quoted) {
+      row.push(field.trim());
+      field = "";
+    } else if ((character === "\n" || character === "\r") && !quoted) {
+      row.push(field.trim());
+      if (row.some((value) => value.length > 0)) rows.push(row);
+      row = [];
+      field = "";
+      if (character === "\r" && input[index + 1] === "\n") index += 1;
+    } else {
+      field += character;
+    }
+  }
+  if (quoted) throw new Error("Reference CSV contains an unclosed quoted value.");
+  row.push(field.trim());
+  if (row.some((value) => value.length > 0)) rows.push(row);
+
+  if (rows.length < 2) {
+    throw new Error("Reference CSV must contain a header and at least one data row.");
+  }
+  const headers = rows[0];
+  if (headers.some((header) => !header)) {
+    throw new Error("Reference CSV headers cannot be empty.");
+  }
+  if (new Set(headers).size !== headers.length) {
+    throw new Error("Reference CSV headers must be unique.");
+  }
+
+  const table = fileName.replace(/\.csv$/i, "").trim();
+  if (!table) throw new Error("Reference CSV filename must identify its table.");
+  const referenceRows = rows.slice(1).map((values, index) => {
+    if (values.length !== headers.length) {
+      throw new Error(`Reference CSV row ${index + 2} must contain ${headers.length} values.`);
+    }
+    return Object.fromEntries(headers.map((header, column) => [header, values[column] || null]));
+  });
+  return { [table]: referenceRows };
+}
+
+function referenceSchemaSummary(referenceData: ReferenceData) {
+  return Object.entries(referenceData).map(([table, rows]) => {
+    const fields = [...new Set(rows.flatMap((row) => Object.keys(row)))];
+    return `${table}(${fields.join(", ")})`;
+  }).join("; ");
+}
+
 function titleForPrompt(prompt: string) {
   const normalized = prompt.replace(/\s+/g, " ").trim();
   if (/^(hi|hello|hey|thanks|thank you|ok|okay|test)\W*$/i.test(normalized)) return "New conversation";
@@ -148,21 +247,49 @@ function createMigratedConversation(title: string) {
 function PromptComposer({
   value,
   onChange,
+  onReferenceAttachment,
   onSubmit,
   onStop,
+  referenceFileName,
   compact = false,
   disabled = false,
   isLoading = false,
 }: {
   value: string;
   onChange: (value: string) => void;
+  onReferenceAttachment: (attachment: ReferenceAttachment) => void;
   onSubmit: () => void;
   onStop: () => void;
+  referenceFileName?: string;
   compact?: boolean;
   disabled?: boolean;
   isLoading?: boolean;
 }) {
   const [attachmentError, setAttachmentError] = useState("");
+  const handleAttachment = async (file: File) => {
+    setAttachmentError("");
+    if (file.size > 100000 || !/\.(csv|json|txt)$/i.test(file.name)) {
+      setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB.");
+      return;
+    }
+    try {
+      const text = await file.text();
+      if (/\.(csv|json)$/i.test(file.name)) {
+        const data = /\.json$/i.test(file.name)
+          ? parseReferenceData(text)
+          : parseCsvReferenceData(text, file.name);
+        onReferenceAttachment({
+          data,
+          fileName: file.name,
+          schemaSummary: referenceSchemaSummary(data),
+        });
+        return;
+      }
+      onChange(value + `\n\nAttached context (${file.name}):\n${text}`);
+    } catch (error) {
+      setAttachmentError(error instanceof Error ? error.message : "Could not read this file. Please retry.");
+    }
+  };
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey && !disabled && !isLoading) {
       event.preventDefault();
@@ -193,7 +320,7 @@ function PromptComposer({
         />
         <div className="flex flex-wrap items-center gap-2 border-t px-3 py-3">
           <label className="inline-flex h-9 shrink-0 cursor-pointer items-center justify-center rounded-full border px-3 text-sm font-medium focus-within:ring-2 focus-within:ring-ring">
-            Attach<input className="sr-only" aria-label="Attach schema or sample" disabled={disabled || isLoading} type="file" accept=".csv,.json,.txt" onChange={async e => { const file = e.target.files?.[0]; e.target.value = ""; if (!file) return; setAttachmentError(""); if (file.size > 100000 || !/\.(csv|json|txt)$/i.test(file.name)) { setAttachmentError("Choose a CSV, JSON, or TXT file under 100 KB."); return; } try { onChange(value + `\n\nAttached context (${file.name}):\n${await file.text()}`); } catch { setAttachmentError("Could not read this file. Please retry."); } }} />
+            Attach<input className="sr-only" aria-label="Attach schema or sample" disabled={disabled || isLoading} type="file" accept=".csv,.json,.txt" onChange={e => { const file = e.target.files?.[0]; e.target.value = ""; if (file) void handleAttachment(file); }} />
           </label>
           <Button aria-label={isLoading ? "Stop response" : "Send prompt"} title={isLoading ? "Stop response" : "Send prompt"} className="ml-auto shrink-0" disabled={!isLoading && (!value.trim() || disabled)} size="icon" type={isLoading ? "button" : "submit"} onClick={isLoading ? onStop : undefined}>
           {isLoading ? (
@@ -205,6 +332,7 @@ function PromptComposer({
         </div>
       </div>
       {attachmentError && <p role="alert" className="mt-2 text-xs text-destructive">{attachmentError}</p>}
+      {referenceFileName && !attachmentError && <p role="status" className="mt-2 text-xs text-muted-foreground">Reference ready: {referenceFileName}</p>}
       {!compact && (
         <p className="mt-3 text-center text-xs text-muted-foreground">
           Syda can make mistakes. Review rules and evaluations before using generated data.
@@ -451,6 +579,7 @@ export default function Home() {
   conversationIdRef.current = conversationId;
   const [prompt, setPrompt] = useState("");
   const [source, setSource] = useState<SchemaSource | null>(null);
+  const [referenceAttachment, setReferenceAttachment] = useState<ReferenceAttachment>();
   const [chatRuns, setChatRuns] = useState<ChatRun[]>([]);
   const [conversationTitle, setConversationTitle] = useState("");
   const [loadedConversationId, setLoadedConversationId] = useState<string>();
@@ -541,6 +670,7 @@ export default function Home() {
       return () => { active = false; };
     }
 
+    setReferenceAttachment(undefined);
     stop();
     setIsAwaitingResponse(false);
     setConversationError(undefined);
@@ -751,13 +881,18 @@ export default function Home() {
       setConversationTitle(titleForPrompt(text));
     }
 
+    const referenceContext = referenceAttachment
+      ? `\n\nAttached reference schema (${referenceAttachment.fileName}): ${referenceAttachment.schemaSummary}. Reference rows will be supplied separately during generation.`
+      : "";
     setPrompt("");
     clearError();
-    await sendMessage({ text: source ? `${text}\n\nDatabase schema context (${source.name}; structure only, output CSV):\n${JSON.stringify(source.schemas)}` : text });
+    const promptWithReference = `${text}${referenceContext}`;
+    await sendMessage({ text: source ? `${promptWithReference}\n\nDatabase schema context (${source.name}; structure only, output CSV):\n${JSON.stringify(source.schemas)}` : promptWithReference });
   };
 
   const startNewScenario = () => {
     setSource(null);
+    setReferenceAttachment(undefined);
     stop();
     setIsAwaitingResponse(false);
     setPrompt("");
@@ -806,7 +941,11 @@ export default function Home() {
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ scenario, scenarioId }),
+        body: JSON.stringify({
+          scenario,
+          scenarioId,
+          ...(referenceAttachment ? { referenceData: referenceAttachment.data } : {}),
+        }),
       });
       if (!response.ok) {
         const body = await response.json().catch(() => undefined) as { detail?: string } | undefined;
@@ -837,7 +976,7 @@ export default function Home() {
               <p className="mb-8 mt-3 max-w-md text-center text-sm leading-6 text-muted-foreground">
                 Describe the entities, relationships, constraints, and edge cases. Syda will turn them into a testable scenario.
               </p>
-              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} value={prompt} />
+              <PromptComposer disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onReferenceAttachment={setReferenceAttachment} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} referenceFileName={referenceAttachment?.fileName} value={prompt} />
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {promptSuggestions.map((suggestion) => (
                   <Button key={suggestion.label} onClick={() => setPrompt(suggestion.prompt)} size="sm" type="button" variant="outline">
@@ -935,7 +1074,7 @@ export default function Home() {
             <div className="shrink-0 border-t bg-background px-5 py-4">
               <div className="mx-auto w-full max-w-3xl">
                 <div className="flex items-end gap-2">
-                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} value={prompt} />
+                  <PromptComposer compact disabled={isThinking || conversationLoading || (!!conversationId && loadedConversationId !== conversationId)} isLoading={isThinking} onChange={setPrompt} onReferenceAttachment={setReferenceAttachment} onSubmit={submitPrompt} onStop={() => { stop(); setIsAwaitingResponse(false); }} referenceFileName={referenceAttachment?.fileName} value={prompt} />
                 </div>
                 {error && <p className="mt-2 text-xs text-destructive">{error.message}</p>}
               </div>
