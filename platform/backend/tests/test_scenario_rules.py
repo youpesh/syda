@@ -17,7 +17,7 @@ def _insurance_scenario():
     return ScenarioConfiguration.model_validate(payload)
 
 
-def test_insurance_rule_text_and_checks_reach_engine_and_pass():
+def test_insurance_rules_pass_while_unique_demographics_fail_privacy():
     scenario = _insurance_scenario()
     definition = _scenario_definition(scenario, scenario.schemas or {})
     assert definition.rules == scenario.rules
@@ -34,9 +34,13 @@ def test_insurance_rule_text_and_checks_reach_engine_and_pass():
         generated.tables, scenario.schemas or {}, scenario
     )
     rules_metric = next(item for item in metrics if item.key == "declared_rules")
+    privacy_metric = next(item for item in metrics if item.key == "privacy_leakage")
     assert rules_metric.status == "pass"
-    assert result in {"pass", "partial"}
-    assert violations == 0
+    assert privacy_metric.status == "fail"
+    assert privacy_metric.value == "k=1; risk=100.0%"
+    assert privacy_metric.violations == 20
+    assert result == "fail"
+    assert violations == 20
 
 
 def test_evaluation_fails_when_denied_claim_has_payment():
