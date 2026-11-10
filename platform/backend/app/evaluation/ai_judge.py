@@ -55,7 +55,16 @@ Evaluate:
 2. Clinical plausibility when the workflow is healthcare-related.
 3. Specialty-procedure coherence when those concepts are present.
 4. Age-diagnosis realism when age and diagnosis information are present.
-5. Coherence of diagnoses, procedures, statuses, amounts, and related events.
+5. Cross-table clinical or business coherence that requires domain judgment.
+
+Deterministic validators separately enforce numeric minimums and maximums,
+allowed values, date and temporal ordering, state transitions, scenario coverage,
+referential integrity, and other machine-executable declared rules. Do not
+re-evaluate those checks, flag them as Judge anomalies, or base the score or verdict
+on alleged violations of them. Use declared rules only as context for semantic
+domain plausibility. If a concern can be resolved by direct arithmetic, date
+comparison, membership, existence, or key lookup, leave it to the deterministic
+validators.
 
 The score must be between 0.0 and 1.0. Choose pass, warning, or fail from the
 evidence and rubric. Use warning for plausible data with material concerns needing
@@ -67,10 +76,11 @@ repeat the numeric score or verdict, use generic introductory filler, or specula
 about concerns that are not supported by the sampled evidence. Every material
 concern mentioned in the reasoning must have a corresponding flagged anomaly.
 
-Return at most five of the strongest specific anomalies. When the evidence includes
-a pseudonymized workflowId, name it and cite the relevant table, fields, and
-conflicting values or relationship. Do not invent evidence, reproduce full rows, or
-reveal hidden chain-of-thought.
+Return every distinct, material anomaly supported by the evidence, ordered from
+most to least serious. When the evidence includes a pseudonymized workflowId, name
+it and cite the relevant table, fields, and conflicting values or relationship. Do
+not include duplicates, invent evidence, reproduce full rows, or reveal hidden
+chain-of-thought.
 """
 
 
@@ -275,11 +285,16 @@ def run_ai_judge_audit(
         )
 
     workflows = sample_complete_workflows(job_id, tables, scenario, sample_size)
-    if not workflows:
+    if len(workflows) < MIN_SAMPLE_SIZE:
         return JudgeAuditOutcome(
             result=None,
             status="insufficient_data",
-            detail="AI Judge not evaluated because no complete workflow instances were available.",
+            detail=(
+                "AI Judge not evaluated because only "
+                f"{len(workflows)} complete workflow instances were available; "
+                f"at least {MIN_SAMPLE_SIZE} are required."
+            ),
+            sampled_workflows=len(workflows),
         )
 
     prompt = (

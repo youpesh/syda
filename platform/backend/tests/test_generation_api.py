@@ -230,11 +230,18 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
 
 
 def test_generation_persists_judge_audit_in_stats_and_report_routes(monkeypatch, tmp_path):
+    anomalies = [
+        "Specialty <script> pairing needs review.",
+        *[
+            f"Workflow id_{index:02d}: route anomaly {index}."
+            for index in range(1, 12)
+        ],
+    ]
     audit = JudgeAuditResult(
         score=0.78,
         verdict="warning",
         reasoning="Generally plausible; review one specialty pairing.",
-        flaggedAnomalies=["Specialty <script> pairing needs review."],
+        flaggedAnomalies=anomalies,
     )
     monkeypatch.setattr(
         generation_service,
@@ -269,6 +276,8 @@ def test_generation_persists_judge_audit_in_stats_and_report_routes(monkeypatch,
         html_report = client.get(f"/api/jobs/{job_id}/evaluation-report").text
         assert "AI Judge Audit" in html_report
         assert "0.78 / 1.00" in html_report
+        assert "Flagged anomalies (12)" in html_report
+        assert "Workflow id_11: route anomaly 11." in html_report
         assert "Specialty &lt;script&gt; pairing needs review." in html_report
         assert "Specialty <script> pairing needs review." not in html_report
 

@@ -19,6 +19,8 @@ import type { JobStats } from "~/lib/studio-types";
 type EvaluationMetric = JobStats["evaluationMetrics"][number];
 type DisplayStatus = EvaluationMetric["status"] | "not_applicable";
 
+const MAX_VISIBLE_JUDGE_ANOMALIES = 10;
+
 const statusPresentation = {
   pass: {
     badgeClassName: "border-emerald-500/30 bg-emerald-500/10 text-emerald-500",
@@ -115,6 +117,10 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
   const reportFailed = stats.evaluationResult === "fail";
   const judgeAudit = stats.judgeAudit;
   const judge = judgeAudit ? judgePresentation[judgeAudit.verdict] : undefined;
+  const visibleJudgeAnomalies = judgeAudit?.flaggedAnomalies.slice(0, MAX_VISIBLE_JUDGE_ANOMALIES) ?? [];
+  const judgeAnomaliesTruncated = Boolean(
+    judgeAudit && judgeAudit.flaggedAnomalies.length > visibleJudgeAnomalies.length,
+  );
 
   return (
     <Card>
@@ -176,9 +182,14 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
 
             <div className="mt-4 rounded-lg border bg-background/60 p-4">
               <h4 className="text-sm font-medium">Flagged anomalies ({judgeAudit.flaggedAnomalies.length})</h4>
+              {judgeAnomaliesTruncated && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {judgeAudit.flaggedAnomalies.length.toLocaleString()} detected, {visibleJudgeAnomalies.length.toLocaleString()} shown. All detected anomalies are included in the JSON and HTML reports.
+                </p>
+              )}
               {judgeAudit.flaggedAnomalies.length ? (
                 <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm text-muted-foreground">
-                  {judgeAudit.flaggedAnomalies.map((anomaly, index) => (
+                  {visibleJudgeAnomalies.map((anomaly, index) => (
                     <li className="whitespace-pre-wrap break-words pl-1" key={`${index}-${anomaly}`}>{anomaly}</li>
                   ))}
                 </ol>

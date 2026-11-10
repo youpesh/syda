@@ -127,6 +127,21 @@ def test_job_stats_remains_compatible_without_judge_audit():
     assert "judgeAudit" not in stats.model_dump(by_alias=True)
 
 
+def test_judge_prompt_separates_semantic_and_deterministic_responsibilities():
+    prompt = " ".join(ai_judge._SYSTEM_PROMPT.split())
+
+    assert "Clinical plausibility" in prompt
+    assert "Specialty-procedure coherence" in prompt
+    assert "Age-diagnosis realism" in prompt
+    assert "Cross-table clinical or business coherence" in prompt
+    assert "Deterministic validators separately enforce" in prompt
+    assert "numeric minimums and maximums" in prompt
+    assert "date and temporal ordering" in prompt
+    assert "referential integrity" in prompt
+    assert "Do not re-evaluate those checks" in prompt
+    assert "leave it to the deterministic validators" in prompt
+
+
 def test_workflow_sampling_is_path_aware_deterministic_and_minimized():
     tables = _tables(30, include_incomplete=True)
     scenario = _scenario(32)
@@ -167,6 +182,59 @@ def test_offline_provider_skips_without_invoking_judge(monkeypatch):
     )
     assert outcome.status == "not_configured"
     assert outcome.result is None
+
+
+def test_audit_requires_at_least_card_minimum_complete_workflows(monkeypatch):
+    monkeypatch.setattr(
+        ai_judge,
+        "_request_structured_audit",
+        lambda *_: pytest.fail("provider request should not run"),
+    )
+    outcome = ai_judge.run_ai_judge_audit(
+        "job-1",
+        _tables(24),
+        _scenario(24),
+        {"id": "openai", "model": "judge-model", "key": "secret"},
+    )
+    assert outcome.status == "insufficient_data"
+    assert outcome.result is None
+    assert outcome.sampled_workflows == 24
+    assert "only 24 complete workflow instances" in outcome.detail
+    assert "at least 25 are required" in outcome.detail
+
+
+@pytest.mark.parametrize(
+    "available,sample_size,expected",
+    [
+        (25, 30, 25),
+        (29, 30, 29),
+        (30, 30, 30),
+        (31, 30, 30),
+        (40, 50, 40),
+        (51, 50, 50),
+    ],
+)
+def test_audit_sampling_uses_inclusive_target_boundary(
+    monkeypatch, available, sample_size, expected
+):
+    monkeypatch.setattr(
+        ai_judge,
+        "_request_structured_audit",
+        lambda *_: JudgeAuditResult(
+            score=1.0,
+            verdict="pass",
+            reasoning="The sampled workflows are plausible.",
+        ),
+    )
+    outcome = ai_judge.run_ai_judge_audit(
+        "job-1",
+        _tables(available),
+        _scenario(available),
+        {"id": "openai", "model": "judge-model", "key": "secret"},
+        sample_size=sample_size,
+    )
+    assert outcome.status == "completed"
+    assert outcome.sampled_workflows == expected
 
 
 def test_provider_failure_is_contained_by_judge_boundary(monkeypatch):
@@ -273,11 +341,18 @@ def test_deterministic_semantic_failure_wins_over_judge_pass():
 
 
 def test_report_payload_and_html_include_escaped_judge_audit():
+    anomalies = [
+        "Specialty <img src=x onerror=alert(1)> mismatch.",
+        *[
+            f"Workflow id_{index:02d}: evidence-supported anomaly {index}."
+            for index in range(1, 12)
+        ],
+    ]
     audit = JudgeAuditResult(
         score=0.85,
         verdict="warning",
         reasoning="Review <script>alert('reason')</script> carefully.",
-        flaggedAnomalies=["Specialty <img src=x onerror=alert(1)> mismatch."],
+        flaggedAnomalies=anomalies,
     )
     stats = _stats(audit)
     payload = _evaluation_report_payload("job-1", stats)
@@ -285,8 +360,11 @@ def test_report_payload_and_html_include_escaped_judge_audit():
 
     assert payload["schemaVersion"] == "1.0"
     assert payload["judgeAudit"]["flaggedAnomalies"] == audit.flagged_anomalies
+    assert len(payload["judgeAudit"]["flaggedAnomalies"]) == 12
     assert "AI Judge Audit" in report
     assert "0.85 / 1.00" in report
+    assert "Flagged anomalies (12)" in report
+    assert "Workflow id_11: evidence-supported anomaly 11." in report
     assert "&lt;script&gt;" in report
     assert "&lt;img" in report
     assert "<script>alert('reason')</script>" not in report
@@ -301,7 +379,8 @@ def test_historical_report_omits_json_audit_and_explains_html_state():
 
 
 def test_judge_provider_failure_does_not_fail_or_retry_generation(monkeypatch, tmp_path):
-    scenario = _scenario(3)
+    scenario = _scenario(30)
+    scenario.paths = scenario.paths[:1]
     scenario.schemas["Patient"].pop("age")
     monkeypatch.setattr(
         generation_service,
