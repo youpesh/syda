@@ -42,6 +42,27 @@ const statusPresentation = {
   },
 } as const;
 
+const judgePresentation = {
+  pass: {
+    badgeClassName: "border-emerald-500/30 bg-emerald-500/10 text-emerald-600",
+    containerClassName: "border-emerald-500/30 bg-emerald-500/5",
+    icon: CheckmarkCircle02Icon,
+    label: "Pass",
+  },
+  warning: {
+    badgeClassName: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+    containerClassName: "border-amber-500/40 bg-amber-500/5",
+    icon: InformationCircleIcon,
+    label: "Warning",
+  },
+  fail: {
+    badgeClassName: "",
+    containerClassName: "border-destructive/40 bg-destructive/5",
+    icon: AlertCircleIcon,
+    label: "Fail",
+  },
+} as const;
+
 function displayStatus(metric: EvaluationMetric): DisplayStatus {
   if (metric.key === "referential_integrity" && metric.value.toLowerCase() === "not applicable") {
     return "not_applicable";
@@ -92,6 +113,8 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
     : stats.evaluationMetrics;
   const reportPassed = stats.evaluationResult === "pass";
   const reportFailed = stats.evaluationResult === "fail";
+  const judgeAudit = stats.judgeAudit;
+  const judge = judgeAudit ? judgePresentation[judgeAudit.verdict] : undefined;
 
   return (
     <Card>
@@ -111,6 +134,73 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
         </div>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
+        {judgeAudit && judge ? (
+          <section
+            aria-labelledby="ai-judge-audit-title"
+            className={`rounded-xl border p-4 ${judge.containerClassName}`}
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex min-w-0 items-start gap-3">
+                <HugeiconsIcon
+                  className={judgeAudit.verdict === "fail" ? "mt-0.5 shrink-0 text-destructive" : "mt-0.5 shrink-0"}
+                  icon={judge.icon}
+                  strokeWidth={2}
+                />
+                <div className="min-w-0">
+                  <h3 className="text-base font-semibold" id="ai-judge-audit-title">AI Judge Audit</h3>
+                  <p className="mt-1 text-xs text-muted-foreground">Semantic plausibility across sampled complete workflows</p>
+                </div>
+              </div>
+              <Badge
+                className={judge.badgeClassName}
+                variant={judgeAudit.verdict === "fail" ? "destructive" : "outline"}
+              >
+                <HugeiconsIcon data-icon="inline-start" icon={judge.icon} strokeWidth={2} />
+                {judge.label}
+              </Badge>
+            </div>
+
+            <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,0.35fr)_minmax(0,0.65fr)]">
+              <div className="rounded-lg border bg-background/60 p-4">
+                <p className="text-xs text-muted-foreground">Semantic plausibility score</p>
+                <p className="mt-1 text-3xl font-semibold tabular-nums">{judgeAudit.score.toFixed(2)} <span className="text-base font-normal text-muted-foreground">/ 1.00</span></p>
+                <p className="mt-3 text-xs text-muted-foreground">
+                  {judgeAudit.flaggedAnomalies.length.toLocaleString()} {judgeAudit.flaggedAnomalies.length === 1 ? "anomaly" : "anomalies"} flagged
+                </p>
+              </div>
+              <div className="rounded-lg border bg-background/60 p-4">
+                <h4 className="text-sm font-medium">Judge reasoning</h4>
+                <p className="mt-2 whitespace-pre-wrap break-words text-sm text-muted-foreground">{judgeAudit.reasoning}</p>
+              </div>
+            </div>
+
+            <div className="mt-4 rounded-lg border bg-background/60 p-4">
+              <h4 className="text-sm font-medium">Flagged anomalies ({judgeAudit.flaggedAnomalies.length})</h4>
+              {judgeAudit.flaggedAnomalies.length ? (
+                <ol className="mt-3 list-decimal space-y-2 pl-5 text-sm text-muted-foreground">
+                  {judgeAudit.flaggedAnomalies.map((anomaly, index) => (
+                    <li className="whitespace-pre-wrap break-words pl-1" key={`${index}-${anomaly}`}>{anomaly}</li>
+                  ))}
+                </ol>
+              ) : (
+                <p className="mt-2 text-sm text-muted-foreground">No anomalies were flagged in the sampled workflows.</p>
+              )}
+            </div>
+          </section>
+        ) : (
+          <section aria-labelledby="ai-judge-audit-title" className="rounded-xl border bg-muted/20 p-4">
+            <div className="flex items-start gap-3">
+              <HugeiconsIcon className="mt-0.5 shrink-0 text-muted-foreground" icon={MinusSignCircleIcon} strokeWidth={2} />
+              <div>
+                <h3 className="text-sm font-medium" id="ai-judge-audit-title">AI Judge Audit</h3>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  An AI Judge audit was not recorded for this run. Existing deterministic evaluation results remain available below.
+                </p>
+              </div>
+            </div>
+          </section>
+        )}
+
         {showPrivacyFailure && privacyMetric && privacy && (
           <section className="rounded-xl border border-destructive/40 bg-destructive/5 p-4" role="alert" aria-labelledby="privacy-failure-title">
             <div className="flex items-start gap-3">

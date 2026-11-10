@@ -32,6 +32,13 @@ export interface ViolationRecord {
   error: string;
 }
 
+export interface JudgeAuditResult {
+  score: number;
+  verdict: "pass" | "warning" | "fail";
+  reasoning: string;
+  flaggedAnomalies: string[];
+}
+
 export interface JobStats {
   causalIntegrity: string;
   referentialIntegrity: string;
@@ -44,6 +51,7 @@ export interface JobStats {
   evaluationResult: "pass" | "fail" | "partial";
   evaluationMetrics: { key: string; label: string; status: "pass" | "fail" | "not_evaluated"; value: string; detail: string; violations: number }[];
   violations?: ViolationRecord[];
+  judgeAudit?: JudgeAuditResult | null;
 }
 
 export interface GenerationJob {

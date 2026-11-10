@@ -60,8 +60,17 @@ Evaluate:
 The score must be between 0.0 and 1.0. Choose pass, warning, or fail from the
 evidence and rubric. Use warning for plausible data with material concerns needing
 human review, and fail for implausible or contradictory data that should not pass a
-quality gate. Provide concise audit reasoning, not hidden chain-of-thought. Flag
-only specific anomalies supported by the evidence and do not reproduce full rows.
+quality gate.
+
+Write a direct audit summary of no more than 80 words for the reasoning. Do not
+repeat the numeric score or verdict, use generic introductory filler, or speculate
+about concerns that are not supported by the sampled evidence. Every material
+concern mentioned in the reasoning must have a corresponding flagged anomaly.
+
+Return at most five of the strongest specific anomalies. When the evidence includes
+a pseudonymized workflowId, name it and cite the relevant table, fields, and
+conflicting values or relationship. Do not invent evidence, reproduce full rows, or
+reveal hidden chain-of-thought.
 """
 
 

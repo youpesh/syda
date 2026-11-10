@@ -406,9 +406,15 @@ def _evaluation_metrics(
             if deterministic_semantic_status == "not_evaluated"
             else f"deterministic constraints {deterministic_semantic_status}ed"
         )
+        anomaly_count = len(judge_audit.flagged_anomalies)
+        anomaly_summary = (
+            f"{anomaly_count} anomaly flagged"
+            if anomaly_count == 1
+            else f"{anomaly_count} anomalies flagged"
+        )
         semantic_detail = (
             f"AI Judge verdict: {judge_audit.verdict}; {deterministic_summary}. "
-            f"{judge_audit.reasoning}"
+            f"{anomaly_summary}. See AI Judge Audit above."
         )
     elif judge_detail:
         semantic_detail = f"{semantic_detail} {judge_detail}"

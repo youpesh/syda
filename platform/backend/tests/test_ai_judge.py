@@ -228,6 +228,7 @@ def test_judge_verdict_composes_with_semantic_correctness(
         score=0.4 if verdict == "fail" else 0.8,
         verdict=verdict,
         reasoning="Structured audit result.",
+        flaggedAnomalies=["Workflow wf-123: procedure conflicts with diagnosis."],
     )
     metrics, result, _, _ = _evaluation_metrics(
         tables,
@@ -240,6 +241,11 @@ def test_judge_verdict_composes_with_semantic_correctness(
     assert semantic.status == expected_status
     assert semantic.value == f"{audit.score:.3f}"
     assert semantic.violations == 0
+    assert semantic.detail == (
+        f"AI Judge verdict: {verdict}; deterministic constraints passed. "
+        "1 anomaly flagged. See AI Judge Audit above."
+    )
+    assert audit.reasoning not in semantic.detail
     assert result == expected_result
 
 
@@ -258,6 +264,11 @@ def test_deterministic_semantic_failure_wins_over_judge_pass():
     semantic = next(item for item in metrics if item.key == "semantic_correctness")
     assert semantic.status == "fail"
     assert semantic.violations == 1
+    assert semantic.detail == (
+        "AI Judge verdict: pass; deterministic constraints failed. "
+        "0 anomalies flagged. See AI Judge Audit above."
+    )
+    assert audit.reasoning not in semantic.detail
     assert result == "fail"
 
 
