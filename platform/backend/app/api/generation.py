@@ -324,7 +324,7 @@ def _completed_evaluation_stats(job_id: str, db: Session, user: User) -> JobStat
 
 
 def _evaluation_report_payload(job_id: str, stats: JobStats) -> Dict[str, Any]:
-    return {
+    payload = {
         "schemaVersion": "1.0",
         "jobId": job_id,
         "result": stats.evaluation_result,
@@ -333,6 +333,9 @@ def _evaluation_report_payload(job_id: str, stats: JobStats) -> Dict[str, Any]:
         "metrics": [metric.model_dump(by_alias=True, exclude_none=True) for metric in stats.evaluation_metrics],
         "violations": [violation.model_dump(by_alias=True) for violation in stats.violations],
     }
+    if stats.judge_audit is not None:
+        payload["judgeAudit"] = stats.judge_audit.model_dump(by_alias=True)
+    return payload
 
 
 def _format_report_number(value: Optional[float]) -> str:
@@ -388,10 +391,33 @@ def _evaluation_report_html(job_id: str, stats: JobStats) -> str:
         f'<tbody>{violation_rows}</tbody></table>'
         if violation_rows else '<p>No causal or semantic rule violations detected.</p>'
     )
+    if stats.judge_audit is not None:
+        audit = stats.judge_audit
+        anomaly_items = "".join(
+            f"<li>{html.escape(anomaly)}</li>" for anomaly in audit.flagged_anomalies
+        )
+        anomaly_section = (
+            f"<ol>{anomaly_items}</ol>"
+            if anomaly_items else "<p>No anomalies were flagged in the sampled workflows.</p>"
+        )
+        judge_section = (
+            '<section><h2>AI Judge Audit</h2>'
+            f'<span class="badge {audit.verdict}">{html.escape(audit.verdict.title())}</span>'
+            f'<p class="judge-score">{audit.score:.2f} / 1.00</p>'
+            f'<p>{html.escape(audit.reasoning)}</p>'
+            f'<h3>Flagged anomalies ({len(audit.flagged_anomalies)})</h3>{anomaly_section}</section>'
+        )
+    else:
+        judge_section = (
+            "<section><h2>AI Judge Audit</h2>"
+            "<p>An AI Judge audit was not recorded for this run. Existing deterministic "
+            "evaluation results remain available below.</p></section>"
+        )
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Syda evaluation {html.escape(job_id)}</title>
-<style>body{{font:14px system-ui;margin:0;background:#f8fafc;color:#172033}}main{{max-width:1100px;margin:auto;padding:32px}}section,header,.card{{background:white;border:1px solid #dbe3ee;border-radius:14px;padding:20px}}section{{margin-top:18px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}}.card h3{{margin:0 0 8px}}.card strong{{display:block;font-size:1.4rem;margin:12px 0}}.badge{{float:right;padding:3px 8px;border-radius:999px;background:#e2e8f0}}.pass{{color:#15803d}}.fail{{color:#b91c1c}}.chart{{display:grid;grid-template-columns:140px 1fr 40px;gap:12px;margin:10px 0}}progress{{width:100%}}table{{border-collapse:collapse;width:100%;overflow:auto}}th,td{{border:1px solid #dbe3ee;padding:8px;text-align:left}}th{{background:#f1f5f9}}</style></head>
+<style>body{{font:14px system-ui;margin:0;background:#f8fafc;color:#172033}}main{{max-width:1100px;margin:auto;padding:32px}}section,header,.card{{background:white;border:1px solid #dbe3ee;border-radius:14px;padding:20px}}section{{margin-top:18px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}}.card h3{{margin:0 0 8px}}.card strong{{display:block;font-size:1.4rem;margin:12px 0}}.badge{{float:right;padding:3px 8px;border-radius:999px;background:#e2e8f0}}.pass{{color:#15803d}}.warning{{color:#b45309}}.fail{{color:#b91c1c}}.judge-score{{font-size:1.8rem;font-weight:700;margin:12px 0}}.chart{{display:grid;grid-template-columns:140px 1fr 40px;gap:12px;margin:10px 0}}progress{{width:100%}}table{{border-collapse:collapse;width:100%;overflow:auto}}th,td{{border:1px solid #dbe3ee;padding:8px;text-align:left}}th{{background:#f1f5f9}}</style></head>
 <body><main><header><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p></header>
+{judge_section}
 <section><h2>Metric scorecards</h2><div class="cards">{scorecards}</div></section>
 <section><h2>Quality status chart</h2>{chart}</section>
 <section><h2>Statistical similarity details</h2>{statistical_section}</section>

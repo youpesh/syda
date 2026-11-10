@@ -13,10 +13,12 @@ from syda.output import save_dataframes
 from syda.templates import TemplateProcessor
 from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
+from ..evaluation.ai_judge import run_ai_judge_audit
 from ..evaluation.statistical_similarity import evaluate_statistical_similarity
 from ..models.scenario import (
     ScenarioConfiguration,
     EvaluationMetric,
+    JudgeAuditResult,
     JobStats,
     StatisticalFieldResult,
     ViolationRecord,
@@ -339,6 +341,8 @@ def _evaluation_metrics(
     scenario: ScenarioConfiguration,
     reference_data: Optional[Dict[str, list[Dict[str, Any]]]] = None,
     return_details: bool = False,
+    judge_audit: Optional[JudgeAuditResult] = None,
+    judge_detail: Optional[str] = None,
 ) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
@@ -386,6 +390,29 @@ def _evaluation_metrics(
     def binary_status(is_pass: bool) -> Literal["pass", "fail"]:
         return "pass" if is_pass else "fail"
 
+    deterministic_semantic_status = measured_status(semantic_violations, semantic_checked)
+    semantic_status = deterministic_semantic_status
+    semantic_metric_value = semantic_value
+    semantic_detail = "Checks declared numeric minimum and maximum constraints."
+    if judge_audit is not None:
+        semantic_status = (
+            "fail"
+            if deterministic_semantic_status == "fail" or judge_audit.verdict == "fail"
+            else "pass"
+        )
+        semantic_metric_value = f"{judge_audit.score:.3f}"
+        deterministic_summary = (
+            "no deterministic constraints were evaluable"
+            if deterministic_semantic_status == "not_evaluated"
+            else f"deterministic constraints {deterministic_semantic_status}ed"
+        )
+        semantic_detail = (
+            f"AI Judge verdict: {judge_audit.verdict}; {deterministic_summary}. "
+            f"{judge_audit.reasoning}"
+        )
+    elif judge_detail:
+        semantic_detail = f"{semantic_detail} {judge_detail}"
+
     metrics = [
         EvaluationMetric(
             key="statistical_similarity",
@@ -410,9 +437,9 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="semantic_correctness",
             label="Semantic correctness",
-            status=measured_status(semantic_violations, semantic_checked),
-            value=semantic_value,
-            detail="Checks declared numeric minimum and maximum constraints.",
+            status=semantic_status,
+            value=semantic_metric_value,
+            detail=semantic_detail,
             violations=semantic_violations,
         ),
         EvaluationMetric(
@@ -577,11 +604,22 @@ def run_generation(
         "current_stage": "Evaluating causal rules and relational constraints",
     })
 
-    elapsed = round(time.time() - t0, 1)
     total_records = sum(len(df) for df in dfs.values())
+    update_job(job_id, {
+        "progress": 88,
+        "current_stage": "Running AI Judge semantic plausibility audit",
+    })
+    judge_outcome = run_ai_judge_audit(job_id, dfs, scenario, provider)
     metrics, evaluation_result, total_violations, violation_records = _evaluation_metrics(
-        dfs, schemas, scenario, reference_data=reference_data, return_details=True
+        dfs,
+        schemas,
+        scenario,
+        reference_data=reference_data,
+        return_details=True,
+        judge_audit=judge_outcome.result,
+        judge_detail=judge_outcome.detail,
     )
+    elapsed = round(time.time() - t0, 1)
     metric_by_key = {metric.key: metric for metric in metrics}
     table_row_counts = {name: len(df) for name, df in dfs.items()}
 
@@ -597,6 +635,7 @@ def run_generation(
         evaluationMetrics=metrics,
         evaluationResult=evaluation_result,
         violations=violation_records,
+        judgeAudit=judge_outcome.result,
     )
 
     if evaluation_result == "fail":

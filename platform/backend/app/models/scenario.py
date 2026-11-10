@@ -125,6 +125,15 @@ class EvaluationMetric(BaseModel):
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
 
+class JudgeAuditResult(BaseModel):
+    score: float = Field(ge=0.0, le=1.0)
+    verdict: Literal["pass", "warning", "fail"]
+    reasoning: str
+    flagged_anomalies: List[str] = Field(default_factory=list, alias="flaggedAnomalies")
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+
 class ViolationRecord(BaseModel):
     table: str
     row: Any
@@ -150,6 +159,11 @@ class JobStats(BaseModel):
     evaluation_metrics: List[EvaluationMetric] = Field(default_factory=list, alias="evaluationMetrics")
     evaluation_result: Literal["pass", "fail", "partial"] = Field(default="partial", alias="evaluationResult")
     violations: List[ViolationRecord] = Field(default_factory=list, alias="violations")
+    judge_audit: Optional[JudgeAuditResult] = Field(
+        default=None,
+        alias="judgeAudit",
+        exclude_if=lambda value: value is None,
+    )
 
     model_config = ConfigDict(
         populate_by_name=True,

@@ -15,8 +15,11 @@ from app import database, job_queue, job_runner
 from app.api import generation
 from app.main import app
 from app.models.entities import JobRecord
+from app.models.scenario import JudgeAuditResult
 from app.models.user import User
 from app.api.auth import require_authenticated
+from app.evaluation.ai_judge import JudgeAuditOutcome
+from app.services import generation as generation_service
 
 
 _TEST_USER = User(
@@ -224,6 +227,50 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert "Statistical similarity" in inline_report.text
         assert "<script" not in inline_report.text
         assert "<link" not in inline_report.text
+
+
+def test_generation_persists_judge_audit_in_stats_and_report_routes(monkeypatch, tmp_path):
+    audit = JudgeAuditResult(
+        score=0.78,
+        verdict="warning",
+        reasoning="Generally plausible; review one specialty pairing.",
+        flaggedAnomalies=["Specialty <script> pairing needs review."],
+    )
+    monkeypatch.setattr(
+        generation_service,
+        "run_ai_judge_audit",
+        lambda *_args, **_kwargs: JudgeAuditOutcome(
+            result=audit,
+            status="completed",
+            detail="AI Judge evaluated 3 complete workflow instances.",
+            sampled_workflows=3,
+        ),
+    )
+    with _client(monkeypatch, tmp_path) as client:
+        job_id = client.post(
+            "/api/generate", json={"scenario": _scenario(record_count=3)}
+        ).json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+
+        assert job["status"] == "complete"
+        assert job["stats"]["judgeAudit"]["score"] == 0.78
+        semantic = next(
+            metric for metric in job["stats"]["evaluationMetrics"]
+            if metric["key"] == "semantic_correctness"
+        )
+        assert semantic["status"] == "pass"
+        assert semantic["value"] == "0.780"
+
+        report = client.get(f"/api/jobs/{job_id}/evaluation").json()
+        assert report["schemaVersion"] == "1.0"
+        assert report["judgeAudit"]["verdict"] == "warning"
+        assert report["judgeAudit"]["flaggedAnomalies"] == audit.flagged_anomalies
+
+        html_report = client.get(f"/api/jobs/{job_id}/evaluation-report").text
+        assert "AI Judge Audit" in html_report
+        assert "0.78 / 1.00" in html_report
+        assert "Specialty &lt;script&gt; pairing needs review." in html_report
+        assert "Specialty <script> pairing needs review." not in html_report
 
 
 def test_privacy_leakage_passes_when_every_equivalence_class_has_three_records():
