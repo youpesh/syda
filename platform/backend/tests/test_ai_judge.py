@@ -363,6 +363,8 @@ def test_report_payload_and_html_include_escaped_judge_audit():
     assert len(payload["judgeAudit"]["flaggedAnomalies"]) == 12
     assert "AI Judge Audit" in report
     assert "0.85 / 1.00" in report
+    assert 'class="judge-reasoning"' in report
+    assert ".judge-score,.judge-reasoning{color:var(--text)}" in report
     assert "Flagged anomalies (12)" in report
     assert "Workflow id_11: evidence-supported anomaly 11." in report
     assert "&lt;script&gt;" in report
