@@ -15,6 +15,7 @@ import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle }
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "~/components/ui/empty";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/components/ui/table";
 import type { JobStats } from "~/lib/studio-types";
+import { useTheme } from "~/lib/theme-provider";
 
 type EvaluationMetric = JobStats["evaluationMetrics"][number];
 type DisplayStatus = EvaluationMetric["status"] | "not_applicable";
@@ -91,6 +92,8 @@ function privacySummary(metric: EvaluationMetric) {
 }
 
 export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: string }) {
+  const { resolvedTheme } = useTheme();
+
   if (!stats || !jobId) {
     return (
       <Card>
@@ -343,7 +346,7 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
         <Button onClick={() => window.open(`/api/evaluation/${jobId}/report?format=html`, "_blank")} type="button" variant="outline">
           <HugeiconsIcon data-icon="inline-start" icon={Download01Icon} strokeWidth={2} />Download HTML
         </Button>
-        <Button onClick={() => window.open(`/api/jobs/${jobId}/evaluation-report`, "_blank")} type="button">
+        <Button onClick={() => window.open(`/api/jobs/${jobId}/evaluation-report?theme=${resolvedTheme}`, "_blank")} type="button">
           <HugeiconsIcon data-icon="inline-start" icon={ArrowUpRight01Icon} strokeWidth={2} />View Evaluation Report
         </Button>
       </CardFooter>

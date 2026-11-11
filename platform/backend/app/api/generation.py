@@ -6,7 +6,7 @@ import logging
 import zipfile
 from urllib.parse import quote
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Literal, Optional
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Depends, Query
@@ -342,7 +342,11 @@ def _format_report_number(value: Optional[float]) -> str:
     return "—" if value is None else f"{value:.6g}"
 
 
-def _evaluation_report_html(job_id: str, stats: JobStats) -> str:
+def _evaluation_report_html(
+    job_id: str,
+    stats: JobStats,
+    theme: Literal["light", "dark"] = "light",
+) -> str:
     scorecards = "".join(
         f'<article class="card"><h3>{html.escape(metric.label)}</h3>'
         f'<span class="badge {metric.status}">{html.escape(metric.status.replace("_", " ").title())}</span>'
@@ -413,9 +417,13 @@ def _evaluation_report_html(job_id: str, stats: JobStats) -> str:
             "<p>An AI Judge audit was not recorded for this run. Existing deterministic "
             "evaluation results remain available below.</p></section>"
         )
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8">
+    return f'''<!doctype html><html lang="en" data-theme="{theme}"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Syda evaluation {html.escape(job_id)}</title>
-<style>body{{font:14px system-ui;margin:0;background:#f8fafc;color:#172033}}main{{max-width:1100px;margin:auto;padding:32px}}section,header,.card{{background:white;border:1px solid #dbe3ee;border-radius:14px;padding:20px}}section{{margin-top:18px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}}.card h3{{margin:0 0 8px}}.card strong{{display:block;font-size:1.4rem;margin:12px 0}}.badge{{float:right;padding:3px 8px;border-radius:999px;background:#e2e8f0}}.pass{{color:#15803d}}.warning{{color:#b45309}}.fail{{color:#b91c1c}}.judge-score{{font-size:1.8rem;font-weight:700;margin:12px 0}}.chart{{display:grid;grid-template-columns:140px 1fr 40px;gap:12px;margin:10px 0}}progress{{width:100%}}table{{border-collapse:collapse;width:100%;overflow:auto}}th,td{{border:1px solid #dbe3ee;padding:8px;text-align:left}}th{{background:#f1f5f9}}</style></head>
+<style>
+:root{{color-scheme:light;--page:#f8fafc;--surface:#fff;--surface-muted:#f1f5f9;--text:#172033;--muted:#526078;--border:#dbe3ee;--pass:#15803d;--pass-bg:rgba(34,197,94,.12);--pass-border:rgba(21,128,61,.35);--fail:#b91c1c;--fail-bg:rgba(239,68,68,.12);--fail-border:rgba(185,28,28,.35);--warning:#b45309;--warning-bg:rgba(245,158,11,.14);--warning-border:rgba(180,83,9,.35);--neutral:#526078;--neutral-bg:rgba(100,116,139,.12);--neutral-border:rgba(82,96,120,.3)}}
+:root[data-theme="dark"]{{color-scheme:dark;--page:#0b1117;--surface:#121a22;--surface-muted:#1b2530;--text:#e5edf5;--muted:#a7b4c4;--border:#2d3a48;--pass:#4ade80;--pass-bg:rgba(74,222,128,.13);--pass-border:rgba(74,222,128,.35);--fail:#f87171;--fail-bg:rgba(248,113,113,.13);--fail-border:rgba(248,113,113,.35);--warning:#fbbf24;--warning-bg:rgba(251,191,36,.14);--warning-border:rgba(251,191,36,.35);--neutral:#a7b4c4;--neutral-bg:rgba(167,180,196,.12);--neutral-border:rgba(167,180,196,.3)}}
+*{{box-sizing:border-box}}body{{font:14px system-ui;margin:0;background:var(--page);color:var(--text)}}main{{max-width:1100px;margin:auto;padding:32px}}section,header,.card{{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px}}section{{margin-top:18px}}p,small{{color:var(--muted)}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}}.card h3{{margin:0 0 8px}}.card strong{{display:block;font-size:1.4rem;margin:12px 0}}.badge{{float:right;display:inline-flex;width:max-content;align-items:center;justify-content:center;padding:3px 8px;border:1px solid var(--neutral-border);border-radius:999px;background:var(--neutral-bg);color:var(--neutral);line-height:1.2;white-space:nowrap}}.badge.pass{{border-color:var(--pass-border);background:var(--pass-bg);color:var(--pass)}}.badge.fail{{border-color:var(--fail-border);background:var(--fail-bg);color:var(--fail)}}.badge.warning{{border-color:var(--warning-border);background:var(--warning-bg);color:var(--warning)}}.badge.not_evaluated{{border-color:var(--neutral-border);background:var(--neutral-bg);color:var(--neutral)}}.judge-score{{font-size:1.8rem;font-weight:700;margin:12px 0}}.chart{{display:grid;grid-template-columns:140px 1fr 40px;gap:12px;margin:10px 0}}progress{{width:100%;accent-color:var(--pass)}}table{{border-collapse:collapse;width:100%;overflow:auto}}th,td{{border:1px solid var(--border);padding:8px;text-align:left}}th{{background:var(--surface-muted)}}@media(max-width:640px){{main{{padding:16px}}.chart{{grid-template-columns:1fr 36px}}.chart progress{{grid-column:1/-1}}}}
+</style></head>
 <body><main><header><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p></header>
 {judge_section}
 <section><h2>Metric scorecards</h2><div class="cards">{scorecards}</div></section>
@@ -438,12 +446,13 @@ async def get_evaluation_report_json(
 @router.get("/jobs/{job_id}/evaluation-report")
 async def view_evaluation_report_html(
     job_id: str,
+    theme: Literal["light", "dark"] = Query("light"),
     db: Session = Depends(get_db),
     user: User = Depends(require_authenticated),
 ):
     stats = _completed_evaluation_stats(job_id, db, user)
     return HTMLResponse(
-        _evaluation_report_html(job_id, stats),
+        _evaluation_report_html(job_id, stats, theme),
         headers={"Content-Disposition": f'inline; filename="evaluation_{job_id}.html"'},
     )
 
