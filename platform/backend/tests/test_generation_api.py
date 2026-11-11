@@ -241,6 +241,12 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert ".badge.fail{border-color:var(--fail-border);background:var(--fail-bg)" in inline_report.text
         assert ".badge.warning{border-color:var(--warning-border);background:var(--warning-bg)" in inline_report.text
         assert ".badge.not_evaluated{border-color:var(--neutral-border);background:var(--neutral-bg)" in inline_report.text
+        assert '<progress class="pass"' in inline_report.text
+        assert '<progress class="fail"' in inline_report.text
+        assert '<progress class="not_evaluated"' in inline_report.text
+        assert "progress.pass{accent-color:var(--pass)}" in inline_report.text
+        assert "progress.fail{accent-color:var(--fail)}" in inline_report.text
+        assert "progress.not_evaluated{accent-color:var(--neutral)}" in inline_report.text
         assert "<script" not in inline_report.text
         assert "<link" not in inline_report.text
 
@@ -250,6 +256,9 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert ':root[data-theme="dark"]' in dark_report.text
         assert 'class="report-brand"' in dark_report.text
         assert dark_report.text.count('stroke="currentColor"') == 2
+        assert '<progress class="pass"' in dark_report.text
+        assert '<progress class="fail"' in dark_report.text
+        assert '<progress class="not_evaluated"' in dark_report.text
         assert "<script" not in dark_report.text
         assert "<link" not in dark_report.text
 
