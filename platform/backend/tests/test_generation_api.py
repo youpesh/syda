@@ -222,8 +222,23 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert "Quality status chart" in inline_report.text
         assert "Privacy leakage risk" in inline_report.text
         assert "Statistical similarity" in inline_report.text
+        assert '<html lang="en" data-theme="light">' in inline_report.text
+        assert ".badge.pass{border-color:var(--pass-border);background:var(--pass-bg)" in inline_report.text
+        assert ".badge.fail{border-color:var(--fail-border);background:var(--fail-bg)" in inline_report.text
+        assert ".badge.warning{border-color:var(--warning-border);background:var(--warning-bg)" in inline_report.text
+        assert ".badge.not_evaluated{border-color:var(--neutral-border);background:var(--neutral-bg)" in inline_report.text
         assert "<script" not in inline_report.text
         assert "<link" not in inline_report.text
+
+        dark_report = client.get(f"/api/jobs/{job_id}/evaluation-report?theme=dark")
+        assert dark_report.status_code == 200
+        assert '<html lang="en" data-theme="dark">' in dark_report.text
+        assert ':root[data-theme="dark"]' in dark_report.text
+        assert "<script" not in dark_report.text
+        assert "<link" not in dark_report.text
+
+        invalid_theme = client.get(f"/api/jobs/{job_id}/evaluation-report?theme=sepia")
+        assert invalid_theme.status_code == 422
 
 
 def test_privacy_leakage_passes_when_every_equivalence_class_has_three_records():
