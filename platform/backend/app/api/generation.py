@@ -6,7 +6,7 @@ import logging
 import zipfile
 from urllib.parse import quote
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Literal, Optional
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Depends, Query
@@ -314,6 +314,123 @@ async def get_document(
     )
 
 
+def _completed_evaluation_stats(job_id: str, db: Session, user: User) -> JobStats:
+    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in {"complete", "failed"} or not job.stats:
+        raise HTTPException(status_code=409, detail="Evaluation report is not ready")
+    return JobStats.model_validate(job.stats)
+
+
+def _evaluation_report_payload(job_id: str, stats: JobStats) -> Dict[str, Any]:
+    return {
+        "schemaVersion": "1.0",
+        "jobId": job_id,
+        "result": stats.evaluation_result,
+        "recordsGenerated": stats.records_generated,
+        "pathCounts": stats.path_counts,
+        "metrics": [metric.model_dump(by_alias=True, exclude_none=True) for metric in stats.evaluation_metrics],
+        "violations": [violation.model_dump(by_alias=True) for violation in stats.violations],
+    }
+
+
+def _format_report_number(value: Optional[float]) -> str:
+    return "—" if value is None else f"{value:.6g}"
+
+
+def _evaluation_report_html(
+    job_id: str,
+    stats: JobStats,
+    theme: Literal["light", "dark"] = "light",
+) -> str:
+    scorecards = "".join(
+        f'<article class="card"><h3>{html.escape(metric.label)}</h3>'
+        f'<span class="badge {metric.status}">{html.escape(metric.status.replace("_", " ").title())}</span>'
+        f'<strong>{html.escape(metric.value)}</strong><p>{html.escape(metric.detail)}</p>'
+        f'<small>{metric.violations:,} violations</small></article>'
+        for metric in stats.evaluation_metrics
+    )
+    status_counts = {
+        status: sum(metric.status == status for metric in stats.evaluation_metrics)
+        for status in ("pass", "fail", "not_evaluated")
+    }
+    chart = "".join(
+        f'<div class="chart"><span>{html.escape(status.replace("_", " ").title())}</span>'
+        f'<progress class="{status}" max="{max(1, len(stats.evaluation_metrics))}" value="{count}"></progress><strong>{count}</strong></div>'
+        for status, count in status_counts.items()
+    )
+    statistical = next((metric for metric in stats.evaluation_metrics if metric.key == "statistical_similarity"), None)
+    field_rows = ""
+    if statistical and statistical.field_results:
+        field_rows = "".join(
+            "<tr>"
+            f"<td>{html.escape(field.table)}</td><td>{html.escape(field.column)}</td><td>{html.escape(field.kind)}</td>"
+            f"<td>{field.score:.6g}</td><td>{_format_report_number(field.ks_statistic)}</td>"
+            f"<td>{_format_report_number(field.wasserstein_distance)}</td>"
+            f"<td>{_format_report_number(field.chi_square_statistic)}</td></tr>"
+            for field in statistical.field_results
+        )
+    if statistical is not None and statistical.field_results is None:
+        statistical_section = '<p>Per-field statistical details were not recorded for this run.</p>'
+    elif field_rows:
+        statistical_section = (
+            '<table><thead><tr><th>Table</th><th>Field</th><th>Type</th><th>Similarity score</th>'
+            '<th>KS statistic</th><th>Wasserstein distance</th><th>Chi-squared statistic</th></tr></thead>'
+            f'<tbody>{field_rows}</tbody></table>'
+        )
+    else:
+        statistical_section = '<p>No comparable numeric or categorical fields were evaluated.</p>'
+    violation_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(item.table)}</td><td>{html.escape(str(item.row))}</td>"
+        f"<td>{html.escape(item.rule)}</td><td>{html.escape(item.error)}</td></tr>"
+        for item in stats.violations
+    )
+    violation_section = (
+        '<table><thead><tr><th>Table</th><th>Row</th><th>Rule</th><th>Error</th></tr></thead>'
+        f'<tbody>{violation_rows}</tbody></table>'
+        if violation_rows else '<p>No causal or semantic rule violations detected.</p>'
+    )
+    return f'''<!doctype html><html lang="en" data-theme="{theme}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Syda evaluation {html.escape(job_id)}</title>
+<style>
+:root{{color-scheme:light;--page:#f8fafc;--surface:#fff;--surface-muted:#f1f5f9;--text:#172033;--muted:#526078;--border:#dbe3ee;--pass:#15803d;--pass-bg:rgba(34,197,94,.12);--pass-border:rgba(21,128,61,.35);--fail:#b91c1c;--fail-bg:rgba(239,68,68,.12);--fail-border:rgba(185,28,28,.35);--warning:#b45309;--warning-bg:rgba(245,158,11,.14);--warning-border:rgba(180,83,9,.35);--neutral:#526078;--neutral-bg:rgba(100,116,139,.12);--neutral-border:rgba(82,96,120,.3)}}
+:root[data-theme="dark"]{{color-scheme:dark;--page:#0b1117;--surface:#121a22;--surface-muted:#1b2530;--text:#e5edf5;--muted:#a7b4c4;--border:#2d3a48;--pass:#4ade80;--pass-bg:rgba(74,222,128,.13);--pass-border:rgba(74,222,128,.35);--fail:#f87171;--fail-bg:rgba(248,113,113,.13);--fail-border:rgba(248,113,113,.35);--warning:#fbbf24;--warning-bg:rgba(251,191,36,.14);--warning-border:rgba(251,191,36,.35);--neutral:#a7b4c4;--neutral-bg:rgba(167,180,196,.12);--neutral-border:rgba(167,180,196,.3)}}
+*{{box-sizing:border-box}}body{{font:14px system-ui;margin:0;background:var(--page);color:var(--text)}}main{{max-width:1100px;margin:auto;padding:32px}}section,header,.card{{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px}}section{{margin-top:18px}}p,small{{color:var(--muted)}}.report-brand{{display:flex;min-width:0;align-items:center;gap:12px}}.brand-mark{{display:inline-flex;flex:0 0 40px;width:40px;height:40px;align-items:center;justify-content:center;border:1px solid var(--border);background:var(--surface);color:var(--text);box-shadow:0 1px 2px rgba(15,23,42,.08)}}.brand-mark svg{{width:20px;height:20px}}.report-copy{{min-width:0}}.report-title{{margin:0;font-size:2em;line-height:1.15}}.report-meta{{margin:8px 0 0;overflow-wrap:anywhere}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}}.card h3{{margin:0 0 8px}}.card strong{{display:block;font-size:1.4rem;margin:12px 0}}.badge{{float:right;display:inline-flex;width:max-content;align-items:center;justify-content:center;padding:3px 8px;border:1px solid var(--neutral-border);border-radius:999px;background:var(--neutral-bg);color:var(--neutral);line-height:1.2;white-space:nowrap}}.badge.pass{{border-color:var(--pass-border);background:var(--pass-bg);color:var(--pass)}}.badge.fail{{border-color:var(--fail-border);background:var(--fail-bg);color:var(--fail)}}.badge.warning{{border-color:var(--warning-border);background:var(--warning-bg);color:var(--warning)}}.badge.not_evaluated{{border-color:var(--neutral-border);background:var(--neutral-bg);color:var(--neutral)}}.chart{{display:grid;grid-template-columns:140px 1fr 40px;gap:12px;margin:10px 0}}progress{{width:100%;accent-color:var(--neutral)}}progress.pass{{accent-color:var(--pass)}}progress.fail{{accent-color:var(--fail)}}progress.not_evaluated{{accent-color:var(--neutral)}}table{{border-collapse:collapse;width:100%;overflow:auto}}th,td{{border:1px solid var(--border);padding:8px;text-align:left}}th{{background:var(--surface-muted)}}@media(max-width:640px){{main{{padding:16px}}.chart{{grid-template-columns:1fr 36px}}.chart progress{{grid-column:1/-1}}}}
+</style></head>
+<body><main><header><div class="report-brand"><span class="brand-mark" aria-hidden="true"><svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none"><path d="M15 2L15.5387 4.39157C15.9957 6.42015 17.5798 8.00431 19.6084 8.46127L22 9L19.6084 9.53873C17.5798 9.99569 15.9957 11.5798 15.5387 13.6084L15 16L14.4613 13.6084C14.0043 11.5798 12.4202 9.99569 10.3916 9.53873L8 9L10.3916 8.46127C12.4201 8.00431 14.0043 6.42015 14.4613 4.39158L15 2Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7 12L7.38481 13.7083C7.71121 15.1572 8.84275 16.2888 10.2917 16.6152L12 17L10.2917 17.3848C8.84275 17.7112 7.71121 18.8427 7.38481 20.2917L7 22L6.61519 20.2917C6.28879 18.8427 5.15725 17.7112 3.70827 17.3848L2 17L3.70827 16.6152C5.15725 16.2888 6.28879 15.1573 6.61519 13.7083L7 12Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></span><div class="report-copy"><h1 class="report-title">Syda evaluation report</h1><p class="report-meta">Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p></div></div></header>
+<section><h2>Metric scorecards</h2><div class="cards">{scorecards}</div></section>
+<section><h2>Quality status chart</h2>{chart}</section>
+<section><h2>Statistical similarity details</h2>{statistical_section}</section>
+<section><h2>Causal &amp; Semantic Rule Violations ({len(stats.violations)})</h2>{violation_section}</section>
+</main></body></html>'''
+
+
+@router.get("/jobs/{job_id}/evaluation")
+async def get_evaluation_report_json(
+    job_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
+):
+    stats = _completed_evaluation_stats(job_id, db, user)
+    return JSONResponse(_evaluation_report_payload(job_id, stats))
+
+
+@router.get("/jobs/{job_id}/evaluation-report")
+async def view_evaluation_report_html(
+    job_id: str,
+    theme: Literal["light", "dark"] = Query("light"),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_authenticated),
+):
+    stats = _completed_evaluation_stats(job_id, db, user)
+    return HTMLResponse(
+        _evaluation_report_html(job_id, stats, theme),
+        headers={"Content-Disposition": f'inline; filename="evaluation_{job_id}.html"'},
+    )
+
+
 @router.get("/evaluation/{job_id}/report")
 async def download_evaluation_report(
     job_id: str,
@@ -322,59 +439,15 @@ async def download_evaluation_report(
     user: User = Depends(require_authenticated),
 ):
     """Download the structured evaluation report as JSON or HTML."""
-    job = db.query(JobRecord).filter(JobRecord.id == job_id, JobRecord.user_id == user.id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.status not in {"complete", "failed"} or not job.stats:
-        raise HTTPException(status_code=409, detail="Evaluation report is not ready")
-    stats = JobStats.model_validate(job.stats)
-    report = {
-        "jobId": job_id,
-        "result": stats.evaluation_result,
-        "recordsGenerated": stats.records_generated,
-        "pathCounts": stats.path_counts,
-        "metrics": [metric.model_dump(by_alias=True) for metric in stats.evaluation_metrics],
-        "violations": [violation.model_dump(by_alias=True) for violation in stats.violations],
-    }
+    stats = _completed_evaluation_stats(job_id, db, user)
+    report = _evaluation_report_payload(job_id, stats)
     if format == "json":
         return JSONResponse(
             report,
             headers={"Content-Disposition": f'attachment; filename="evaluation_{job_id}.json"'},
         )
-
-    rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(metric.label)}</td>"
-        f"<td>{html.escape(metric.status.replace('_', ' ').title())}</td>"
-        f"<td>{html.escape(metric.value)}</td>"
-        f"<td>{metric.violations}</td>"
-        f"<td>{html.escape(metric.detail)}</td>"
-        "</tr>"
-        for metric in stats.evaluation_metrics
-    )
-    violation_rows = "".join(
-        "<tr>"
-        f"<td>{html.escape(v.table)}</td>"
-        f"<td>{html.escape(str(v.row))}</td>"
-        f"<td>{html.escape(v.rule)}</td>"
-        f"<td>{html.escape(v.error)}</td>"
-        "</tr>"
-        for v in stats.violations
-    )
-    violations_section = (
-        f"<h2>Causal & Semantic Rule Violations ({len(stats.violations)})</h2>"
-        f"<table><thead><tr><th>Table</th><th>Row</th><th>Rule</th><th>Error</th></tr></thead><tbody>{violation_rows}</tbody></table>"
-        if stats.violations
-        else "<p><em>No causal or semantic rule violations detected.</em></p>"
-    )
-    document = f"""<!doctype html><html><head><meta charset="utf-8"><title>Syda evaluation {html.escape(job_id)}</title>
-<style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%;margin-bottom:24px}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}h2{{margin-top:24px}}</style>
-</head><body><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p>
-<table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>
-{violations_section}
-</body></html>"""
     return HTMLResponse(
-        document,
+        _evaluation_report_html(job_id, stats),
         headers={"Content-Disposition": f'attachment; filename="evaluation_{job_id}.html"'},
     )
 
