@@ -209,6 +209,12 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert html_report.status_code == 200
         assert html_report.headers["content-disposition"].startswith("attachment;")
         assert "Syda evaluation report" in html_report.text
+        assert 'class="report-brand"' in html_report.text
+        assert 'class="brand-mark" aria-hidden="true"' in html_report.text
+        assert '<svg aria-hidden="true" focusable="false"' in html_report.text
+        assert 'stroke="currentColor"' in html_report.text
+        assert "<script" not in html_report.text
+        assert "<link" not in html_report.text
 
         json_report = client.get(f"/api/jobs/{job_id}/evaluation")
         assert json_report.status_code == 200
@@ -223,6 +229,14 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert "Privacy leakage risk" in inline_report.text
         assert "Statistical similarity" in inline_report.text
         assert '<html lang="en" data-theme="light">' in inline_report.text
+        assert 'class="report-brand"' in inline_report.text
+        assert 'class="brand-mark" aria-hidden="true"' in inline_report.text
+        assert 'class="report-title">Syda evaluation report</h1>' in inline_report.text
+        assert 'class="report-meta">Job ' in inline_report.text
+        assert '<svg aria-hidden="true" focusable="false" viewBox="0 0 24 24" fill="none">' in inline_report.text
+        assert inline_report.text.count('stroke="currentColor"') == 2
+        assert "M15 2L15.5387 4.39157" in inline_report.text
+        assert "M7 12L7.38481 13.7083" in inline_report.text
         assert ".badge.pass{border-color:var(--pass-border);background:var(--pass-bg)" in inline_report.text
         assert ".badge.fail{border-color:var(--fail-border);background:var(--fail-bg)" in inline_report.text
         assert ".badge.warning{border-color:var(--warning-border);background:var(--warning-bg)" in inline_report.text
@@ -234,6 +248,8 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         assert dark_report.status_code == 200
         assert '<html lang="en" data-theme="dark">' in dark_report.text
         assert ':root[data-theme="dark"]' in dark_report.text
+        assert 'class="report-brand"' in dark_report.text
+        assert dark_report.text.count('stroke="currentColor"') == 2
         assert "<script" not in dark_report.text
         assert "<link" not in dark_report.text
 
