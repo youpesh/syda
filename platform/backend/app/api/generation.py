@@ -69,6 +69,7 @@ async def start_generation(
     try:
         selected = resolve_provider(db, user.id)
         snapshot = {key: selected.get(key) for key in ("id", "model", "base_url")}
+        snapshot["reference_data"] = req.reference_data
         new_job = JobRecord(
             id=job_id,
             user_id=user.id,

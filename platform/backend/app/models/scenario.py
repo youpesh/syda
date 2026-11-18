@@ -73,6 +73,14 @@ class ChatResponse(BaseModel):
 class GenerateRequest(BaseModel):
     scenario: ScenarioConfiguration
     scenario_id: Optional[str] = Field(default=None, alias="scenarioId")
+    reference_data: Dict[str, List[Dict[str, Any]]] = Field(
+        default_factory=dict,
+        alias="referenceData",
+        description=(
+            "Optional synthetic or non-sensitive reference rows keyed by table name "
+            "for statistical distribution evaluation."
+        ),
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
