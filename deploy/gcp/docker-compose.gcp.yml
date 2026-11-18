@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: syda-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-syda}
+      POSTGRES_USER: ${POSTGRES_USER:-syda}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-syda_gcp_secure_password_2026}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-syda} -d ${POSTGRES_DB:-syda}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:latest}
+    pull_policy: always
+    container_name: syda-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-syda}:${POSTGRES_PASSWORD:-syda_gcp_secure_password_2026}@postgres:5432/${POSTGRES_DB:-syda}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-c990f4c5683f7503e8574cd8333b745b3da643afdb498786436ca0792fb43855}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+    volumes:
+      - job_data:/app/platform/backend/data/jobs
+      - settings_data:/app/platform/backend/data/settings
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    image: ${BACKEND_IMAGE:-ghcr.io/youpesh/syda-backend:latest}
+    pull_policy: always
+    container_name: syda-worker
+    restart: unless-stopped
+    command: ["uv", "run", "python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-syda}:${POSTGRES_PASSWORD:-syda_gcp_secure_password_2026}@postgres:5432/${POSTGRES_DB:-syda}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-c990f4c5683f7503e8574cd8333b745b3da643afdb498786436ca0792fb43855}
+    volumes:
+      - job_data:/app/platform/backend/data/jobs
+      - settings_data:/app/platform/backend/data/settings
+    stop_grace_period: 65s
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  frontend:
+    image: ${FRONTEND_IMAGE:-ghcr.io/youpesh/syda-frontend:latest}
+    pull_policy: always
+    container_name: syda-frontend
+    restart: unless-stopped
+    ports:
+      - "80:3000"
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  job_data:
+  settings_data:
