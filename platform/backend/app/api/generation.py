@@ -25,7 +25,7 @@ from ..job_queue import DATA_DIR, publish_job, output_directory, cancel_job
 from ..services.generation import (
     _synthesize_relational_tables, _LocalTableGenerator, _scenario_schemas,
     _referential_integrity, _constraint_compliance, _temporal_consistency,
-    _evaluation_metrics,
+    _evaluation_metrics, _privacy_leakage_metric,
 )
 from ..scenario_definition import (
     scenario_definition as _scenario_definition,

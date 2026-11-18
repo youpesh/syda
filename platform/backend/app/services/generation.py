@@ -16,6 +16,21 @@ from ..scenario_definition import scenario_definition as _scenario_definition
 from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, ViolationRecord
 logger = logging.getLogger(__name__)
 
+_K_ANONYMITY_THRESHOLD = 3
+_QUASI_IDENTIFIER_NAMES = frozenset(
+    {
+        "age",
+        "birth_date",
+        "date_of_birth",
+        "dob",
+        "gender",
+        "postal_code",
+        "sex",
+        "zip",
+        "zip_code",
+    }
+)
+
 def _synthesize_relational_tables(
     schemas: Dict[str, Any],
     sample_sizes: Dict[str, int],
@@ -269,6 +284,74 @@ def _temporal_consistency(
     return f"{consistency:.1f}%", violations, checked
 
 
+def _privacy_leakage_metric(
+    dfs: Dict[str, pd.DataFrame],
+) -> EvaluationMetric:
+    """Measure k-anonymity using recognized quasi-identifier columns."""
+    evaluated_records = 0
+    vulnerable_records = 0
+    minimum_k: Optional[int] = None
+    detected_columns = []
+
+    for table_name, df in dfs.items():
+        if df is None or df.empty:
+            continue
+
+        quasi_identifiers = [
+            column
+            for column in df.columns
+            if str(column).lower() in _QUASI_IDENTIFIER_NAMES
+        ]
+        if not quasi_identifiers:
+            continue
+
+        working = df[quasi_identifiers].copy()
+        working["__privacy_row__"] = range(len(working))
+        group_sizes = working.groupby(
+            quasi_identifiers,
+            dropna=False,
+            sort=False,
+        )["__privacy_row__"].transform("size")
+
+        table_minimum_k = int(group_sizes.min())
+        minimum_k = (
+            table_minimum_k
+            if minimum_k is None
+            else min(minimum_k, table_minimum_k)
+        )
+        evaluated_records += len(working)
+        vulnerable_records += int(
+            (group_sizes < _K_ANONYMITY_THRESHOLD).sum()
+        )
+        detected_columns.append(
+            f"{table_name} ({', '.join(map(str, quasi_identifiers))})"
+        )
+
+    if minimum_k is None or evaluated_records == 0:
+        return EvaluationMetric(
+            key="privacy_leakage",
+            label="Privacy leakage risk",
+            status="not_evaluated",
+            value="No quasi-identifiers detected",
+            detail="No populated table contains a recognized quasi-identifier column.",
+        )
+
+    risk_percentage = 100 * vulnerable_records / evaluated_records
+    status = "pass" if minimum_k >= _K_ANONYMITY_THRESHOLD else "fail"
+    return EvaluationMetric(
+        key="privacy_leakage",
+        label="Privacy leakage risk",
+        status=status,
+        value=f"k={minimum_k}; risk={risk_percentage:.1f}%",
+        detail=(
+            f"Evaluated {evaluated_records} records using "
+            f"{'; '.join(detected_columns)}. {vulnerable_records} records are in "
+            f"equivalence classes smaller than {_K_ANONYMITY_THRESHOLD}."
+        ),
+        violations=vulnerable_records,
+    )
+
+
 def _evaluation_metrics(
     dfs: Dict[str, pd.DataFrame],
     schemas: Dict[str, Any],
@@ -277,6 +360,7 @@ def _evaluation_metrics(
 ) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
+    privacy_metric = _privacy_leakage_metric(dfs)
     definition = _scenario_definition(scenario, schemas)
     executable_checks = ScenarioEngine.evaluate_checks(definition, dfs)
     # Use the same temporal/FSM rules as core validation. Choosing arbitrary date
@@ -351,13 +435,7 @@ def _evaluation_metrics(
             detail="Checks that every table required by the allocated scenario paths produced records.",
             violations=len(missing_steps),
         ),
-        EvaluationMetric(
-            key="privacy_leakage",
-            label="Privacy leakage risk",
-            status="not_evaluated",
-            value="Not configured",
-            detail="Declare quasi-identifiers before running a k-anonymity check.",
-        ),
+        privacy_metric,
         EvaluationMetric(
             key="referential_integrity",
             label="Referential integrity",
