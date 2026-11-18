@@ -14,22 +14,18 @@ from syda.templates import TemplateProcessor
 from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
 from ..evaluation.statistical_similarity import evaluate_statistical_similarity
-from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, ViolationRecord
+from ..models.scenario import (
+    ScenarioConfiguration,
+    EvaluationMetric,
+    JobStats,
+    StatisticalFieldResult,
+    ViolationRecord,
+)
 logger = logging.getLogger(__name__)
 
 _K_ANONYMITY_THRESHOLD = 3
 _QUASI_IDENTIFIER_NAMES = frozenset(
-    {
-        "age",
-        "birth_date",
-        "date_of_birth",
-        "dob",
-        "gender",
-        "postal_code",
-        "sex",
-        "zip",
-        "zip_code",
-    }
+    {"age", "birth_date", "date_of_birth", "dob", "gender", "postal_code", "sex", "zip", "zip_code"}
 )
 
 def _synthesize_relational_tables(
@@ -285,22 +281,18 @@ def _temporal_consistency(
     return f"{consistency:.1f}%", violations, checked
 
 
-def _privacy_leakage_metric(
-    dfs: Dict[str, pd.DataFrame],
-) -> EvaluationMetric:
+def _privacy_leakage_metric(dfs: Dict[str, pd.DataFrame]) -> EvaluationMetric:
     """Measure k-anonymity using recognized quasi-identifier columns."""
     evaluated_records = 0
     vulnerable_records = 0
     minimum_k: Optional[int] = None
-    detected_columns = []
+    detected_columns: list[str] = []
 
     for table_name, df in dfs.items():
         if df is None or df.empty:
             continue
-
         quasi_identifiers = [
-            column
-            for column in df.columns
+            column for column in df.columns
             if str(column).lower() in _QUASI_IDENTIFIER_NAMES
         ]
         if not quasi_identifiers:
@@ -309,24 +301,13 @@ def _privacy_leakage_metric(
         working = df[quasi_identifiers].copy()
         working["__privacy_row__"] = range(len(working))
         group_sizes = working.groupby(
-            quasi_identifiers,
-            dropna=False,
-            sort=False,
+            quasi_identifiers, dropna=False, sort=False
         )["__privacy_row__"].transform("size")
-
         table_minimum_k = int(group_sizes.min())
-        minimum_k = (
-            table_minimum_k
-            if minimum_k is None
-            else min(minimum_k, table_minimum_k)
-        )
+        minimum_k = table_minimum_k if minimum_k is None else min(minimum_k, table_minimum_k)
         evaluated_records += len(working)
-        vulnerable_records += int(
-            (group_sizes < _K_ANONYMITY_THRESHOLD).sum()
-        )
-        detected_columns.append(
-            f"{table_name} ({', '.join(map(str, quasi_identifiers))})"
-        )
+        vulnerable_records += int((group_sizes < _K_ANONYMITY_THRESHOLD).sum())
+        detected_columns.append(f"{table_name} ({', '.join(map(str, quasi_identifiers))})")
 
     if minimum_k is None or evaluated_records == 0:
         return EvaluationMetric(
@@ -338,16 +319,15 @@ def _privacy_leakage_metric(
         )
 
     risk_percentage = 100 * vulnerable_records / evaluated_records
-    status = "pass" if minimum_k >= _K_ANONYMITY_THRESHOLD else "fail"
     return EvaluationMetric(
         key="privacy_leakage",
         label="Privacy leakage risk",
-        status=status,
+        status="pass" if minimum_k >= _K_ANONYMITY_THRESHOLD else "fail",
         value=f"k={minimum_k}; risk={risk_percentage:.1f}%",
         detail=(
-            f"Evaluated {evaluated_records} records using "
-            f"{'; '.join(detected_columns)}. {vulnerable_records} records are in "
-            f"equivalence classes smaller than {_K_ANONYMITY_THRESHOLD}."
+            f"Evaluated {evaluated_records} records using {'; '.join(detected_columns)}. "
+            f"{vulnerable_records} records are in equivalence classes smaller than "
+            f"{_K_ANONYMITY_THRESHOLD}."
         ),
         violations=vulnerable_records,
     )
@@ -363,9 +343,7 @@ def _evaluation_metrics(
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
     privacy_metric = _privacy_leakage_metric(dfs)
-    statistical_result = evaluate_statistical_similarity(
-        dfs, schemas, reference_data
-    )
+    statistical_result = evaluate_statistical_similarity(dfs, schemas, reference_data)
     definition = _scenario_definition(scenario, schemas)
     executable_checks = ScenarioEngine.evaluate_checks(definition, dfs)
     # Use the same temporal/FSM rules as core validation. Choosing arbitrary date
@@ -413,13 +391,21 @@ def _evaluation_metrics(
             key="statistical_similarity",
             label="Statistical similarity",
             status=statistical_result.status,
-            value=(
-                "No reference"
-                if statistical_result.score is None
-                else f"{statistical_result.score:.3f}"
-            ),
+            value="No reference" if statistical_result.score is None else f"{statistical_result.score:.3f}",
             detail=statistical_result.detail,
             violations=statistical_result.violations,
+            fieldResults=[
+                StatisticalFieldResult(
+                    table=field.table,
+                    column=field.column,
+                    kind=field.kind,
+                    score=field.score,
+                    ksStatistic=field.ks_statistic,
+                    wassersteinDistance=field.wasserstein_distance,
+                    chiSquareStatistic=field.chi_square_statistic,
+                )
+                for field in statistical_result.evaluated_fields
+            ],
         ),
         EvaluationMetric(
             key="semantic_correctness",
@@ -594,11 +580,7 @@ def run_generation(
     elapsed = round(time.time() - t0, 1)
     total_records = sum(len(df) for df in dfs.values())
     metrics, evaluation_result, total_violations, violation_records = _evaluation_metrics(
-        dfs,
-        schemas,
-        scenario,
-        reference_data=reference_data,
-        return_details=True,
+        dfs, schemas, scenario, reference_data=reference_data, return_details=True
     )
     metric_by_key = {metric.key: metric for metric in metrics}
     table_row_counts = {name: len(df) for name, df in dfs.items()}
