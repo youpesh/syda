@@ -1,15 +1,14 @@
-name: Deploy Staging
+name: Publish Docker Images
 
 on:
+  push:
+    branches:
+      - main
+      - feat/web-platform
   workflow_dispatch:
-    inputs:
-      branch:
-        description: "Branch or Git reference to build and deploy"
-        required: false
-        default: "feat/web-platform"
 
 concurrency:
-  group: dokploy-staging
+  group: docker-publish
   cancel-in-progress: false
 
 jobs:
@@ -22,8 +21,6 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.branch }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -46,7 +43,7 @@ jobs:
           file: platform/backend/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-backend:staging
+            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-backend:latest
             ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-backend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -58,39 +55,20 @@ jobs:
           file: platform/frontend/Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-frontend:staging
+            ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-frontend:latest
             ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-frontend:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  deploy:
-    name: Trigger Dokploy Deployment
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    environment: staging
-    steps:
-      - name: Connect to Tailscale Network
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          authkey: ${{ secrets.TS_AUTHKEY }}
-          tags: ${{ secrets.TS_OAUTH_CLIENT_ID != '' && 'tag:ci' || '' }}
-
-      - name: Trigger Dokploy Staging Redeploy
-        run: |
-          echo "Triggering Dokploy Staging Deploy Webhook..."
-          curl -sS -f -X POST "${{ secrets.DOKPLOY_STAGING_DEPLOY_WEBHOOK_URL }}"
-          echo "Webhook triggered successfully!"
-
-      - name: Add Deployment Summary
+      - name: Add Publish Summary
         run: |
           cat << 'EOF' >> $GITHUB_STEP_SUMMARY
-          ### 🚀 Staging Deployment Triggered
+          ### 🐳 Docker Images Published to GHCR
 
           * **Triggered by:** @${{ github.actor }}
-          * **Source Ref:** `${{ inputs.branch }}` (`${{ github.sha }}`)
-          * **Public URL:** [https://staging.mlgate.ai](https://staging.mlgate.ai)
+          * **Commit:** `${{ github.sha }}`
+          * **Backend Image:** `ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-backend:latest`
+          * **Frontend Image:** `ghcr.io/${{ steps.repo_name.outputs.REPO_LOWER }}-frontend:latest`
 
-          Dokploy has received the signal to pull the latest images from GHCR and reload the staging containers.
+          These container images are publicly available and ready for deployment on GCP, Kubernetes, or any standard container host.
           EOF

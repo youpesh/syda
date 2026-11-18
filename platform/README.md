@@ -1,7 +1,7 @@
 # Syda Platform
 
-For manually deploying a selected branch or PR to Dokploy staging, see
-[Staging deployment setup and instructions](STAGING.md).
+For automated cloud deployment instructions (Google Cloud Platform), see
+[GCP Deployment Guide](../deploy/gcp/README.md).
 
 An end-to-end web platform and interactive studio built directly into the [Syda](https://github.com/syda-ai/syda) monorepo.
 

@@ -20,12 +20,15 @@ if ! command -v gcloud &> /dev/null; then
 fi
 
 # Detect or prompt for Project ID
-CURRENT_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
-if [ -n "$CURRENT_PROJECT" ]; then
-    read -rp "Enter GCP Project ID [$CURRENT_PROJECT]: " PROJECT_ID
-    PROJECT_ID=${PROJECT_ID:-$CURRENT_PROJECT}
-else
-    read -rp "Enter GCP Project ID: " PROJECT_ID
+PROJECT_ID="${1:-${PROJECT_ID:-}}"
+if [ -z "$PROJECT_ID" ]; then
+    CURRENT_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
+    if [ -n "$CURRENT_PROJECT" ]; then
+        read -rp "Enter GCP Project ID [$CURRENT_PROJECT]: " PROJECT_ID
+        PROJECT_ID=${PROJECT_ID:-$CURRENT_PROJECT}
+    else
+        read -rp "Enter GCP Project ID: " PROJECT_ID
+    fi
 fi
 
 if [ -z "$PROJECT_ID" ]; then
@@ -74,8 +77,9 @@ fi
 AUTH_SECRET=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || echo "syda_production_auth_key_$(date +%s)")
 POSTGRES_PASS=$(openssl rand -hex 16 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null || echo "syda_pg_pass_$(date +%s)")
 
-# Prepare VM Startup Script (runs automatically on VM boot)
-STARTUP_SCRIPT=$(cat <<EOF
+# Write VM Startup Script to a temporary file
+STARTUP_SCRIPT_FILE="/tmp/syda_gcp_startup.sh"
+cat <<EOF > "$STARTUP_SCRIPT_FILE"
 #!/bin/bash
 set -ex
 
@@ -177,7 +181,6 @@ COMPOSE
 # Start services
 docker compose -f /opt/syda/docker-compose.yml up -d
 EOF
-)
 
 # Provision Compute Engine VM
 echo "==> [3/4] Launching Compute Engine instance '$VM_NAME' in $ZONE..."
@@ -186,7 +189,7 @@ if gcloud compute instances describe "$VM_NAME" --zone="$ZONE" --project="$PROJE
     gcloud compute instances add-metadata "$VM_NAME" \
         --zone="$ZONE" \
         --project="$PROJECT_ID" \
-        --metadata=startup-script="$STARTUP_SCRIPT"
+        --metadata-from-file=startup-script="$STARTUP_SCRIPT_FILE"
     gcloud compute instances reset "$VM_NAME" --zone="$ZONE" --project="$PROJECT_ID"
 else
     gcloud compute instances create "$VM_NAME" \
@@ -197,8 +200,9 @@ else
         --image-project=ubuntu-os-cloud \
         --boot-disk-size=30GB \
         --tags=syda-web,http-server,https-server \
-        --metadata=startup-script="$STARTUP_SCRIPT"
+        --metadata-from-file=startup-script="$STARTUP_SCRIPT_FILE"
 fi
+rm -f "$STARTUP_SCRIPT_FILE"
 
 echo "==> [4/4] Fetching external IP address..."
 sleep 5
