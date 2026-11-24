@@ -83,6 +83,7 @@ class EvaluationMetric(BaseModel):
     value: str
     detail: str
     violations: int = 0
+    omitted_violations: int = Field(default=0, alias="omittedViolations", ge=0)
 
     model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 

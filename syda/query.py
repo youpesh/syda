@@ -57,7 +57,7 @@ def query_dataset(
             tables = {}
             for f in csvs:
                 name = os.path.splitext(f)[0]
-                df = pd.read_csv(os.path.join(output_dir, f))
+                df = pd.read_csv(os.path.join(output_dir, f), float_precision="round_trip")
                 df.to_sql(name, conn, index=False)
                 tables[name] = {"columns": list(df.columns), "row_count": len(df)}
 

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from syda.scenarios import ScenarioDefinition, ScenarioPath, ScenarioStep
 
 from .models.scenario import ScenarioConfiguration
+from .services.schema_evaluation import normalize_schema_constraints
 
 
 def scenario_definition(
@@ -14,6 +15,7 @@ def scenario_definition(
     schemas: Dict[str, Any],
 ) -> ScenarioDefinition:
     """Translate the platform configuration into the reusable core model."""
+    schemas = normalize_schema_constraints(schemas)
     for table, schema in schemas.items():
         if not schema.get("__template__"):
             continue

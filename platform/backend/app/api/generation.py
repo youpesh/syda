@@ -262,14 +262,14 @@ async def preview_generated_dataset(
         row_count = row_counts_by_name.get(path.stem.lower(), 0)
         if filtering:
             # ponytail: reads the whole table to filter; index the CSVs if tables outgrow memory.
-            full = pd.read_csv(path, dtype={column: str})
+            full = pd.read_csv(path, dtype={column: str}, float_precision="round_trip")
             if column not in full.columns:
                 raise HTTPException(status_code=400, detail=f"Unknown column '{column}'")
             matches = full[full[column] == value]
             row_count = len(matches)
             raw_frame = matches.iloc[offset:offset + limit]
         else:
-            raw_frame = pd.read_csv(path, skiprows=range(1, offset + 1), nrows=limit)
+            raw_frame = pd.read_csv(path, skiprows=range(1, offset + 1), nrows=limit, float_precision="round_trip")
         frame = raw_frame.astype(object).where(pd.notna(raw_frame), None)
         tables[path.stem] = {
             "columns": frame.columns.tolist(),
@@ -435,7 +435,7 @@ async def download_generated_dataset(
                 filename=f"{table.lower()}_{job_id}.csv",
             )
         if target_file is not None:
-            raw_frame = pd.read_csv(target_file)
+            raw_frame = pd.read_csv(target_file, float_precision="round_trip")
             records = raw_frame.astype(object).where(pd.notna(raw_frame), None).to_dict(orient="records")
             return JSONResponse(
                 records,
@@ -452,7 +452,7 @@ async def download_generated_dataset(
 
     if csv_files and format == "json":
         if len(csv_files) == 1 and not documents:
-            raw_frame = pd.read_csv(csv_files[0])
+            raw_frame = pd.read_csv(csv_files[0], float_precision="round_trip")
             records = raw_frame.astype(object).where(pd.notna(raw_frame), None).to_dict(orient="records")
             return JSONResponse(
                 records,
@@ -461,7 +461,7 @@ async def download_generated_dataset(
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for path in csv_files:
-                raw_frame = pd.read_csv(path)
+                raw_frame = pd.read_csv(path, float_precision="round_trip")
                 records = raw_frame.astype(object).where(pd.notna(raw_frame), None).to_dict(orient="records")
                 zf.writestr(f"{path.stem}.json", json.dumps(records, default=str))
             for path in documents:

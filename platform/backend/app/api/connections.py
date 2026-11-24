@@ -141,7 +141,7 @@ def export_connection(
         if request.table_filter and table_name.lower() not in [t.lower() for t in request.table_filter]:
             continue
         try:
-            frame = pd.read_csv(csv_file)
+            frame = pd.read_csv(csv_file, float_precision="round_trip")
             declared_fields = schemas.get(table_name, {})
             # Provenance belongs to the run, not the destination schema.
             internal_columns = [name for name in ("scenario_instance_id", "scenario_path")

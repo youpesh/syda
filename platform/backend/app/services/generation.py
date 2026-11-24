@@ -5,6 +5,8 @@ import random
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
+from decimal import Decimal, localcontext, ROUND_CEILING, ROUND_FLOOR
+from math import inf, isfinite, nextafter
 from typing import Dict, Any, Optional, Literal
 import pandas as pd
 from syda.schemas import validate_schema, ModelConfig
@@ -14,17 +16,121 @@ from syda.templates import TemplateProcessor
 from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
 from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, PathCoverage, ViolationRecord
+from .schema_evaluation import evaluate_schema_constraints, normalize_schema_constraints
 logger = logging.getLogger(__name__)
+
+
+class _PendingUniqueValues:
+    """Stage one call's allocations without copying the accumulated value pool."""
+
+    def __init__(self, committed):
+        self.committed = committed
+        self.added = set()
+
+    def __contains__(self, value):
+        return value in self.committed or value in self.added
+
+    def add(self, value):
+        self.added.add(value)
+
+def _unique_local_value(table, column, field_type, constraints, sequence, state):
+    """Allocate unique local values across all chunks in this generator's run."""
+    key = (table, column)
+    entry = state.setdefault(key, {"used": set(), "next": None})
+    used = entry["used"]
+    required = (constraints.get("not_null") or constraints.get("nullable") is False
+                or constraints.get("primary_key"))
+    if constraints.get("enum") is not None or field_type in ("boolean", "bool"):
+        pool = constraints.get("enum", [False, True])
+        start = entry["next"] or 0
+        start = start if start < len(pool) else 0
+        for indexes in (range(start, len(pool)), range(start)):
+            for index in indexes:
+                value = pool[index]
+                if value is not None and value not in used:
+                    used.add(value)
+                    entry["next"] = index + 1
+                    return value
+        if None in pool and not required:
+            return None
+        raise ValueError(f"{table}.{column}: unique value pool exhausted; no distinct values available.")
+    if field_type in ("integer", "int", "number", "float"):
+        # Allocate on a decimal grid for floating fields, respecting declared precision.
+        integer = field_type in ("integer", "int")
+        declared_precision = constraints.get("decimals")
+        if integer:
+            precision = 0
+        elif declared_precision is not None:
+            precision = int(declared_precision)
+            if precision < 0 or precision > 324:
+                raise ValueError(f"{table}.{column}: offline unique precision must be between 0 and 324.")
+        else:
+            exponents = [Decimal(str(abs(constraints[k]))).adjusted()
+                         for k in ("min", "max") if constraints.get(k)]
+            precision = max(0, 17 - min(exponents, default=0))
+        scale = 10 ** precision
+        if integer:
+            lower, upper = constraints.get("min"), constraints.get("max")
+        else:
+            # Finite binary64 bounds need at most 309 integer digits. Keep grid
+            # arithmetic exact even at large magnitudes and fine precision.
+            with localcontext() as context:
+                context.prec = 350 + precision
+                lower = (int((Decimal(str(constraints["min"])) * scale).to_integral_value(rounding=ROUND_CEILING))
+                         if constraints.get("min") is not None else None)
+                upper = (int((Decimal(str(constraints["max"])) * scale).to_integral_value(rounding=ROUND_FLOOR))
+                         if constraints.get("max") is not None else None)
+        direction = -1 if lower is None and upper is not None else 1
+        start = lower if lower is not None else upper if upper is not None else scale
+        candidate = entry["next"] if entry["next"] is not None else start
+        if ((lower is not None and candidate < lower) or (upper is not None and candidate > upper)):
+            candidate = start
+        while ((lower is None or candidate >= lower) and (upper is None or candidate <= upper)):
+            try:
+                value = candidate if integer else candidate / scale
+            except OverflowError:
+                break
+            if isinstance(value, float) and not isfinite(value):
+                break
+            if value not in used:
+                used.add(value)
+                entry["next"] = candidate + direction
+                return value
+            if integer:
+                candidate += direction
+            else:
+                successor = nextafter(value, inf if direction > 0 else -inf)
+                if not isfinite(successor):
+                    break
+                with localcontext() as context:
+                    context.prec = 350 + precision
+                    next_grid = int((Decimal.from_float(successor) * scale).to_integral_value(
+                        rounding=ROUND_CEILING if direction > 0 else ROUND_FLOOR
+                    ))
+                candidate = max(candidate + 1, next_grid) if direction > 0 else min(candidate - 1, next_grid)
+        raise ValueError(f"{table}.{column}: unique numeric pool exhausted at the requested precision.")
+    if field_type == "email" or "email" in column:
+        return f"user_{sequence}@example.com"
+    if field_type in ("text", "string", "phone", "address", "url"):
+        return f"{table}-{column}-{sequence}"
+    raise ValueError(f"{table}.{column}: offline unique generation is unavailable for type {field_type}.")
+
 
 def _synthesize_relational_tables(
     schemas: Dict[str, Any],
     sample_sizes: Dict[str, int],
+    *,
+    row_offsets: Optional[Dict[str, int]] = None,
+    unique_state: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, pd.DataFrame]:
     """
     Intelligent fallback synthesizer that preserves 100% foreign-key referential integrity
     and causal timelines when running offline or without an active LLM provider.
     """
+    schemas = normalize_schema_constraints(schemas)
     dfs: Dict[str, pd.DataFrame] = {}
+    row_offsets = row_offsets if row_offsets is not None else {}
+    unique_state = unique_state if unique_state is not None else {}
     base_time = datetime.now() - timedelta(days=60)
 
     for table_idx, (table_name, schema_def) in enumerate(schemas.items()):
@@ -35,7 +141,9 @@ def _synthesize_relational_tables(
         fields = {k: v for k, v in schema_def.items() if not (k.startswith("__") and k.endswith("__"))}
         fks = schema_def.get("__foreign_keys__", {})
 
-        for i in range(1, n_rows + 1):
+        offset = row_offsets.get(table_name, 0)
+        for local_index in range(1, n_rows + 1):
+            i = offset + local_index
             row = {}
             for col_name, col_info in fields.items():
                 col_type = col_info if isinstance(col_info, str) else col_info.get("type", "text")
@@ -43,7 +151,11 @@ def _synthesize_relational_tables(
                 enum_values = constraints.get("enum")
 
                 # 1. Preserve constrained values, including scenario-ledger row keys.
-                if enum_values:
+                if (constraints.get("unique") or constraints.get("primary_key")) and col_name not in fks:
+                    row[col_name] = _unique_local_value(
+                        table_name, col_name, col_type, constraints, i, unique_state,
+                    )
+                elif enum_values:
                     row[col_name] = enum_values[(i - 1) % len(enum_values)]
 
                 # 2. Primary keys
@@ -111,7 +223,7 @@ def _synthesize_relational_tables(
                     event_time = base_time + timedelta(days=table_idx * 2, hours=i * 4)
                     row[col_name] = event_time.date().isoformat() if col_type == "date" else event_time.isoformat()
 
-                elif col_type == "boolean":
+                elif col_type in ("boolean", "bool"):
                     row[col_name] = random.choice([True, True, False])
 
                 else:
@@ -121,12 +233,17 @@ def _synthesize_relational_tables(
             rows.append(row)
 
         dfs[table_name] = pd.DataFrame(rows)
+        row_offsets[table_name] = offset + n_rows
 
     return dfs
 
 
 class _LocalTableGenerator:
     """Expose the offline synthesizer through the core generator protocol."""
+
+    def __init__(self):
+        self._row_offsets: Dict[str, int] = {}
+        self._unique_state: Dict[Any, Any] = {}
 
     def generate_for_schemas(
         self,
@@ -135,7 +252,22 @@ class _LocalTableGenerator:
         sample_sizes: Optional[Dict[str, int]] = None,
         **_: Any,
     ) -> Dict[str, pd.DataFrame]:
-        return _synthesize_relational_tables(schemas, sample_sizes or {})
+        offsets = dict(self._row_offsets)
+        pending = {
+            key: {**entry, "used": _PendingUniqueValues(entry["used"])}
+            for key, entry in self._unique_state.items()
+        }
+        result = _synthesize_relational_tables(
+            schemas, sample_sizes or {},
+            row_offsets=offsets, unique_state=pending,
+        )
+        for entry in pending.values():
+            used = entry["used"]
+            if isinstance(used, _PendingUniqueValues):
+                used.committed.update(used.added)
+                entry["used"] = used.committed
+        self._row_offsets, self._unique_state = offsets, pending
+        return result
 
 
 def _scenario_schemas(scenario: ScenarioConfiguration) -> Dict[str, Any]:
@@ -190,28 +322,7 @@ def _constraint_compliance(
     dfs: Dict[str, pd.DataFrame],
     schemas: Dict[str, Any],
 ) -> tuple[str, int, int]:
-    checked = 0
-    violations = 0
-    for table_name, schema_def in schemas.items():
-        df = dfs.get(table_name)
-        if df is None:
-            continue
-        for column_name, field in schema_def.items():
-            if column_name.startswith("__") or column_name not in df or not isinstance(field, dict):
-                continue
-            constraints = field.get("constraints", {})
-            if "min" in constraints:
-                values = pd.to_numeric(df[column_name], errors="coerce").dropna()
-                checked += len(values)
-                violations += int((values < float(constraints["min"])).sum())
-            if "max" in constraints:
-                values = pd.to_numeric(df[column_name], errors="coerce").dropna()
-                checked += len(values)
-                violations += int((values > float(constraints["max"])).sum())
-    if checked == 0:
-        return "Not evaluated", 0, 0
-    compliance = 100 * (checked - violations) / checked
-    return f"{compliance:.1f}%", violations, checked
+    return evaluate_schema_constraints(dfs, schemas)[:3]
 
 
 def _temporal_consistency(
@@ -277,7 +388,7 @@ def _evaluation_metrics(
     return_path_coverage: bool = False,
 ) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
-    semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
+    semantic_value, semantic_violations, semantic_checked, semantic_details = evaluate_schema_constraints(dfs, schemas)
     definition = _scenario_definition(scenario, schemas)
     executable_checks = ScenarioEngine.evaluate_checks(definition, dfs)
     # Use the same temporal/FSM rules as core validation. Choosing arbitrary date
@@ -372,6 +483,7 @@ def _evaluation_metrics(
             violation_records.append(ViolationRecord(
                 table="Scenario", row=path.path, rule="scenario_coverage", error=path.detail,
             ))
+    violation_records.extend(semantic_details)
 
     def measured_status(violations: int, checked: int) -> Literal["not_evaluated", "pass", "fail"]:
         if checked == 0:
@@ -394,8 +506,13 @@ def _evaluation_metrics(
             label="Semantic correctness",
             status=measured_status(semantic_violations, semantic_checked),
             value=semantic_value,
-            detail="Checks declared numeric minimum and maximum constraints.",
+            detail=(
+                "Checks declared required fields, uniqueness, allowed values or reference code lists, and numeric/date bounds. Violations count failed cell checks."
+                + (f" {semantic_violations - len(semantic_details)} additional schema violation details omitted."
+                   if semantic_violations > len(semantic_details) else "")
+            ),
             violations=semantic_violations,
+            omittedViolations=semantic_violations - len(semantic_details),
         ),
         EvaluationMetric(
             key="causal_consistency",
