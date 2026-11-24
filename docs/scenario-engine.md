@@ -187,3 +187,69 @@ and any missing or extra step rows. The observed counts come from generated
 `scenario_instance_id` and `scenario_path` values. A mismatch fails the quality
 gate and appears in the violation report. Runs without those tracking fields
 report path coverage as `not_evaluated`.
+
+### Schema semantic checks in the platform
+
+The platform's semantic correctness metric audits the generated values against
+declared field constraints before publishing dataset files:
+
+- `not_null: true` or `nullable: false` rejects null values. Primary keys are
+  also required and unique.
+- `unique: true` flags every row sharing a non-null duplicate value. Nullable
+  unique fields may contain multiple nulls. Numeric, boolean, and temporal
+  values are compared in their declared type: integer `"01"` and `1` are
+  duplicates, as are equivalent timestamps with different UTC offsets.
+- `enum` restricts non-null values to the supplied list. Use it for allowed
+  statuses or a bounded reference code list, for example:
+
+```yaml
+diagnosis_code_icd10:
+  type: text
+  constraints:
+    not_null: true
+    enum: ["E11.9", "I10"]
+```
+
+- `min` and `max` check numeric or date/datetime bounds, including their
+  endpoints. Non-null values that cannot be parsed for their field type fail
+  each declared bound. Datetimes are compared in UTC; date fields compare days.
+
+The example list is a small test fixture; Syda does not supply or verify a
+complete official medical code catalog. Callers supply the reference values.
+Nested `constraints` override equivalent field-level shorthand declarations.
+Boolean constraints accept standard boolean representations, such as `true`,
+`"true"`, and `1`, and are normalized consistently for generation and evaluation.
+Invalid boolean values, malformed or empty enum lists, invalid bounds, and
+reversed bounds are rejected before a generation job is created.
+Numeric enum lists are canonicalized and deduplicated using their field type.
+Integer bounds retain exact integer precision, including values above `2**53`.
+Fractional integer bounds are rounded inward (`min: 1.2`, `max: 3.8` becomes
+`2..3`); a range containing no integer is rejected. Declared `decimals` must
+normalize to an integer from 0 through 324. Canonical bounds and precision are
+passed to generation so accepted numeric strings do not cause conversion errors.
+Empty branch tables are handled by scenario coverage; a missing constrained
+column in a populated table fails semantic evaluation.
+
+Violations appear in existing JSON/HTML reports and the Evaluation tab with the
+table, instance (or row index), field, and constraint, such as
+`schema.diagnosis_code_icd10.enum`. Counts represent failed cell checks, so a
+single row can contribute multiple violations. Evaluation never modifies data.
+Schema diagnostics are limited to the first 1,000 entries across all fields.
+The semantic metric keeps the exact violation total and includes
+`omittedViolations` and explanatory text when more diagnostics were omitted.
+
+Offline generation keeps counters and unique value pools on each generator
+instance, scoped by table and field, across scenario enrichment batches.
+Separate runs start with fresh state. Failed calls do not consume values or
+advance counters. Unique numeric and enum pools fail with an exhaustion error
+when no distinct values remain; they never wrap around and reuse earlier values.
+Floating pools respect an explicit decimal precision, or choose precision from
+the bounds when none is specified. Offline unique allocation supports numeric,
+boolean, text, and email fields; unsupported unique field types produce an
+explicit error. The final evaluation gate still checks provider output before
+any dataset files are published.
+
+Built-in previews, JSON downloads, database exports, and dataset queries read
+CSV floats with round-trip precision so distinct validated values remain
+distinct. When reading CSV files directly with pandas, use
+`pd.read_csv(path, float_precision="round_trip")` to preserve the same values.

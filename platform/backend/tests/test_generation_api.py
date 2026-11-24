@@ -127,7 +127,7 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         stats = result["stats"]
         assert stats["causalIntegrity"] == "Not evaluated"
         assert stats["referentialIntegrity"] == "100.0%"
-        assert stats["compliance"] == "Not evaluated"
+        assert stats["compliance"] == "100.0%"
         assert stats["recordsGenerated"] == 22
         assert stats["flaggedRecords"] == 0
         assert stats["tableRowCounts"] == {"Parent": 11, "Child": 11}
@@ -180,6 +180,108 @@ def test_generation_reports_and_downloads_the_rows_it_created(monkeypatch, tmp_p
         html_report = client.get(f"/api/evaluation/{job_id}/report?format=html")
         assert html_report.status_code == 200
         assert "Syda evaluation report" in html_report.text
+
+
+@pytest.mark.parametrize("diagnostic_limit", [1000, 2])
+def test_schema_semantic_failure_is_reported_and_blocks_download(monkeypatch, tmp_path, diagnostic_limit):
+    from app.services import schema_evaluation
+    monkeypatch.setattr(schema_evaluation, "MAX_SCHEMA_VIOLATIONS", diagnostic_limit)
+    scenario = _scenario(record_count=3, paths=[{
+        "name": "default", "steps": ["Parent", "Child"], "weight": 1,
+        "overrides": {"Parent": {"name": "repeated"}},
+    }])
+    scenario["schemas"]["Parent"]["name"] = {
+        "type": "text", "constraints": {"unique": True},
+    }
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+        assert job["status"] == "failed"
+        assert job["stats"]["evaluationResult"] == "fail"
+        report = client.get(f"/api/evaluation/{job_id}/report")
+        assert report.status_code == 200
+        violations = report.json()["violations"]
+        assert len(violations) == min(3, diagnostic_limit)
+        semantic = next(m for m in report.json()["metrics"] if m["key"] == "semantic_correctness")
+        assert semantic["violations"] == 3
+        assert semantic["omittedViolations"] == max(0, 3 - diagnostic_limit)
+        assert all(v["rule"] == "schema.name.unique" for v in violations)
+        assert all(v["table"] == "Parent" for v in violations)
+        html = client.get(f"/api/evaluation/{job_id}/report?format=html")
+        assert html.status_code == 200
+        assert "schema.name.unique" in html.text
+        if diagnostic_limit < 3:
+            assert "1 additional schema violation details omitted" in html.text
+        assert client.get(f"/api/download/{job_id}").status_code == 409
+        assert client.get(f"/api/preview/{job_id}").status_code == 409
+
+
+@pytest.mark.parametrize("constraints", [{"enum": "APPROVED"}, {"enum": 7}, {"unique": "sometimes"}, {"decimals": 1.5}])
+def test_malformed_constraints_are_rejected_before_job_creation(monkeypatch, tmp_path, constraints):
+    scenario = _scenario()
+    scenario["schemas"]["Parent"]["name"] = {"type": "text", "constraints": constraints}
+    with _client(monkeypatch, tmp_path) as client:
+        preflight = client.post("/api/validate", json={"scenario": scenario})
+        assert preflight.status_code == 200
+        assert preflight.json()["valid"] is False
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 422
+        assert "Parent.name" in response.json()["detail"]
+        with database.SessionLocal() as db:
+            assert db.query(JobRecord).count() == 0
+
+
+def test_canonical_numeric_constraints_survive_generation_download_and_sqlite_export(monkeypatch, tmp_path):
+    import sqlite3
+    scenario = _scenario(record_count=3)
+    scenario["schemas"]["Parent"]["code"] = {
+        "type": "integer", "unique": True, "enum": ["01", "2.0", 3],
+        "min": "1.0", "max": "3.0",
+    }
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        job = client.get(f"/api/status/{job_id}").json()
+        assert job["status"] == "complete"
+        semantic = next(m for m in job["stats"]["evaluationMetrics"] if m["key"] == "semantic_correctness")
+        assert semantic["status"] == "pass"
+        download = client.get(f"/api/download/{job_id}")
+        assert download.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+            name = next(name for name in archive.namelist() if name.lower().endswith("parent.csv"))
+            rows = list(csv.DictReader(io.StringIO(archive.read(name).decode())))
+        codes = [int(row["code"]) for row in rows]
+        assert sorted(codes) == [1, 2, 3]
+        with sqlite3.connect(":memory:") as connection:
+            connection.execute("CREATE TABLE exported (code INTEGER UNIQUE)")
+            connection.executemany("INSERT INTO exported (code) VALUES (?)", [(code,) for code in codes])
+            assert connection.execute("SELECT COUNT(*) FROM exported").fetchone()[0] == 3
+
+
+def test_unique_float_precision_survives_preview_and_json_download(monkeypatch, tmp_path):
+    scenario = _scenario(record_count=10)
+    scenario["schemas"]["Parent"]["code"] = {
+        "type": "float", "constraints": {"unique": True, "min": 0.001, "max": 0.009},
+    }
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.post("/api/generate", json={"scenario": scenario})
+        assert response.status_code == 200
+        job_id = response.json()["jobId"]
+        assert client.get(f"/api/status/{job_id}").json()["status"] == "complete"
+        preview = client.get(f"/api/preview/{job_id}?table=Parent").json()
+        codes = [row["code"] for row in preview["tables"]["parent"]["rows"]]
+        assert len(set(codes)) == 10
+        single = client.get(f"/api/download/{job_id}?table=Parent&format=json")
+        assert [row["code"] for row in single.json()] == codes
+        download = client.get(f"/api/download/{job_id}?format=json")
+        with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+            name = next(name for name in archive.namelist() if name.lower() == "parent.json")
+            import json
+            rows = json.loads(archive.read(name))
+        assert [row["code"] for row in rows] == codes
 
 
 def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):

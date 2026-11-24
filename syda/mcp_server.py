@@ -378,7 +378,7 @@ def generate_from_schema(
                 import pandas as pd
                 csv = os.path.join(output_dir, f"{name.lower()}.csv")
                 if os.path.exists(csv):
-                    df = pd.read_csv(csv)
+                    df = pd.read_csv(csv, float_precision="round_trip")
             tables_preview[name] = _df_preview(df, preview_rows)
 
         report_summary = {}
