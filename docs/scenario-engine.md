@@ -179,3 +179,11 @@ The platform persists failed evaluations as failed jobs, retains their JSON/HTML
 reports at `/api/evaluation/{job_id}/report`, and blocks dataset previews and
 downloads. Rejected data is not exported as CSV. The run's Evaluation tab remains
 available so users can inspect the rule, table, instance, and reason before retrying.
+
+The platform also verifies scenario path coverage against the deterministic plan.
+`pathCounts` remains the planned allocation; `pathCoverage` in job stats and the
+evaluation report lists each path's expected and observed instance counts, status,
+and any missing or extra step rows. The observed counts come from generated
+`scenario_instance_id` and `scenario_path` values. A mismatch fails the quality
+gate and appears in the violation report. Runs without those tracking fields
+report path coverage as `not_evaluated`.

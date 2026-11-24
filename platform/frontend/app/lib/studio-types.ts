@@ -41,6 +41,7 @@ export interface JobStats {
   durationSeconds: number;
   tableRowCounts: Record<string, number>;
   pathCounts: Record<string, number>;
+  pathCoverage?: { path: string; expectedInstances: number; actualInstances: number; status: "pass" | "fail"; detail: string }[];
   evaluationResult: "pass" | "fail" | "partial";
   evaluationMetrics: { key: string; label: string; status: "pass" | "fail" | "not_evaluated"; value: string; detail: string; violations: number }[];
   violations?: ViolationRecord[];

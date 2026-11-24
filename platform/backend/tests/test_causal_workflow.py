@@ -3,6 +3,7 @@ import pytest
 
 from app.api.generation import _evaluation_metrics, _LocalTableGenerator
 from app.models.scenario import ScenarioConfiguration, JobStats
+from app.scenario_definition import scenario_definition
 from syda.scenarios import ScenarioEngine, ScenarioCheck
 
 
@@ -156,6 +157,42 @@ def test_job_stats_serializes_violations():
     assert len(dumped["violations"]) == 1
     assert dumped["violations"][0]["table"] == "Claim"
     assert dumped["violations"][0]["rule"] == "paid_claim_has_positive_payment"
+
+
+def test_path_coverage_checks_instances_and_required_steps():
+    scenario = ScenarioConfiguration.model_validate({
+        "title": "Claims", "description": "Three claim outcomes", "recordCount": 6,
+        "secondaryMetric": {"label": "Paths", "value": "3"},
+        "workflow": ["Claim", "Payment"], "rules": [],
+        "paths": [
+            {"name": "approved", "steps": ["Claim", "Payment"], "weight": 2},
+            {"name": "denied", "steps": ["Claim"], "weight": 1},
+            {"name": "review", "steps": ["Claim"], "weight": 1},
+        ],
+        "schemas": {
+            "Claim": {"id": {"type": "integer", "constraints": {"primary_key": True}}},
+            "Payment": {"id": {"type": "integer", "constraints": {"primary_key": True}}},
+        },
+    })
+    plan = ScenarioEngine().plan(scenario_definition(scenario, scenario.schemas), scenario.record_count)
+    tables = {name: frame.copy() for name, frame in plan.tables.items()}
+    metrics, result, _, _, paths = _evaluation_metrics(
+        tables, scenario.schemas, scenario, return_details=True, return_path_coverage=True,
+    )
+    assert result == "partial"  # Unconfigured statistical and privacy checks remain partial.
+    assert all(path.status == "pass" for path in paths)
+    assert {path.path: path.expected_instances for path in paths} == plan.path_counts
+
+    # Remove a required payment row and all rows for the review path.
+    tables["Payment"] = tables["Payment"].iloc[1:].copy()
+    tables["Claim"] = tables["Claim"].loc[tables["Claim"]["scenario_path"] != "review"].copy()
+    metrics, result, _, _, paths = _evaluation_metrics(
+        tables, scenario.schemas, scenario, return_details=True, return_path_coverage=True,
+    )
+    assert result == "fail"
+    assert next(metric for metric in metrics if metric.key == "scenario_coverage").status == "fail"
+    assert {path.path for path in paths if path.status == "fail"} == {"approved", "review"}
+    assert next(path for path in paths if path.path == "review").actual_instances == 0
 
 
 def test_causal_metric_uses_declared_order_instead_of_arbitrary_date_columns():

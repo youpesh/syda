@@ -59,6 +59,25 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
             ))}
           </div>
         )}
+        {!!stats.pathCoverage?.length && (
+          <div className="flex flex-col gap-2">
+            <h3 className="text-sm font-semibold">Scenario path coverage</h3>
+            <Table>
+              <TableHeader><TableRow><TableHead>Path</TableHead><TableHead>Expected</TableHead><TableHead>Actual</TableHead><TableHead>Status</TableHead><TableHead>Detail</TableHead></TableRow></TableHeader>
+              <TableBody>
+                {stats.pathCoverage.map((path) => (
+                  <TableRow key={path.path}>
+                    <TableCell className="font-medium">{path.path}</TableCell>
+                    <TableCell className="tabular-nums">{path.expectedInstances.toLocaleString()}</TableCell>
+                    <TableCell className="tabular-nums">{path.actualInstances.toLocaleString()}</TableCell>
+                    <TableCell><Badge variant={statusVariant[path.status]}>{path.status}</Badge></TableCell>
+                    <TableCell className="max-w-xs whitespace-normal text-muted-foreground">{path.detail}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
         <dl className="grid gap-3 sm:grid-cols-3">
           <div className="border-l pl-3"><dt className="text-xs text-muted-foreground">Causal consistency</dt><dd className="mt-1 text-lg font-semibold tabular-nums">{stats.causalIntegrity}</dd></div>
           <div className="border-l pl-3"><dt className="text-xs text-muted-foreground">Referential integrity</dt><dd className="mt-1 text-lg font-semibold tabular-nums">{stats.referentialIntegrity}</dd></div>
@@ -84,7 +103,7 @@ export function EvaluationReport({ stats, jobId }: { stats?: JobStats; jobId?: s
           <div className="flex flex-col gap-2 pt-2 border-t">
             <div className="flex items-center justify-between">
               <span className="text-sm font-semibold text-destructive">
-                Causal & Semantic Violations ({stats.violations.length})
+                Evaluation violations ({stats.violations.length})
               </span>
             </div>
             <div className="rounded-md border overflow-x-auto max-h-60 overflow-y-auto">
