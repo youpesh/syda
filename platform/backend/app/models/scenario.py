@@ -100,6 +100,16 @@ class ViolationRecord(BaseModel):
     )
 
 
+class PathCoverage(BaseModel):
+    path: str
+    expected_instances: int = Field(alias="expectedInstances")
+    actual_instances: int = Field(alias="actualInstances")
+    status: Literal["pass", "fail"]
+    detail: str
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+
 class JobStats(BaseModel):
     causal_integrity: str = Field(alias="causalIntegrity")
     referential_integrity: str = Field(alias="referentialIntegrity")
@@ -109,6 +119,7 @@ class JobStats(BaseModel):
     duration_seconds: float = Field(alias="durationSeconds")
     table_row_counts: Dict[str, int] = Field(default_factory=dict, alias="tableRowCounts")
     path_counts: Dict[str, int] = Field(default_factory=dict, alias="pathCounts")
+    path_coverage: List[PathCoverage] = Field(default_factory=list, alias="pathCoverage")
     evaluation_metrics: List[EvaluationMetric] = Field(default_factory=list, alias="evaluationMetrics")
     evaluation_result: Literal["pass", "fail", "partial"] = Field(default="partial", alias="evaluationResult")
     violations: List[ViolationRecord] = Field(default_factory=list, alias="violations")

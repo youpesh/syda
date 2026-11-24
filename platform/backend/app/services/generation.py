@@ -13,7 +13,7 @@ from syda.output import save_dataframes
 from syda.templates import TemplateProcessor
 from syda.scenarios import ScenarioEngine, ScenarioValidationError
 from ..scenario_definition import scenario_definition as _scenario_definition
-from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, ViolationRecord
+from ..models.scenario import ScenarioConfiguration, EvaluationMetric, JobStats, PathCoverage, ViolationRecord
 logger = logging.getLogger(__name__)
 
 def _synthesize_relational_tables(
@@ -274,6 +274,7 @@ def _evaluation_metrics(
     schemas: Dict[str, Any],
     scenario: ScenarioConfiguration,
     return_details: bool = False,
+    return_path_coverage: bool = False,
 ) -> tuple:
     referential_value, referential_violations = _referential_integrity(dfs, schemas)
     semantic_value, semantic_violations, semantic_checked = _constraint_compliance(dfs, schemas)
@@ -294,10 +295,66 @@ def _evaluation_metrics(
     )
     check_violations = sum(item["violations"] for item in executable_checks)
     checked_rules = len(executable_checks)
-    expected_counts = ScenarioEngine.summarize(definition, scenario.record_count).table_row_counts
-    expected_tables = [table for table, count in expected_counts.items() if count > 0]
-    missing_steps = [table for table in expected_tables if table not in dfs or dfs[table].empty]
-    coverage_value = f"{100 * (len(expected_tables) - len(missing_steps)) / max(1, len(expected_tables)):.1f}%"
+    planned_counts = ScenarioEngine.summarize(definition, scenario.record_count).path_counts
+    path_coverage: list[PathCoverage] = []
+    tracked = all(
+        frame.empty or {definition.instance_id_field, definition.path_field}.issubset(frame.columns)
+        for frame in dfs.values()
+    )
+    if tracked:
+        steps = {step.name: step for step in definition.steps}
+        for path in definition.resolved_paths():
+            expected = planned_counts[path.name]
+            path_rows = {
+                table: frame.loc[frame[definition.path_field] == path.name]
+                for table, frame in dfs.items()
+                if not frame.empty
+            }
+            instance_ids = set().union(*(
+                set(rows[definition.instance_id_field].dropna().astype(str))
+                for rows in path_rows.values()
+            ))
+            issues = []
+            if len(instance_ids) != expected:
+                issues.append(f"expected {expected} instances, found {len(instance_ids)}")
+            expected_rows = {
+                steps[name].table: expected * steps[name].records_per_instance
+                for name in path.steps
+            }
+            for table in set(expected_rows) | set(path_rows):
+                rows = path_rows.get(table)
+                actual_rows = len(rows) if rows is not None else 0
+                if actual_rows != expected_rows.get(table, 0):
+                    issues.append(f"{table}: expected {expected_rows.get(table, 0)} rows, found {actual_rows}")
+                if table in expected_rows and rows is not None:
+                    step_ids = set(rows[definition.instance_id_field].dropna().astype(str))
+                    if step_ids != instance_ids:
+                        issues.append(f"{table}: instance IDs differ from the path")
+            path_coverage.append(PathCoverage(
+                path=path.name,
+                expectedInstances=expected,
+                actualInstances=len(instance_ids),
+                status="fail" if issues else "pass",
+                detail="; ".join(issues) if issues else "All planned instances and step rows are present.",
+            ))
+        unexpected_paths = set().union(*(
+            set(frame[definition.path_field].dropna().astype(str))
+            for frame in dfs.values() if not frame.empty
+        )) - set(planned_counts)
+        for name in sorted(unexpected_paths):
+            actual = len(set().union(*(
+                set(frame.loc[frame[definition.path_field] == name, definition.instance_id_field].dropna().astype(str))
+                for frame in dfs.values() if not frame.empty
+            )))
+            path_coverage.append(PathCoverage(
+                path=name, expectedInstances=0, actualInstances=actual,
+                status="fail", detail="Path is not declared in the scenario.",
+            ))
+    coverage_failures = sum(item.status == "fail" for item in path_coverage)
+    coverage_value = (
+        f"{len(path_coverage) - coverage_failures}/{len(path_coverage)} paths matched"
+        if tracked else "Not evaluated"
+    )
 
     violation_records: list[ViolationRecord] = []
     for check_item in executable_checks:
@@ -310,6 +367,11 @@ def _evaluation_metrics(
                     error=detail["error"],
                 )
             )
+    for path in path_coverage:
+        if path.status == "fail":
+            violation_records.append(ViolationRecord(
+                table="Scenario", row=path.path, rule="scenario_coverage", error=path.detail,
+            ))
 
     def measured_status(violations: int, checked: int) -> Literal["not_evaluated", "pass", "fail"]:
         if checked == 0:
@@ -346,10 +408,10 @@ def _evaluation_metrics(
         EvaluationMetric(
             key="scenario_coverage",
             label="Scenario coverage",
-            status=binary_status(not missing_steps),
+            status=measured_status(coverage_failures, len(path_coverage)) if tracked else "not_evaluated",
             value=coverage_value,
-            detail="Checks that every table required by the allocated scenario paths produced records.",
-            violations=len(missing_steps),
+            detail="Compares generated instance IDs and step rows with each planned path allocation.",
+            violations=coverage_failures,
         ),
         EvaluationMetric(
             key="privacy_leakage",
@@ -386,7 +448,8 @@ def _evaluation_metrics(
     )
     total_violations = sum(metric.violations for metric in metrics)
     if return_details:
-        return metrics, result, total_violations, violation_records
+        details = (metrics, result, total_violations, violation_records)
+        return (*details, path_coverage) if return_path_coverage else details
     return metrics, result, total_violations
 
 
@@ -497,8 +560,8 @@ def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[
 
     elapsed = round(time.time() - t0, 1)
     total_records = sum(len(df) for df in dfs.values())
-    metrics, evaluation_result, total_violations, violation_records = _evaluation_metrics(
-        dfs, schemas, scenario, return_details=True
+    metrics, evaluation_result, total_violations, violation_records, path_coverage = _evaluation_metrics(
+        dfs, schemas, scenario, return_details=True, return_path_coverage=True
     )
     metric_by_key = {metric.key: metric for metric in metrics}
     table_row_counts = {name: len(df) for name, df in dfs.items()}
@@ -512,6 +575,7 @@ def run_generation(job_id: str, scenario: ScenarioConfiguration, provider: dict[
         durationSeconds=elapsed,
         tableRowCounts=table_row_counts,
         pathCounts=path_counts,
+        pathCoverage=path_coverage,
         evaluationMetrics=metrics,
         evaluationResult=evaluation_result,
         violations=violation_records,

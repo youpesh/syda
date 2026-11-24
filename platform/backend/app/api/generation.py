@@ -332,6 +332,7 @@ async def download_evaluation_report(
         "result": stats.evaluation_result,
         "recordsGenerated": stats.records_generated,
         "pathCounts": stats.path_counts,
+        "pathCoverage": [item.model_dump(by_alias=True) for item in stats.path_coverage],
         "metrics": [metric.model_dump(by_alias=True) for metric in stats.evaluation_metrics],
         "violations": [violation.model_dump(by_alias=True) for violation in stats.violations],
     }
@@ -361,15 +362,31 @@ async def download_evaluation_report(
         for v in stats.violations
     )
     violations_section = (
-        f"<h2>Causal & Semantic Rule Violations ({len(stats.violations)})</h2>"
+        f"<h2>Evaluation violations ({len(stats.violations)})</h2>"
         f"<table><thead><tr><th>Table</th><th>Row</th><th>Rule</th><th>Error</th></tr></thead><tbody>{violation_rows}</tbody></table>"
         if stats.violations
-        else "<p><em>No causal or semantic rule violations detected.</em></p>"
+        else "<p><em>No evaluation violations detected.</em></p>"
+    )
+    path_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(item.path)}</td>"
+        f"<td>{item.expected_instances}</td>"
+        f"<td>{item.actual_instances}</td>"
+        f"<td>{html.escape(item.status.title())}</td>"
+        f"<td>{html.escape(item.detail)}</td>"
+        "</tr>"
+        for item in stats.path_coverage
+    )
+    path_section = (
+        "<h2>Scenario path coverage</h2>"
+        f"<table><thead><tr><th>Path</th><th>Expected instances</th><th>Actual instances</th><th>Status</th><th>Detail</th></tr></thead><tbody>{path_rows}</tbody></table>"
+        if stats.path_coverage else ""
     )
     document = f"""<!doctype html><html><head><meta charset="utf-8"><title>Syda evaluation {html.escape(job_id)}</title>
 <style>body{{font:14px system-ui;margin:40px;color:#18181b}}table{{border-collapse:collapse;width:100%;margin-bottom:24px}}th,td{{border:1px solid #d4d4d8;padding:8px;text-align:left}}th{{background:#f4f4f5}}h2{{margin-top:24px}}</style>
 </head><body><h1>Syda evaluation report</h1><p>Job {html.escape(job_id)} · Result: {html.escape(stats.evaluation_result.upper())}</p>
 <table><thead><tr><th>Metric</th><th>Status</th><th>Value</th><th>Violations</th><th>Detail</th></tr></thead><tbody>{rows}</tbody></table>
+ {path_section}
 {violations_section}
 </body></html>"""
     return HTMLResponse(

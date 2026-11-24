@@ -217,6 +217,16 @@ def test_generation_honors_weighted_scenario_paths(monkeypatch, tmp_path):
             "edge": 2,
             "failure": 2,
         }
+        assert {
+            item["path"]: (item["expectedInstances"], item["actualInstances"], item["status"])
+            for item in result["stats"]["pathCoverage"]
+        } == {
+            "complete": (4, 4, "pass"),
+            "edge": (2, 2, "pass"),
+            "failure": (2, 2, "pass"),
+        }
+        report = client.get(f"/api/evaluation/{created.json()['jobId']}/report").json()
+        assert report["pathCoverage"] == result["stats"]["pathCoverage"]
 
         download = client.get(result["downloadUrl"])
         with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
